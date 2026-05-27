@@ -25,6 +25,7 @@ llama_context::llama_context(
     model(model),
     cvec(std::make_unique<llama_adapter_cvec>()),
     loras(std::make_unique<llama_adapter_loras>()),
+    seq_loras(std::make_unique<llama_adapter_seq_loras>()),
     balloc(std::make_unique<llama_batch_allocr>(model.hparams.n_pos_per_embd())) {
     // TODO warning when creating llama_context with awkward ctx size that is not a power of 2,
     //     may need to be backend-dependent
@@ -1131,6 +1132,35 @@ void llama_context::set_adapters_lora(llama_adapter_lora ** adapters, size_t n_a
     sched_need_reserve = true;
 }
 
+void llama_context::set_seq_adapters_lora(
+        const llama_seq_id * seq_ids,
+        llama_adapter_lora ** adapters,
+        const float * scales,
+        size_t n) {
+    seq_loras->clear();
+
+    for (size_t i = 0; i < n; i++) {
+        if (adapters[i] == nullptr) {
+            continue;
+        }
+
+        const float scale = scales ? scales[i] : 1.0f;
+        if (scale == 0.0f) {
+            continue;
+        }
+
+        (*seq_loras)[seq_ids[i]] = { adapters[i], scale };
+
+        LLAMA_LOG_INFO("%s: seq_id %d -> adapter %p, scale %.3f\n",
+                __func__,
+                (int) seq_ids[i],
+                (void *) adapters[i],
+                scale);
+    }
+
+    // sched_reserve_reset();
+}
+
 bool llama_context::adapters_lora_are_same(llama_adapter_lora ** adapters, size_t n_adapters, float * scales) {
     LLAMA_LOG_DEBUG("%s: adapters = %p\n", __func__, (void *) adapters);
 
@@ -2157,6 +2187,7 @@ llm_graph_params llama_context::graph_params(
         /*.backend_cpu =*/ backend_cpu,
         /*.cvec        =*/ cvec.get(),
         /*.loras       =*/ loras.get(),
+        /*.seq_loras   =*/ seq_loras.get(),
         /*.mctx        =*/ mctx,
         /*.cross       =*/ &cross,
         /*.samplers    =*/ sampling.samplers,
@@ -3179,6 +3210,24 @@ int32_t llama_set_adapters_lora(
 
     ctx->set_adapters_lora(adapters, n_adapters, scales);
 
+    return 0;
+}
+
+int32_t llama_set_seq_adapters_lora(
+        llama_context * ctx,
+        const llama_seq_id * seq_ids,
+        llama_adapter_lora ** adapters,
+        const float * scales,
+        size_t n) {
+    if (ctx == nullptr) {
+        return -1;
+    }
+
+    if (n > 0 && (seq_ids == nullptr || adapters == nullptr)) {
+        return -1;
+    }
+
+    ctx->set_seq_adapters_lora(seq_ids, adapters, scales, n);
     return 0;
 }
 

@@ -876,6 +876,7 @@ llm_graph_context::llm_graph_context(const llm_graph_params & params) :
     backend_cpu      (params.backend_cpu),
     cvec             (params.cvec),
     loras            (params.loras),
+    seq_loras        (params.seq_loras),
     mctx             (params.mctx),
     cross            (params.cross),
     samplers         (params.samplers),
@@ -903,6 +904,158 @@ ggml_tensor * llm_graph_context::build_lora_mm(
           ggml_tensor * cur,
           ggml_tensor * w_s) const {
     ggml_tensor * res = ggml_mul_mat(ctx0, w, cur);
+
+    // 这里新增 debug
+    static bool printed_seq_lora_debug = false;
+
+    if (!printed_seq_lora_debug && seq_loras && !seq_loras->empty()) {
+        LLAMA_LOG_INFO("\n========== Multi-LoRA seq mapping debug ==========\n");
+        LLAMA_LOG_INFO("ubatch.n_tokens = %d, ubatch.n_seqs = %d, seq_loras.size = %zu\n",
+                (int) ubatch.n_tokens,
+                (int) ubatch.n_seqs,
+                seq_loras->size());
+
+        for (uint32_t i = 0; i < ubatch.n_tokens; i++) {
+            if (ubatch.n_seq_id[i] <= 0) {
+                continue;
+            }
+
+            const llama_seq_id seq_id = ubatch.seq_id[i][0];
+            auto it = seq_loras->find(seq_id);
+
+            if (it == seq_loras->end()) {
+                LLAMA_LOG_INFO("token %d -> seq_id %d -> no LoRA mapping\n",
+                        (int) i,
+                        (int) seq_id);
+            } else {
+                LLAMA_LOG_INFO("token %d -> seq_id %d -> adapter %p, scale %.3f\n",
+                        (int) i,
+                        (int) seq_id,
+                        (void *) it->second.first,
+                        it->second.second);
+            }
+        }
+
+        LLAMA_LOG_INFO("==================================================\n\n");
+        printed_seq_lora_debug = true;
+    }
+
+    if (seq_loras && !seq_loras->empty()) {
+        // 第二阶段：按 seq_id -> adapter 进行 LoRA 分组。
+        // 第一版只支持 ubatch 中 token 按 adapter 连续排列。
+        struct lora_token_group {
+            llama_adapter_lora * adapter = nullptr;
+            float scale = 1.0f;
+            int start = 0;
+            int count = 0;
+        };
+
+        std::vector<lora_token_group> groups;
+
+        for (int i = 0; i < (int) ubatch.n_tokens; i++) {
+            if (ubatch.n_seq_id[i] <= 0) {
+                continue;
+            }
+
+            const llama_seq_id seq_id = ubatch.seq_id[i][0];
+            auto it = seq_loras->find(seq_id);
+
+            if (it == seq_loras->end()) {
+                continue;
+            }
+
+            llama_adapter_lora * adapter = it->second.first;
+            const float adapter_scale = it->second.second;
+
+            if (groups.empty() || groups.back().adapter != adapter) {
+                groups.push_back({ adapter, adapter_scale, i, 1 });
+            } else {
+                groups.back().count++;
+            }
+        }
+
+        static bool printed_group_debug = false;
+        if (!printed_group_debug) {
+            LLAMA_LOG_INFO("\n========== Multi-LoRA group debug ==========\n");
+            for (size_t g = 0; g < groups.size(); g++) {
+                LLAMA_LOG_INFO("group %zu -> adapter %p, start token %d, count %d, scale %.3f\n",
+                        g,
+                        (void *) groups[g].adapter,
+                        groups[g].start,
+                        groups[g].count,
+                        groups[g].scale);
+            }
+            LLAMA_LOG_INFO("===========================================\n\n");
+            printed_group_debug = true;
+        }
+
+        // 第三阶段：按 adapter 分组计算 LoRA 增量，并加回对应 token 区间。
+        for (const auto & group : groups) {
+            llama_adapter_lora_weight * lw = group.adapter->get_weight(w);
+            if (lw == nullptr) {
+                continue;
+            }
+
+            if (cur->ne[1] < group.start + group.count) {
+                static int skip_print_count = 0;
+                if (skip_print_count < 20) {
+                    LLAMA_LOG_WARN("skip grouped LoRA: tensor %s, cur shape [%lld, %lld], start %d, count %d\n",
+                            w->name,
+                            (long long) cur->ne[0],
+                            (long long) cur->ne[1],
+                            group.start,
+                            group.count);
+                    skip_print_count++;
+                }
+                continue;
+            }
+
+            static int lora_group_apply_print_count = 0;
+            if (lora_group_apply_print_count < 20) {
+                LLAMA_LOG_INFO("apply grouped LoRA: tensor %s, adapter %p, start %d, count %d\n",
+                        w->name,
+                        (void *) group.adapter,
+                        group.start,
+                        group.count);
+                lora_group_apply_print_count++;
+            }
+
+            const float scale = lw->get_scale(group.adapter->alpha, group.scale);
+
+            ggml_tensor * cur_group = ggml_view_2d(
+                    ctx0,
+                    cur,
+                    cur->ne[0],
+                    group.count,
+                    cur->nb[1],
+                    group.start * cur->nb[1]
+            );
+
+            ggml_tensor * delta_group = ggml_mul_mat(
+                    ctx0,
+                    lw->b,
+                    ggml_mul_mat(ctx0, lw->a, cur_group)
+            );
+
+            delta_group = ggml_scale(ctx0, delta_group, scale);
+
+            res = ggml_acc(
+                    ctx0,
+                    res,
+                    delta_group,
+                    res->nb[1],
+                    res->nb[2],
+                    res->nb[3],
+                    group.start * res->nb[1]
+            );
+        }
+
+        if (w_s) {
+            res = ggml_mul(ctx0, res, w_s);
+        }
+
+        return res;
+    }
 
     for (const auto & lora : *loras) {
         llama_adapter_lora_weight * lw = lora.first->get_weight(w);

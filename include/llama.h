@@ -675,6 +675,13 @@ extern "C" {
             size_t n_adapters,
             float * scales);
 
+    LLAMA_API int32_t llama_set_seq_adapters_lora(
+            struct llama_context * ctx,
+            const llama_seq_id * seq_ids,
+            struct llama_adapter_lora ** adapters,
+            const float * scales,
+            size_t n);
+
     // Apply a loaded control vector to a llama_context, or if data is NULL, clear
     // the currently loaded vector.
     // n_embd should be the size of a single layer's control, and data should point

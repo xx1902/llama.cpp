@@ -7,6 +7,7 @@
 #include <string>
 #include <unordered_map>
 #include <vector>
+#include <map>
 
 // TODO: pimpl
 
@@ -89,3 +90,6 @@ struct llama_adapter_lora {
 
 using llama_adapter_loras = std::unordered_map<llama_adapter_lora *, float>;
 using llama_adapter_loras_ptr = std::unique_ptr<llama_adapter_loras>;
+
+using llama_adapter_seq_loras = std::map<llama_seq_id, std::pair<llama_adapter_lora *, float>>;
+using llama_adapter_seq_loras_ptr = std::unique_ptr<llama_adapter_seq_loras>;

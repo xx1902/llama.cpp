@@ -531,6 +531,7 @@ struct llm_graph_params {
 
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;
+    const llama_adapter_seq_loras * seq_loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
@@ -739,6 +740,7 @@ struct llm_graph_context {
 
     const llama_adapter_cvec     * cvec;
     const llama_adapter_loras    * loras;
+    const llama_adapter_seq_loras * seq_loras;
     const llama_memory_context_i * mctx;
     const llama_cross            * cross;
 
