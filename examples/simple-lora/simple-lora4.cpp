@@ -34,7 +34,11 @@ int main(int argc, char ** argv) {
         "Hello my name is",
         "The future of marketing is",
         "A good product slogan is",
-        "To attract customers, we should"
+        "To attract customers, we should",
+        "A successful advertising campaign should",
+        "The best way to build a brand is",
+        "When launching a new product, marketers should",
+        "Customer loyalty can be improved by"
     };
 
     const int batch_size = prompts.size();
@@ -246,26 +250,46 @@ int main(int argc, char ** argv) {
         //     lora_adapters[3],
         // };
 
-        std::vector<llama_seq_id> seq_lora_ids = { 0, 1, 2, 3 };
-        std::vector<llama_adapter_lora *> seq_lora_adapters = {
-            lora_adapters[0],
-            lora_adapters[0],
-            lora_adapters[1],
-            lora_adapters[1],
-        };
-        std::vector<llama_adapter_lora *> seq_lora_adapters = {
-            lora_adapters[0],
-            lora_adapters[1],
-            lora_adapters[0],
-            lora_adapters[1],
-        };
+        // std::vector<llama_seq_id> seq_lora_ids = { 0, 1, 2, 3 };
+        // std::vector<llama_adapter_lora *> seq_lora_adapters = {
+        //     lora_adapters[0],
+        //     lora_adapters[0],
+        //     lora_adapters[1],
+        //     lora_adapters[1],
+        // };
 
-        std::vector<float> seq_lora_scales = {
-            lora_scale,
-            lora_scale,
-            lora_scale,
-            lora_scale,
-        };
+        // std::vector<float> seq_lora_scales = {
+        //     lora_scale,
+        //     lora_scale,
+        //     lora_scale,
+        //     lora_scale,
+        // };
+
+        std::vector<llama_seq_id> seq_lora_ids;
+        std::vector<llama_adapter_lora *> seq_lora_adapters;
+        std::vector<float> seq_lora_scales;
+
+        seq_lora_ids.reserve(batch_size);
+        seq_lora_adapters.reserve(batch_size);
+        seq_lora_scales.reserve(batch_size);
+
+        for (int s = 0; s < batch_size; s++) {
+            const int adapter_id = s / 2; // 每个 LoRA 连续对应两个请求
+
+            if (adapter_id >= (int) lora_adapters.size()) {
+                fprintf(stderr, "%s: error: adapter_id %d out of range\n", __func__, adapter_id);
+                return 1;
+            }
+
+            seq_lora_ids.push_back((llama_seq_id) s);
+            seq_lora_adapters.push_back(lora_adapters[adapter_id]);
+            seq_lora_scales.push_back(lora_scale);
+
+            fprintf(stderr, "[Multi-LoRA] seq %d -> LoRA %d (%s)\n",
+                    s,
+                    adapter_id,
+                    lora_paths[adapter_id].c_str());
+        }
 
         if (llama_set_seq_adapters_lora(
                 ctx,
