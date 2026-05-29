@@ -1,18 +1,22 @@
 // simple-lora.cpp
 //
-// 本程序用于测试多 LoRA 推理场景下三种执行方式的吞吐量：
-// 1. sequential：顺序推理，每个请求单独绑定一个 LoRA 并独立 decode。
-// 2. batch_unfused：批处理但不进行 LoRA 分组，请求中的 LoRA 交错排列。
-// 3. batch_grouped：批处理加分组融合，同一 LoRA adapter 的请求连续排列。
+// 图 5-9 延迟分布实验代码
 //
-// 实验口径：
-// - 横轴为逻辑并行 LoRA 数量：1, 2, 4, 8, 16。
-// - 每个逻辑 LoRA 对应 1 个请求，因此请求数等于横轴数值。
-// - 当前只有 4 个真实 LoRA 文件，超过 4 时通过取模复用已有 LoRA。
-// - 因此 8、16 表示更大的逻辑并发请求规模，不表示 8、16 个真实不同 adapter 文件。
+// 本程序用于测量多 LoRA 推理场景下三种执行方式的端到端延迟分布：
+// 1. sequential：4 个请求同时到达，但系统按顺序逐个处理。
+//    因此第 2、3、4 个请求的 TTFT 和总延迟需要包含前面请求的等待时间。
+// 2. batch_unfused：4 个请求组成 batch，但 LoRA 交错排列：0,1,0,1。
+// 3. batch_grouped：4 个请求组成 batch，并按 LoRA 分组排列：0,0,1,1。
 //
-// 输出 CSV：
-// D:/ecnu_experiment/LLama.cpp/llama.cpp/examples/simple-lora/output/multilora_results.csv
+// 主要统计指标：
+// - TTFT：Time To First Token，从请求到达系统到生成第一个 token 的时间。
+// - TGI：Token Generation Interval，同一请求相邻生成 token 之间的平均间隔。
+// - Total Latency：从请求到达系统到该请求生成结束的总时间。
+// - P50 / P95 / P99：延迟分位值。
+//
+// 输出文件：
+// D:/ecnu_experiment/LLama.cpp/llama.cpp/examples/simple-lora/output/latency_samples.csv
+// D:/ecnu_experiment/LLama.cpp/llama.cpp/examples/simple-lora/output/latency_summary.csv
 
 #include "llama.h"
 
@@ -30,14 +34,46 @@ enum class experiment_mode {
     batch_grouped,
 };
 
-struct experiment_result {
-    std::string name;
-    int n_lora = 0;      // 逻辑 LoRA 数量，也等于请求数量
-    int n_requests = 0;
+struct request_latency {
+    std::string scheme;
+    int round = 0;
+    int request_id = 0;
+    int adapter_id = 0;
     int n_tokens = 0;
-    double elapsed_s = 0.0;
-    double tps = 0.0;
-    double rps = 0.0;
+
+    // TTFT：从请求共同到达到生成第一个 token 的时间。
+    double ttft_ms = 0.0;
+
+    // 用户感知 TGI：同一个请求内部，相邻 token 之间的平均间隔。
+    // 这个指标反映用户看到流式输出时是否平滑。
+    double user_tgi_ms = 0.0;
+
+    // 系统级 TGI：系统整体每生成一个 token 的平均耗时。
+    // 批处理每一步会同时为多个请求生成 token，因此需要用总耗时 / 总 token 数来衡量系统效率。
+    double system_tgi_ms = 0.0;
+
+    // 总延迟：从请求共同到达到该请求生成结束的时间。
+    double total_latency_ms = 0.0;
+};
+
+struct latency_summary {
+    std::string scheme;
+    int n_samples = 0;
+    double ttft_p50 = 0.0;
+    double ttft_p95 = 0.0;
+    double ttft_p99 = 0.0;
+
+    double user_tgi_p50 = 0.0;
+    double user_tgi_p95 = 0.0;
+    double user_tgi_p99 = 0.0;
+
+    double system_tgi_p50 = 0.0;
+    double system_tgi_p95 = 0.0;
+    double system_tgi_p99 = 0.0;
+    
+    double total_p50 = 0.0;
+    double total_p95 = 0.0;
+    double total_p99 = 0.0;
 };
 
 static const char * mode_name(experiment_mode mode) {
@@ -53,41 +89,47 @@ static const char * mode_name(experiment_mode mode) {
     return "unknown";
 }
 
-// 生成 seq_id -> 真实 LoRA adapter id 的映射。
-// 假设真实 LoRA 文件数为 4：
-//
-// batch_unfused:
-// n_lora = 8  -> 0,1,2,3,0,1,2,3
-// n_lora = 16 -> 0,1,2,3,0,1,2,3,0,1,2,3,0,1,2,3
-//
-// batch_grouped:
-// n_lora = 8  -> 0,0,1,1,2,2,3,3
-// n_lora = 16 -> 0,0,0,0,1,1,1,1,2,2,2,2,3,3,3,3
-static std::vector<int> build_seq_to_lora(
-        experiment_mode mode,
-        int logical_n_lora,
-        int n_real_lora) {
-    std::vector<int> seq_to_lora;
-    seq_to_lora.reserve(logical_n_lora);
-
-    if (mode == experiment_mode::batch_grouped) {
-        for (int adapter_id = 0; adapter_id < n_real_lora; adapter_id++) {
-            for (int i = 0; i < logical_n_lora; i++) {
-                if (i % n_real_lora == adapter_id) {
-                    seq_to_lora.push_back(adapter_id);
-                }
-            }
-        }
-    } else {
-        for (int i = 0; i < logical_n_lora; i++) {
-            seq_to_lora.push_back(i % n_real_lora);
-        }
+static double percentile(std::vector<double> values, double p) {
+    if (values.empty()) {
+        return 0.0;
     }
 
-    return seq_to_lora;
+    std::sort(values.begin(), values.end());
+
+    const double rank = (p / 100.0) * (values.size() - 1);
+    const size_t lo = (size_t) rank;
+    const size_t hi = std::min(lo + 1, values.size() - 1);
+    const double frac = rank - lo;
+
+    return values[lo] * (1.0 - frac) + values[hi] * frac;
 }
 
-// 向 llama_batch 中加入一个 token。
+// 4 个请求、2 个 LoRA。
+// batch_unfused: 0,1,0,1
+// batch_grouped: 0,0,1,1
+static std::vector<int> build_seq_to_lora(experiment_mode mode) {
+    if (mode == experiment_mode::batch_grouped) {
+        return { 0, 0, 1, 1 };
+    }
+
+    return { 0, 1, 0, 1 };
+}
+
+// 8 个请求、4 个 LoRA。
+// batch_unfused: 0,1,2,3,0,1,2,3
+// batch_grouped: 0,0,1,1,2,2,3,3
+//
+// 这样设计的目的：
+// - batch_unfused 表示 LoRA 请求交错排列，底层会产生更多 LoRA group。
+// - batch_grouped 表示相同 LoRA 的请求连续排列，便于按 adapter 分组执行。
+// static std::vector<int> build_seq_to_lora(experiment_mode mode) {
+//     if (mode == experiment_mode::batch_grouped) {
+//         return { 0, 0, 1, 1, 2, 2, 3, 3 };
+//     }
+
+//     return { 0, 1, 2, 3, 0, 1, 2, 3 };
+// }
+
 static void batch_add(
         llama_batch & batch,
         llama_token token,
@@ -108,7 +150,6 @@ static void batch_add(
     batch.n_tokens++;
 }
 
-// 对多个 prompt 分词。
 static bool tokenize_prompts(
         const llama_vocab * vocab,
         const std::vector<std::string> & prompts,
@@ -137,7 +178,7 @@ static bool tokenize_prompts(
                     prompt_tokens[i].size(),
                     true,
                     true) < 0) {
-            fprintf(stderr, "error: failed to tokenize prompt %d\n", i);
+            fprintf(stderr, "failed to tokenize prompt %d\n", i);
             return false;
         }
 
@@ -147,55 +188,34 @@ static bool tokenize_prompts(
     return true;
 }
 
-// 构造当前逻辑 LoRA 数量下的 prompt。
-// 每个逻辑 LoRA 对应 1 个请求。
-static std::vector<std::string> build_prompts(
-        const std::vector<std::string> & prompt_pool,
-        int logical_n_lora) {
-    std::vector<std::string> prompts;
-    prompts.reserve(logical_n_lora);
-
-    for (int i = 0; i < logical_n_lora; i++) {
-        prompts.push_back(prompt_pool[i % prompt_pool.size()]);
-    }
-
-    return prompts;
-}
-
-// 批处理实验：batch_unfused 或 batch_grouped。
-static experiment_result run_batch_experiment(
+// 批处理延迟实验。
+// 4 个请求同时进入 batch，因此每个请求的 TTFT 和 total latency 都从 t_arrival 开始算。
+static std::vector<request_latency> run_batch_latency_experiment(
         llama_model * model,
         const llama_vocab * vocab,
         const std::vector<std::string> & prompts,
         const std::vector<std::vector<llama_token>> & prompt_tokens,
         const std::vector<llama_adapter_lora *> & lora_adapters,
-        const std::vector<std::string> & lora_paths,
         experiment_mode mode,
-        int logical_n_lora,
         int n_prompt_total,
         int n_predict,
-        float lora_scale) {
-    const int batch_size = (int) prompts.size();
-    const int n_real_lora = (int) lora_adapters.size();
+        float lora_scale,
+        int round_id) {
+    std::vector<request_latency> samples;
 
-    experiment_result result;
-    result.name = mode_name(mode);
-    result.n_lora = logical_n_lora;
-    result.n_requests = batch_size;
+    const int batch_size = (int) prompts.size();
+    std::vector<int> seq_to_lora = build_seq_to_lora(mode);
 
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = 256;
     ctx_params.n_seq_max = batch_size;
     ctx_params.n_batch = n_prompt_total;
-    ctx_params.no_perf = false;
+    ctx_params.no_perf = true;
 
     llama_context * ctx = llama_init_from_model(model, ctx_params);
     if (ctx == nullptr) {
-        fprintf(stderr, "%s: error: failed to create context\n", __func__);
-        return result;
+        return samples;
     }
-
-    std::vector<int> seq_to_lora = build_seq_to_lora(mode, logical_n_lora, n_real_lora);
 
     std::vector<llama_seq_id> seq_lora_ids;
     std::vector<llama_adapter_lora *> seq_lora_adapters;
@@ -207,12 +227,6 @@ static experiment_result run_batch_experiment(
         seq_lora_ids.push_back((llama_seq_id) s);
         seq_lora_adapters.push_back(lora_adapters[adapter_id]);
         seq_lora_scales.push_back(lora_scale);
-
-        fprintf(stderr, "[%s] seq %d -> LoRA %d (%s)\n",
-                mode_name(mode),
-                s,
-                adapter_id,
-                lora_paths[adapter_id].c_str());
     }
 
     if (llama_set_seq_adapters_lora(
@@ -221,9 +235,8 @@ static experiment_result run_batch_experiment(
                 seq_lora_adapters.data(),
                 seq_lora_scales.data(),
                 seq_lora_ids.size()) != 0) {
-        fprintf(stderr, "%s: error: failed to set seq LoRA mapping\n", __func__);
         llama_free(ctx);
-        return result;
+        return samples;
     }
 
     std::vector<llama_sampler *> samplers(batch_size);
@@ -231,7 +244,6 @@ static experiment_result run_batch_experiment(
     for (int s = 0; s < batch_size; s++) {
         auto sparams = llama_sampler_chain_default_params();
         sparams.no_perf = true;
-
         samplers[s] = llama_sampler_chain_init(sparams);
         llama_sampler_chain_add(samplers[s], llama_sampler_init_greedy());
     }
@@ -258,28 +270,32 @@ static experiment_result run_batch_experiment(
         }
     }
 
-    const auto t_start = ggml_time_us();
-
-    if (llama_decode(ctx, batch)) {
-        fprintf(stderr, "%s: failed to eval prompt batch\n", __func__);
-
-        llama_batch_free(batch);
-        for (auto * sampler : samplers) {
-            llama_sampler_free(sampler);
-        }
-        llama_free(ctx);
-
-        return result;
-    }
-
     std::vector<int> seq_pos(batch_size);
     std::vector<bool> done(batch_size, false);
+    std::vector<int> generated_tokens(batch_size, 0);
+    std::vector<int64_t> ttft_us(batch_size, -1);
+    std::vector<int64_t> last_token_us(batch_size, -1);
+    std::vector<int64_t> tgi_sum_us(batch_size, 0);
+    std::vector<int> tgi_count(batch_size, 0);
+    std::vector<int64_t> finish_us(batch_size, -1);
 
     for (int s = 0; s < batch_size; s++) {
         seq_pos[s] = (int) prompt_tokens[s].size();
     }
 
-    int n_decode_total = 0;
+    const int64_t t_arrival = ggml_time_us();
+    const int64_t t_system_start = t_arrival;
+
+    int system_generated_tokens = 0;
+
+    if (llama_decode(ctx, batch)) {
+        llama_batch_free(batch);
+        for (auto * sampler : samplers) {
+            llama_sampler_free(sampler);
+        }
+        llama_free(ctx);
+        return samples;
+    }
 
     for (int step = 0; step < n_predict; step++) {
         llama_batch next_batch = llama_batch_init(batch_size, 0, batch_size);
@@ -293,17 +309,29 @@ static experiment_result run_batch_experiment(
             }
 
             llama_token new_token_id = llama_sampler_sample(samplers[s], ctx, last_logits_idx[s]);
+            const int64_t now_us = ggml_time_us();
 
             if (llama_vocab_is_eog(vocab, new_token_id)) {
                 done[s] = true;
+                finish_us[s] = now_us;
                 continue;
             }
+
+            if (generated_tokens[s] == 0) {
+                ttft_us[s] = now_us - t_arrival;
+            } else {
+                tgi_sum_us[s] += now_us - last_token_us[s];
+                tgi_count[s]++;
+            }
+
+            last_token_us[s] = now_us;
+            generated_tokens[s]++;
+            system_generated_tokens++;
 
             last_logits_idx[s] = next_batch.n_tokens;
             batch_add(next_batch, new_token_id, seq_pos[s], seq_ids[s], true);
 
             seq_pos[s]++;
-            n_decode_total++;
             active_count++;
         }
 
@@ -313,29 +341,41 @@ static experiment_result run_batch_experiment(
         }
 
         if (llama_decode(ctx, next_batch)) {
-            fprintf(stderr, "%s: failed to eval decode batch\n", __func__);
             llama_batch_free(next_batch);
             break;
+        }
+
+        const int64_t after_decode_us = ggml_time_us();
+        for (int s = 0; s < batch_size; s++) {
+            if (!done[s] && generated_tokens[s] > 0) {
+                finish_us[s] = after_decode_us;
+            }
         }
 
         llama_batch_free(next_batch);
     }
 
-    const auto t_end = ggml_time_us();
-    const double elapsed_s = (t_end - t_start) / 1000000.0;
+    const int64_t t_system_end = ggml_time_us();
 
-    result.n_tokens = n_decode_total;
-    result.elapsed_s = elapsed_s;
-    result.tps = n_decode_total / elapsed_s;
-    result.rps = batch_size / elapsed_s;
+    const double system_tgi_ms =
+            system_generated_tokens > 0
+            ? (t_system_end - t_system_start) / 1000.0 / system_generated_tokens
+            : 0.0;
 
-    fprintf(stderr, "[%s][logical_n_lora=%d] decoded %d tokens in %.2f s, TPS = %.2f, RPS = %.2f\n",
-            mode_name(mode),
-            logical_n_lora,
-            result.n_tokens,
-            result.elapsed_s,
-            result.tps,
-            result.rps);
+    for (int s = 0; s < batch_size; s++) {
+        request_latency item;
+        item.scheme = mode_name(mode);
+        item.round = round_id;
+        item.request_id = s;
+        item.adapter_id = seq_to_lora[s];
+        item.n_tokens = generated_tokens[s];
+        item.ttft_ms = ttft_us[s] >= 0 ? ttft_us[s] / 1000.0 : 0.0;
+        item.user_tgi_ms = tgi_count[s] > 0 ? (tgi_sum_us[s] / 1000.0) / tgi_count[s] : 0.0;
+        item.system_tgi_ms = system_tgi_ms;
+        item.total_latency_ms = finish_us[s] >= 0 ? (finish_us[s] - t_arrival) / 1000.0 : 0.0;
+
+        samples.push_back(item);
+    }
 
     llama_batch_free(batch);
 
@@ -344,36 +384,30 @@ static experiment_result run_batch_experiment(
     }
 
     llama_free(ctx);
-    return result;
+    return samples;
 }
 
-// 顺序推理实验。
-// 每个请求单独创建 context，单独绑定 LoRA，独立 decode。
-static experiment_result run_sequential_experiment(
+// 顺序延迟实验。
+// 关键点：4 个请求视为同时到达，因此 t_arrival 在处理第一个请求之前记录。
+// 第 2、3、4 个请求的 TTFT 和 total latency 会自然包含排队等待时间。
+static std::vector<request_latency> run_sequential_latency_experiment(
         llama_model * model,
         const llama_vocab * vocab,
         const std::vector<std::string> & prompts,
         const std::vector<std::vector<llama_token>> & prompt_tokens,
         const std::vector<llama_adapter_lora *> & lora_adapters,
-        int logical_n_lora,
         int n_predict,
-        float lora_scale) {
+        float lora_scale,
+        int round_id) {
+    std::vector<request_latency> samples;
+
     const int n_requests = (int) prompts.size();
-    const int n_real_lora = (int) lora_adapters.size();
+    std::vector<int> seq_to_lora = build_seq_to_lora(experiment_mode::batch_unfused);
 
-    experiment_result result;
-    result.name = mode_name(experiment_mode::sequential);
-    result.n_lora = logical_n_lora;
-    result.n_requests = n_requests;
+    const int64_t t_arrival = ggml_time_us();
+    const int64_t t_system_start = t_arrival;
 
-    std::vector<int> seq_to_lora = build_seq_to_lora(
-            experiment_mode::batch_unfused,
-            logical_n_lora,
-            n_real_lora);
-
-    const auto t_start = ggml_time_us();
-
-    int n_decode_total = 0;
+    int system_generated_tokens = 0;
 
     for (int s = 0; s < n_requests; s++) {
         const int adapter_id = seq_to_lora[s];
@@ -387,7 +421,6 @@ static experiment_result run_sequential_experiment(
 
         llama_context * ctx = llama_init_from_model(model, ctx_params);
         if (ctx == nullptr) {
-            fprintf(stderr, "%s: failed to create context for request %d\n", __func__, s);
             continue;
         }
 
@@ -395,7 +428,6 @@ static experiment_result run_sequential_experiment(
         std::vector<float> scales = { lora_scale };
 
         if (llama_set_adapters_lora(ctx, adapters.data(), adapters.size(), scales.data()) != 0) {
-            fprintf(stderr, "%s: failed to set LoRA for request %d\n", __func__, s);
             llama_free(ctx);
             continue;
         }
@@ -410,72 +442,183 @@ static experiment_result run_sequential_experiment(
                 const_cast<llama_token *>(prompt_tokens[s].data()),
                 prompt_tokens[s].size());
 
-        int n_decode = 0;
+        int generated = 0;
+        int64_t ttft_us = -1;
+        int64_t last_token_us = -1;
+        int64_t tgi_sum_us = 0;
+        int tgi_count = 0;
+        int64_t finish_us = -1;
+
         llama_token new_token_id;
 
         for (int n_pos = 0; n_pos + batch.n_tokens < n_prompt + n_predict; ) {
             if (llama_decode(ctx, batch)) {
-                fprintf(stderr, "%s: failed to eval request %d\n", __func__, s);
                 break;
             }
 
             n_pos += batch.n_tokens;
 
             new_token_id = llama_sampler_sample(sampler, ctx, -1);
+            const int64_t now_us = ggml_time_us();
 
             if (llama_vocab_is_eog(vocab, new_token_id)) {
+                finish_us = now_us;
                 break;
             }
 
+            if (generated == 0) {
+                ttft_us = now_us - t_arrival;
+            } else {
+                tgi_sum_us += now_us - last_token_us;
+                tgi_count++;
+            }
+
+            last_token_us = now_us;
+            generated++;
+            system_generated_tokens++;
+
             batch = llama_batch_get_one(&new_token_id, 1);
-            n_decode++;
+            finish_us = now_us;
         }
 
-        n_decode_total += n_decode;
+        request_latency item;
+        item.scheme = mode_name(experiment_mode::sequential);
+        item.round = round_id;
+        item.request_id = s;
+        item.adapter_id = adapter_id;
+        item.n_tokens = generated;
+        item.ttft_ms = ttft_us >= 0 ? ttft_us / 1000.0 : 0.0;
+        item.user_tgi_ms = tgi_count > 0 ? (tgi_sum_us / 1000.0) / tgi_count : 0.0;
+        item.system_tgi_ms = 0.0; // 循环结束后统一回填
+        item.total_latency_ms = finish_us >= 0 ? (finish_us - t_arrival) / 1000.0 : 0.0;
+
+        samples.push_back(item);
 
         llama_sampler_free(sampler);
         llama_free(ctx);
     }
 
-    const auto t_end = ggml_time_us();
-    const double elapsed_s = (t_end - t_start) / 1000000.0;
+    const int64_t t_system_end = ggml_time_us();
 
-    result.n_tokens = n_decode_total;
-    result.elapsed_s = elapsed_s;
-    result.tps = n_decode_total / elapsed_s;
-    result.rps = n_requests / elapsed_s;
+    const double system_tgi_ms =
+            system_generated_tokens > 0
+            ? (t_system_end - t_system_start) / 1000.0 / system_generated_tokens
+            : 0.0;
 
-    fprintf(stderr, "[sequential][logical_n_lora=%d] decoded %d tokens in %.2f s, TPS = %.2f, RPS = %.2f\n",
-            logical_n_lora,
-            result.n_tokens,
-            result.elapsed_s,
-            result.tps,
-            result.rps);
+    for (auto & item : samples) {
+        item.system_tgi_ms = system_tgi_ms;
+    }
 
-    return result;
+    return samples;
 }
 
-static void save_results(const std::vector<experiment_result> & results) {
-    const std::string csv_path = "D:/ecnu_experiment/LLama.cpp/llama.cpp/examples/simple-lora/output/multilora_results.csv";
+static latency_summary build_summary(
+        const std::vector<request_latency> & samples,
+        const std::string & scheme) {
+    std::vector<double> ttft_values;
+    std::vector<double> user_tgi_values;
+    std::vector<double> system_tgi_values;
+    std::vector<double> total_values;
 
-    std::filesystem::create_directories("D:/ecnu_experiment/LLama.cpp/llama.cpp/examples/simple-lora/output");
+    for (const auto & s : samples) {
+        if (s.scheme == scheme) {
+            if (s.ttft_ms > 0.0) {
+                ttft_values.push_back(s.ttft_ms);
+            }
+
+            if (s.user_tgi_ms > 0.0) {
+                user_tgi_values.push_back(s.user_tgi_ms);
+            }
+
+            if (s.system_tgi_ms > 0.0) {
+                system_tgi_values.push_back(s.system_tgi_ms);
+            }
+
+            if (s.total_latency_ms > 0.0) {
+                total_values.push_back(s.total_latency_ms);
+            }
+        }
+    }
+
+    latency_summary summary;
+    summary.scheme = scheme;
+    summary.n_samples = (int) ttft_values.size();
+    summary.ttft_p50 = percentile(ttft_values, 50);
+    summary.ttft_p95 = percentile(ttft_values, 95);
+    summary.ttft_p99 = percentile(ttft_values, 99);
+
+    summary.user_tgi_p50 = percentile(user_tgi_values, 50);
+    summary.user_tgi_p95 = percentile(user_tgi_values, 95);
+    summary.user_tgi_p99 = percentile(user_tgi_values, 99);
+
+    summary.system_tgi_p50 = percentile(system_tgi_values, 50);
+    summary.system_tgi_p95 = percentile(system_tgi_values, 95);
+    summary.system_tgi_p99 = percentile(system_tgi_values, 99);
+
+    summary.total_p50 = percentile(total_values, 50);
+    summary.total_p95 = percentile(total_values, 95);
+    summary.total_p99 = percentile(total_values, 99);
+
+    return summary;
+}
+
+static void save_latency_samples(const std::vector<request_latency> & samples) {
+    const std::string output_dir = "D:/ecnu_experiment/LLama.cpp/llama.cpp/examples/simple-lora/output";
+    const std::string csv_path = output_dir + "/latency_samples.csv";
+
+    std::filesystem::create_directories(output_dir);
 
     std::ofstream fout(csv_path);
-    fout << "scheme,n_lora,n_requests,n_tokens,elapsed_s,tps,rps\n";
+    fout << "scheme,round,request_id,adapter_id,n_tokens,ttft_ms,user_tgi_ms,system_tgi_ms,total_latency_ms\n";
 
-    for (const auto & r : results) {
-        fout << r.name << ","
-             << r.n_lora << ","
-             << r.n_requests << ","
-             << r.n_tokens << ","
-             << r.elapsed_s << ","
-             << r.tps << ","
-             << r.rps << "\n";
+    for (const auto & s : samples) {
+        fout << s.scheme << ","
+             << s.round << ","
+             << s.request_id << ","
+             << s.adapter_id << ","
+             << s.n_tokens << ","
+             << s.ttft_ms << ","
+            << s.user_tgi_ms << ","
+            << s.system_tgi_ms << ","
+             << s.total_latency_ms << "\n";
     }
 
     fout.close();
+    fprintf(stderr, "saved latency samples to %s\n", csv_path.c_str());
+}
 
-    fprintf(stderr, "saved results to %s\n", csv_path.c_str());
+static void save_latency_summary(const std::vector<latency_summary> & summaries) {
+    const std::string output_dir = "D:/ecnu_experiment/LLama.cpp/llama.cpp/examples/simple-lora/output";
+    const std::string csv_path = output_dir + "/latency_summary.csv";
+
+    std::filesystem::create_directories(output_dir);
+
+    std::ofstream fout(csv_path);
+    fout << "scheme,n_samples,"
+        << "ttft_p50,ttft_p95,ttft_p99,"
+        << "user_tgi_p50,user_tgi_p95,user_tgi_p99,"
+        << "system_tgi_p50,system_tgi_p95,system_tgi_p99,"
+        << "total_p50,total_p95,total_p99\n";
+
+    for (const auto & s : summaries) {
+        fout << s.scheme << ","
+            << s.n_samples << ","
+            << s.ttft_p50 << ","
+            << s.ttft_p95 << ","
+            << s.ttft_p99 << ","
+            << s.user_tgi_p50 << ","
+            << s.user_tgi_p95 << ","
+            << s.user_tgi_p99 << ","
+            << s.system_tgi_p50 << ","
+            << s.system_tgi_p95 << ","
+            << s.system_tgi_p99 << ","
+            << s.total_p50 << ","
+            << s.total_p95 << ","
+            << s.total_p99 << "\n";
+    }
+
+    fout.close();
+    fprintf(stderr, "saved latency summary to %s\n", csv_path.c_str());
 }
 
 int main(int argc, char ** argv) {
@@ -486,27 +629,38 @@ int main(int argc, char ** argv) {
 
     std::string model_path = "D:/ecnu_experiment/Model/Qwen3.5-4B-BF16.gguf";
 
+    // std::vector<std::string> lora_paths = {
+    //     "D:/ecnu_experiment/Model/qwen35-marketing-adapter.gguf",
+    //     "D:/ecnu_experiment/Model/subliminal-monkey.gguf",
+    // };
     std::vector<std::string> lora_paths = {
         "D:/ecnu_experiment/Model/qwen35-marketing-adapter.gguf",
         "D:/ecnu_experiment/Model/subliminal-monkey.gguf",
-        "D:/ecnu_experiment/Model/subliminal-qwen35-4b-tiger.gguf",
-        "D:/ecnu_experiment/Model/subliminal-qwen35-4b-wolf.gguf",
+        // "D:/ecnu_experiment/Model/subliminal-qwen35-4b-tiger.gguf",
+        // "D:/ecnu_experiment/Model/subliminal-qwen35-4b-wolf.gguf",
     };
 
-    std::vector<std::string> prompt_pool = {
+    // std::vector<std::string> prompts = {
+    //     "Hello my name is",
+    //     "The future of marketing is",
+    //     "A good product slogan is",
+    //     "To attract customers, we should",
+    // };
+    std::vector<std::string> prompts = {
         "Hello my name is",
         "The future of marketing is",
         "A good product slogan is",
         "To attract customers, we should",
-        "A successful advertising campaign should",
-        "The best way to build a brand is",
-        "When launching a new product, marketers should",
-        "Customer loyalty can be improved by",
+        // "A successful advertising campaign should",
+        // "The best way to build a brand is",
+        // "When launching a new product, marketers should",
+        // "Customer loyalty can be improved by",
     };
 
     const int ngl = 99;
     const int n_predict = 32;
     const float lora_scale = 1.0f;
+    const int n_rounds = 30;
 
     ggml_backend_load_all();
 
@@ -522,92 +676,83 @@ int main(int argc, char ** argv) {
     std::vector<llama_adapter_lora *> lora_adapters;
 
     for (const auto & path : lora_paths) {
-        fprintf(stderr, "\n========== LoRA loaded ==========\n");
-
-        const auto t0 = ggml_time_us();
         llama_adapter_lora * adapter = llama_adapter_lora_init(model, path.c_str());
-        const auto t1 = ggml_time_us();
-
         if (adapter == nullptr) {
             fprintf(stderr, "failed to load LoRA: %s\n", path.c_str());
             llama_model_free(model);
             return 1;
         }
 
-        fprintf(stderr, "[LoRA] loaded %s in %.3f ms\n",
-                path.c_str(),
-                (t1 - t0) / 1000.0);
-
         lora_adapters.push_back(adapter);
     }
 
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
-    // 横轴：逻辑并行 LoRA 数量。
-    // 其中 8 和 16 会复用已有 4 个真实 LoRA 文件。
-    // std::vector<int> logical_lora_counts = { 1, 2, 4, 8, 16 };
-    
-    // 横轴：逻辑并行 LoRA 请求数量。
-    // 当前只有 4 个真实 LoRA 文件，超过 4 时通过取模复用已有 LoRA。
-    // 这里测试 1 到 15 个逻辑 LoRA 请求的吞吐变化。
-    std::vector<int> logical_lora_counts = {
-        1, 2, 3, 4, 5,
-        6, 7, 8, 9, 10,
-        11, 12, 13, 14, 15
-    };
+    std::vector<std::vector<llama_token>> prompt_tokens;
+    int n_prompt_total = 0;
 
-    std::vector<experiment_result> results;
-
-    for (int logical_n_lora : logical_lora_counts) {
-        fprintf(stderr, "\n========== EXPERIMENT logical_n_lora = %d ==========\n", logical_n_lora);
-
-        std::vector<std::string> prompts = build_prompts(prompt_pool, logical_n_lora);
-
-        std::vector<std::vector<llama_token>> prompt_tokens;
-        int n_prompt_total = 0;
-
-        if (!tokenize_prompts(vocab, prompts, prompt_tokens, n_prompt_total)) {
-            continue;
+    if (!tokenize_prompts(vocab, prompts, prompt_tokens, n_prompt_total)) {
+        for (auto * adapter : lora_adapters) {
+            llama_adapter_lora_free(adapter);
         }
-
-        results.push_back(run_sequential_experiment(
-                model,
-                vocab,
-                prompts,
-                prompt_tokens,
-                lora_adapters,
-                logical_n_lora,
-                n_predict,
-                lora_scale));
-
-        results.push_back(run_batch_experiment(
-                model,
-                vocab,
-                prompts,
-                prompt_tokens,
-                lora_adapters,
-                lora_paths,
-                experiment_mode::batch_unfused,
-                logical_n_lora,
-                n_prompt_total,
-                n_predict,
-                lora_scale));
-
-        results.push_back(run_batch_experiment(
-                model,
-                vocab,
-                prompts,
-                prompt_tokens,
-                lora_adapters,
-                lora_paths,
-                experiment_mode::batch_grouped,
-                logical_n_lora,
-                n_prompt_total,
-                n_predict,
-                lora_scale));
+        llama_model_free(model);
+        return 1;
     }
 
-    save_results(results);
+    std::vector<request_latency> all_samples;
+
+    for (int round = 0; round < n_rounds; round++) {
+        fprintf(stderr, "\n========== LATENCY ROUND %d / %d ==========\n", round + 1, n_rounds);
+
+        auto seq_samples = run_sequential_latency_experiment(
+                model,
+                vocab,
+                prompts,
+                prompt_tokens,
+                lora_adapters,
+                n_predict,
+                lora_scale,
+                round);
+
+        all_samples.insert(all_samples.end(), seq_samples.begin(), seq_samples.end());
+
+        auto unfused_samples = run_batch_latency_experiment(
+                model,
+                vocab,
+                prompts,
+                prompt_tokens,
+                lora_adapters,
+                experiment_mode::batch_unfused,
+                n_prompt_total,
+                n_predict,
+                lora_scale,
+                round);
+
+        all_samples.insert(all_samples.end(), unfused_samples.begin(), unfused_samples.end());
+
+        auto grouped_samples = run_batch_latency_experiment(
+                model,
+                vocab,
+                prompts,
+                prompt_tokens,
+                lora_adapters,
+                experiment_mode::batch_grouped,
+                n_prompt_total,
+                n_predict,
+                lora_scale,
+                round);
+
+        all_samples.insert(all_samples.end(), grouped_samples.begin(), grouped_samples.end());
+    }
+
+    save_latency_samples(all_samples);
+
+    std::vector<latency_summary> summaries;
+    summaries.push_back(build_summary(all_samples, "sequential"));
+    summaries.push_back(build_summary(all_samples, "batch_unfused"));
+    summaries.push_back(build_summary(all_samples, "batch_grouped"));
+
+    save_latency_summary(summaries);
 
     for (auto * adapter : lora_adapters) {
         llama_adapter_lora_free(adapter);
