@@ -106,6 +106,8 @@ poetry.toml
 # Nix
 /result
 
+/examples/simple-lora/output
+
 # Test binaries
 /tests/test-backend-ops
 /tests/test-double-float
