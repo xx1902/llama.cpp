@@ -107,6 +107,9 @@ poetry.toml
 /result
 
 /examples/simple-lora/output
+/examples/simple-lora-memory/output
+/examples/simple-lora-predict/datasets
+/examples/simple-lora-predict/output
 
 # Test binaries
 /tests/test-backend-ops
