@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import json
-import math
 import random
 import sys
 import time
@@ -19,6 +18,7 @@ from torch.utils.data import DataLoader, TensorDataset
 from tqdm import tqdm
 
 ROOT = Path(__file__).resolve().parents[1]
+SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
 from predictor.fusion_engine import evaluate_lru, evaluate_model_and_fusion
@@ -37,34 +37,46 @@ CN_FONT_CANDIDATES = [
     "Arial Unicode MS",
 ]
 
-BW_COLORS = ["#111111", "#444444", "#777777", "#999999", "#BBBBBB"]
-BW_MARKERS = ["o", "s", "^", "D", "v", "P", "X"]
-BW_LINESTYLES = ["-", "--", "-.", ":", (0, (5, 1)), (0, (3, 1, 1, 1))]
-BW_HATCHES = ["", "//", "\\\\", "xx", "..", "++"]
+# 彩色主题
+COLOR_PALETTE = ["#4C78A8", "#F58518", "#54A24B", "#E45756", "#72B7B2", "#B279A2"]
+
 
 def setup_cn_plot() -> None:
-    """Windows-safe Chinese font setup. Falls back without raising errors."""
+    candidates = [
+        "Microsoft YaHei",
+        "SimHei",
+        "Noto Sans CJK SC",
+        "Noto Sans CJK JP",
+        "Noto Serif CJK JP",
+        "Source Han Sans SC",
+    ]
+
     selected = None
-    for font_name in CN_FONT_CANDIDATES:
+    for name in candidates:
         try:
-            font_manager.findfont(font_name, fallback_to_default=False)
-            selected = font_name
+            font_manager.findfont(name, fallback_to_default=False)
+            selected = name
             break
         except Exception:
             continue
 
+    # 先设 seaborn，再设 rcParams，避免被覆盖
+    sns.set_theme(style="whitegrid", font_scale=1.0)
+
     if selected:
+        plt.rcParams["font.family"] = "sans-serif"
         plt.rcParams["font.sans-serif"] = [selected, "DejaVu Sans"]
+        print(f"[plot] 使用中文字体: {selected}")
     else:
-        print("[plot] 未找到常见中文字体，将使用 Matplotlib 默认字体，若中文乱码请安装 Microsoft YaHei 或 SimHei。")
+        print("[plot] 未找到中文字体，建议安装 Microsoft YaHei 或 SimHei。")
 
     plt.rcParams["axes.unicode_minus"] = False
-    sns.set_theme(style="whitegrid", font_scale=1.0)
 
 def save_fig(path: Path) -> None:
     plt.tight_layout()
     plt.savefig(path, dpi=300, bbox_inches="tight")
     plt.close()
+
 
 def set_seed(seed: int) -> None:
     random.seed(seed)
@@ -74,19 +86,18 @@ def set_seed(seed: int) -> None:
         torch.cuda.manual_seed_all(seed)
 
 
-def load_lsapp(path: str | Path) -> pd.DataFrame:
+def load_lsapp(path: str | Path) -> tuple[pd.DataFrame, LabelEncoder]:
     print(f"[1/9] Loading dataset: {path}", flush=True)
     df = pd.read_csv(path, sep="\t" if str(path).endswith((".tsv", ".tsv.gz")) else ",")
     if len(df.columns) >= 5 and not {"user_id", "timestamp", "app_name"}.issubset(df.columns):
         df = df.iloc[:, :5]
         df.columns = ["user_id", "session_id_raw", "timestamp", "app_name", "event_type"]
+
     df["timestamp"] = pd.to_datetime(df["timestamp"])
     if "event_type" in df.columns:
         df = df[df["event_type"].eq("Opened")].copy()
     df = df.sort_values(["user_id", "timestamp"]).reset_index(drop=True)
 
-    # Interaction/session reconstruction follows the original notebook, but keeps
-    # the output columns compact for reproducible experiments.
     user_changed = df["user_id"].ne(df["user_id"].shift(1))
     app_changed = df["app_name"].ne(df["app_name"].shift(1))
     gap_1m = df["timestamp"].sub(df["timestamp"].shift(1)) > pd.Timedelta(minutes=1)
@@ -107,21 +118,33 @@ def load_lsapp(path: str | Path) -> pd.DataFrame:
     return df_start.reset_index(drop=True), enc
 
 
+def _to_tensors(ids, times, labels):
+    return (
+        torch.tensor(np.asarray(ids), dtype=torch.long),
+        torch.tensor(np.asarray(times), dtype=torch.float32),
+        torch.tensor(np.asarray(labels), dtype=torch.long),
+    )
+
+
 def build_user_windows(df: pd.DataFrame, window_size: int, test_ratio: float = 0.2) -> dict:
     samples = {}
     groups = list(df.sort_values(["user_id", "timestamp"]).groupby("user_id"))
     for uid, group in tqdm(groups, desc=f"Build windows L={window_size}", unit="user", leave=False):
         if len(group) <= window_size + 1:
             continue
+
         ids = group["lora_id"].to_numpy()
         times = group[["sin_hour", "cos_hour", "delta_norm"]].to_numpy(dtype=np.float32)
         split_idx = int((1.0 - test_ratio) * len(group))
+
         train_ids, train_t, train_y = [], [], []
         test_ids, test_t, test_y = [], [], []
+
         for i in range(len(group) - window_size):
             x_id = ids[i : i + window_size]
             x_t = times[i : i + window_size]
             y = ids[i + window_size]
+
             if i + window_size < split_idx:
                 train_ids.append(x_id)
                 train_t.append(x_t)
@@ -130,11 +153,13 @@ def build_user_windows(df: pd.DataFrame, window_size: int, test_ratio: float = 0
                 test_ids.append(x_id)
                 test_t.append(x_t)
                 test_y.append(y)
+
         if train_y and test_y:
             samples[uid] = {
                 "train": _to_tensors(train_ids, train_t, train_y),
                 "test": _to_tensors(test_ids, test_t, test_y),
             }
+
     return samples
 
 
@@ -146,6 +171,21 @@ def merge_train_samples(samples_by_user: dict) -> tuple[torch.Tensor, torch.Tens
         ts.append(t)
         ys.append(y)
     return torch.cat(xs), torch.cat(ts), torch.cat(ys)
+
+
+def evaluate_model_only(model: torch.nn.Module, samples_by_user: dict, device: torch.device) -> dict:
+    model.eval()
+    hits = {1: 0, 3: 0, 5: 0}
+    total = 0
+    with torch.no_grad():
+        for data in tqdm(samples_by_user.values(), desc="Evaluate GRU", unit="user", leave=False):
+            x, t, y = data["test"]
+            logits = model(x.to(device), t.to(device))
+            pred = torch.argsort(logits, dim=1, descending=True).cpu()
+            for k in hits:
+                hits[k] += (pred[:, :k] == y.unsqueeze(1)).any(dim=1).sum().item()
+            total += len(y)
+    return {f"top{k}": hits[k] / total for k in hits}
 
 
 def train_model(
@@ -169,6 +209,7 @@ def train_model(
         model.train()
         losses = []
         start = time.perf_counter()
+
         for x, t, y in tqdm(loader, desc=f"Epoch {epoch}/{epochs}", unit="batch", leave=False):
             x, t, y = x.to(device), t.to(device), y.to(device)
             optimizer.zero_grad()
@@ -177,32 +218,21 @@ def train_model(
             torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
             optimizer.step()
             losses.append(loss.item())
+
         val = evaluate_model_only(model, samples_by_user, device)
-        history.append({
-            "epoch": epoch,
-            "train_loss": float(np.mean(losses)),
-            "val_top1": val["top1"],
-            "val_top3": val["top3"],
-            "val_top5": val["top5"],
-            "epoch_seconds": time.perf_counter() - start,
-        })
+        history.append(
+            {
+                "epoch": epoch,
+                "train_loss": float(np.mean(losses)),
+                "val_top1": val["top1"],
+                "val_top3": val["top3"],
+                "val_top5": val["top5"],
+                "epoch_seconds": time.perf_counter() - start,
+            }
+        )
         print(f"epoch={epoch:02d} loss={history[-1]['train_loss']:.4f} top3={val['top3']:.4f}")
+
     return model, pd.DataFrame(history)
-
-
-def evaluate_model_only(model: torch.nn.Module, samples_by_user: dict, device: torch.device) -> dict:
-    model.eval()
-    hits = {1: 0, 3: 0, 5: 0}
-    total = 0
-    with torch.no_grad():
-        for data in tqdm(samples_by_user.values(), desc="Evaluate GRU", unit="user", leave=False):
-            x, t, y = data["test"]
-            logits = model(x.to(device), t.to(device))
-            pred = torch.argsort(logits, dim=1, descending=True).cpu()
-            for k in hits:
-                hits[k] += (pred[:, :k] == y.unsqueeze(1)).any(dim=1).sum().item()
-            total += len(y)
-    return {f"top{k}": hits[k] / total for k in hits}
 
 
 def measure_prediction_latency(model: torch.nn.Module, samples_by_user: dict, device: torch.device, repeats: int = 200) -> float:
@@ -216,11 +246,13 @@ def measure_prediction_latency(model: torch.nn.Module, samples_by_user: dict, de
             _ = model(x, t)
         if device.type == "cuda":
             torch.cuda.synchronize()
+
         start = time.perf_counter()
         for _ in range(repeats):
             _ = model(x, t)
         if device.type == "cuda":
             torch.cuda.synchronize()
+
     return (time.perf_counter() - start) * 1000 / repeats
 
 
@@ -229,13 +261,9 @@ def plot_training_curve(history: pd.DataFrame, out: Path) -> None:
     fig, ax1 = plt.subplots(figsize=(7, 4))
 
     ax1.plot(
-        history["epoch"],
-        history["train_loss"],
-        marker="o",
-        linestyle="-",
-        color="#111111",
-        linewidth=1.8,
-        markersize=5,
+        history["epoch"], history["train_loss"],
+        marker="o", linestyle="-",
+        color=COLOR_PALETTE[0], linewidth=1.8, markersize=5,
         label="训练损失",
     )
     ax1.set_xlabel("训练轮次")
@@ -244,13 +272,9 @@ def plot_training_curve(history: pd.DataFrame, out: Path) -> None:
 
     ax2 = ax1.twinx()
     ax2.plot(
-        history["epoch"],
-        history["val_top3"],
-        marker="s",
-        linestyle="--",
-        color="#555555",
-        linewidth=1.8,
-        markersize=5,
+        history["epoch"], history["val_top3"],
+        marker="s", linestyle="--",
+        color=COLOR_PALETTE[1], linewidth=1.8, markersize=5,
         label="Top-3命中率",
     )
     ax2.set_ylabel("Top-3命中率")
@@ -268,13 +292,9 @@ def plot_window_sweep(df: pd.DataFrame, out: Path) -> None:
     setup_cn_plot()
     plt.figure(figsize=(6, 4))
     plt.plot(
-        df["window"],
-        df["top3"],
-        marker="o",
-        linestyle="-",
-        color="#111111",
-        linewidth=1.8,
-        markersize=6,
+        df["window"], df["top3"],
+        marker="o", linestyle="-",
+        color=COLOR_PALETTE[2], linewidth=1.8, markersize=6,
         label="GRU",
     )
     plt.xlabel("窗口长度")
@@ -298,16 +318,8 @@ def plot_method_bars(metrics: pd.DataFrame, out: Path) -> None:
 
     fig, ax = plt.subplots(figsize=(7, 4))
     x = np.arange(len(sub))
-    bars = ax.bar(
-        x,
-        sub["top3"],
-        color=["#EEEEEE", "#CCCCCC", "#AAAAAA", "#888888"],
-        edgecolor="#111111",
-        linewidth=1.0,
-    )
-
-    for bar, hatch in zip(bars, BW_HATCHES):
-        bar.set_hatch(hatch)
+    colors = [COLOR_PALETTE[i % len(COLOR_PALETTE)] for i in range(len(sub))]
+    ax.bar(x, sub["top3"], color=colors, edgecolor="#222222", linewidth=1.0)
 
     ax.set_xticks(x)
     ax.set_xticklabels(sub["method_cn"], rotation=20, ha="right")
@@ -316,6 +328,7 @@ def plot_method_bars(metrics: pd.DataFrame, out: Path) -> None:
     ax.grid(axis="y", alpha=0.3)
 
     save_fig(out)
+
 
 def plot_relation_heatmap(df: pd.DataFrame, out: Path, top_n: int = 8) -> None:
     setup_cn_plot()
@@ -333,7 +346,7 @@ def plot_relation_heatmap(df: pd.DataFrame, out: Path, top_n: int = 8) -> None:
     plt.figure(figsize=(8, 6))
     sns.heatmap(
         mat,
-        cmap="Greys",
+        cmap="YlGnBu",
         annot=True,
         fmt=".2f",
         cbar_kws={"label": "转移概率"},
@@ -346,48 +359,40 @@ def plot_relation_heatmap(df: pd.DataFrame, out: Path, top_n: int = 8) -> None:
 
 
 def plot_relation_topology(global_seq: pd.DataFrame, out: Path, threshold: float = 0.3) -> None:
+    setup_cn_plot()
     g = nx.DiGraph()
     for _, row in global_seq.iterrows():
         if row["weight"] >= threshold:
             g.add_edge(row["src_lora"], row["dst_lora"], weight=row["weight"])
+
     plt.figure(figsize=(10, 7))
     if len(g) == 0:
         plt.text(0.5, 0.5, "No edges above threshold", ha="center", va="center")
     else:
         pos = nx.spring_layout(g, seed=42)
         weights = [g[u][v]["weight"] * 3 for u, v in g.edges()]
-        nx.draw_networkx_nodes(g, pos, node_size=700, node_color="#9bd3ec")
-        nx.draw_networkx_edges(g, pos, width=weights, edge_color="#666666", arrows=True, alpha=0.75)
+        nx.draw_networkx_nodes(g, pos, node_size=700, node_color="#6BAED6")
+        nx.draw_networkx_edges(g, pos, width=weights, edge_color="#3182BD", arrows=True, alpha=0.8)
         nx.draw_networkx_labels(g, pos, font_size=7)
+
     plt.axis("off")
-    plt.tight_layout()
-    plt.savefig(out, dpi=300)
-    plt.close()
+    save_fig(out)
 
 
 def plot_sweep(df: pd.DataFrame, x: str, y: str, out: Path, xlabel: str) -> None:
+    setup_cn_plot()
     plt.figure(figsize=(6, 4))
-    plt.plot(df[x], df[y], marker="o")
+    plt.plot(df[x], df[y], marker="o", color=COLOR_PALETTE[3], linewidth=1.8)
     plt.xlabel(xlabel)
     plt.ylabel("Top-3 Hit Rate")
     plt.grid(alpha=0.3)
-    plt.tight_layout()
-    plt.savefig(out, dpi=300)
-    plt.close()
-
-
-def _to_tensors(ids, times, labels):
-    return (
-        torch.tensor(np.asarray(ids), dtype=torch.long),
-        torch.tensor(np.asarray(times), dtype=torch.float32),
-        torch.tensor(np.asarray(labels), dtype=torch.long),
-    )
+    save_fig(out)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--input", default="D:/ecnu_experiment/LoRA/datasets/lsapp.tsv.gz")
-    parser.add_argument("--output-dir", default=str(ROOT / "outputs" / "prediction"))
+    parser.add_argument("--input", default=str(SCRIPT_DIR / "datasets" / "lsapp.tsv.gz"))
+    parser.add_argument("--output-dir", default=str(SCRIPT_DIR / "output"))
     parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch-size", type=int, default=256)
     parser.add_argument("--lr", type=float, default=1e-3)
@@ -397,8 +402,9 @@ def main() -> None:
     args = parser.parse_args()
 
     set_seed(args.seed)
-    out_dir = Path(args.output_dir)
+    out_dir = Path(args.output_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     df, encoder = load_lsapp(args.input)
@@ -409,8 +415,10 @@ def main() -> None:
 
     print("[3/9] Building global relation tables...", flush=True)
     global_seq, global_co = build_global_relation_tables(df)
+
     print("[4/9] Building user relation tables...", flush=True)
     user_seq, user_co = build_user_relation_tables(df)
+
     print("[5/9] Plotting relation figures...", flush=True)
     plot_relation_heatmap(df, out_dir / "fig3_3_relation_heatmap.png")
     plot_relation_topology(global_seq, out_dir / "fig3_4_relation_topology.png")
@@ -419,6 +427,7 @@ def main() -> None:
     samples = build_user_windows(df, args.default_window)
     print(f"[6/9] Training default GRU on {len(samples)} users...", flush=True)
     model, history = train_model(samples, num_loras, args.epochs, args.batch_size, args.lr, device)
+
     history.to_csv(out_dir / "training_history.csv", index=False)
     torch.save(model.state_dict(), out_dir / "gru_global.pt")
     plot_training_curve(history, out_dir / "fig5_1_training_curve.png")
@@ -429,30 +438,32 @@ def main() -> None:
         model, samples, id_to_name, name_to_id, global_seq, global_co, user_seq, user_co,
         alpha=0.8, temperature=0.05, device=device, desc="Fusion eval alpha=0.8 T=0.05"
     )
+
     latency = measure_prediction_latency(model, samples, device)
     rows = [{"method": "LRU", **lru}]
     rows.extend({"method": k, **v} for k, v in fusion.items())
+
     metrics = pd.DataFrame(rows)
     metrics["prediction_latency_ms"] = np.nan
     metrics.loc[metrics["method"].eq("GRU"), "prediction_latency_ms"] = latency
     metrics.to_csv(out_dir / "metrics_summary.csv", index=False)
     plot_method_bars(metrics, out_dir / "fig5_3_method_topk.png")
 
+    print(f"[8/9] Running window sweep: {args.window_sweep}", flush=True)
     window_rows = []
     windows = [int(x) for x in args.window_sweep.split(",") if x.strip()]
-    print(f"[8/9] Running window sweep: {windows}", flush=True)
     for w in tqdm(windows, desc="Window sweep", unit="window"):
-        print(f"window sweep: {w}", flush=True)
         s = build_user_windows(df, w)
-        m, h = train_model(s, num_loras, max(3, args.epochs // 2), args.batch_size, args.lr, device)
+        m, _ = train_model(s, num_loras, max(3, args.epochs // 2), args.batch_size, args.lr, device)
         val = evaluate_model_only(m, s, device)
         window_rows.append({"window": w, **val})
+
     window_df = pd.DataFrame(window_rows)
     window_df.to_csv(out_dir / "window_sweep.csv", index=False)
     plot_window_sweep(window_df, out_dir / "fig5_2_window_top3.png")
 
-    alpha_rows = []
     print("[9/9] Running alpha and temperature sweeps...", flush=True)
+    alpha_rows = []
     for alpha in tqdm([0.5, 0.65, 0.75, 0.8, 0.85, 0.9, 0.95], desc="Alpha sweep", unit="alpha"):
         res = evaluate_model_and_fusion(
             model, samples, id_to_name, name_to_id, global_seq, global_co, user_seq, user_co,
@@ -477,6 +488,7 @@ def main() -> None:
     config = vars(args)
     config.update({"num_loras": num_loras, "num_users": int(df["user_id"].nunique()), "device": str(device)})
     (out_dir / "run_config.json").write_text(json.dumps(config, indent=2), encoding="utf-8")
+
     print(f"done. results written to {out_dir}")
 
 
