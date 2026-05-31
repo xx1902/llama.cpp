@@ -21,9 +21,9 @@ PATH_NAME = {
 }
 
 PATH_COLOR = {
-    "gpu_hot": "#4C72B0",
-    "cpu_warm": "#DD8452",
-    "file_load": "#55A868",
+    "gpu_hot": "#F18E2A",    # 橙色：GPU 热区
+    "cpu_warm": "#EEDD40",   # 黄色：CPU 温区
+    "file_load": "#649FDD",  # 蓝色：SSD 冷区
 }
 
 
@@ -100,6 +100,7 @@ def plot_box(df):
         labels=labels,
         patch_artist=True,
         showfliers=True,
+        widths=0.6,
         flierprops=flierprops,
         medianprops=medianprops,
         whiskerprops=whiskerprops,

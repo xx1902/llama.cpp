@@ -1,27 +1,11 @@
 // simple-lora-memory.cpp
-//
-// LoRA 不同加载路径延迟真实测量实验
-//
-// 本程序用于测量 LoRA adapter 从不同状态到“可以完成一次最小前向计算”的时间。
-// 和只测 llama_set_adapters_lora 不同，这里会在 CPU 温区和文件加载路径中加入一次 1-token decode，
-// 用来触发 LoRA 在当前 context 下真正进入可运行路径。
-//
+// 本程序用于测量 LoRA adapter 从不同驻留状态到“完成绑定、可被当前 context 使用”的路径延迟。
+// 本实验不包含 token decode 前向计算，只统计 LoRA adapter 的加载、CPU->GPU 提升和绑定开销。
+
 // 测量路径：
-// 1. GPU 热区：adapter 已经绑定在当前 context 中，测重复绑定同一 adapter 的开销。
-//    该路径代表 adapter 已经可直接复用。
-// 2. CPU 温区：adapter 已经通过 llama_adapter_lora_init 初始化在进程内，
-//    但当前 context 需要切换到该 adapter，测绑定 + 1-token decode。
-//    这是“已在内存中的 adapter 进入可运行状态”的近似测量。
-// 3. 文件加载：adapter 不在进程缓存中，测 llama_adapter_lora_init + 绑定 + 1-token decode。
-//    该路径代表需要从 LoRA GGUF 文件初始化 adapter 后才能运行。
-//
-// 注意：
-// - llama.cpp 当前公开 LoRA API 没有直接暴露 CPU backend tensor 到 GPU backend tensor 的迁移接口。
-// - 因此这里的 CPU 温区不是严格的 CPU->GPU 显式迁移，而是“已初始化 adapter 对象”的工程近似。
-// - 如果操作系统文件缓存已经命中，文件加载也不一定等价于严格 SSD cold load。
-//
-// 输出文件：
-// D:/ecnu_experiment/LLama.cpp/llama.cpp/examples/simple-lora-memory/output/lora_load_path_latency.csv
+// 1. GPU 热区：adapter 已经位于模型所在 backend buffer 中，测绑定开销。
+// 2. CPU 温区：adapter 已经加载到 CPU backend buffer 中，测克隆/提升到模型所在 backend buffer + 绑定开销。
+// 3. SSD 冷区：adapter 不在内存中，测从 LoRA GGUF 文件初始化到模型所在 backend buffer + 绑定开销。
 
 #include "llama.h"
 
@@ -37,9 +21,8 @@ struct latency_sample {
     std::string path_type;
     int round = 0;
     int adapter_id = 0;
-    double init_ms = 0.0;
+    double load_ms = 0.0;
     double bind_ms = 0.0;
-    double decode_ms = 0.0;
     double total_ms = 0.0;
 };
 
@@ -76,51 +59,51 @@ static void clear_adapter(llama_context * ctx) {
 
 // 执行一次最小 1-token decode。
 // 这一步用于触发 adapter 在当前 context 下真正参与一次前向计算。
-static double run_one_token_decode(
-        llama_context * ctx,
-        const llama_vocab * vocab) {
-    llama_memory_clear(llama_get_memory(ctx), true);
+// static double run_one_token_decode(
+//         llama_context * ctx,
+//         const llama_vocab * vocab) {
+//     llama_memory_clear(llama_get_memory(ctx), true);
 
-    const char * prompt = "Hello";
-    const int n_prompt = -llama_tokenize(
-            vocab,
-            prompt,
-            5,
-            nullptr,
-            0,
-            true,
-            true);
+//     const char * prompt = "Hello";
+//     const int n_prompt = -llama_tokenize(
+//             vocab,
+//             prompt,
+//             5,
+//             nullptr,
+//             0,
+//             true,
+//             true);
 
-    std::vector<llama_token> tokens(n_prompt);
+//     std::vector<llama_token> tokens(n_prompt);
 
-    if (llama_tokenize(
-                vocab,
-                prompt,
-                5,
-                tokens.data(),
-                tokens.size(),
-                true,
-                true) < 0) {
-        fprintf(stderr, "failed to tokenize warmup prompt\n");
-        return 0.0;
-    }
+//     if (llama_tokenize(
+//                 vocab,
+//                 prompt,
+//                 5,
+//                 tokens.data(),
+//                 tokens.size(),
+//                 true,
+//                 true) < 0) {
+//         fprintf(stderr, "failed to tokenize warmup prompt\n");
+//         return 0.0;
+//     }
 
-    llama_batch batch = llama_batch_get_one(tokens.data(), tokens.size());
+//     llama_batch batch = llama_batch_get_one(tokens.data(), tokens.size());
 
-    const auto t0 = ggml_time_us();
+//     const auto t0 = ggml_time_us();
 
-    if (llama_decode(ctx, batch)) {
-        fprintf(stderr, "failed to run one-token decode\n");
-    }
+//     if (llama_decode(ctx, batch)) {
+//         fprintf(stderr, "failed to run one-token decode\n");
+//     }
 
-    const auto t1 = ggml_time_us();
+//     const auto t1 = ggml_time_us();
 
-    return (t1 - t0) / 1000.0;
-}
+//     return (t1 - t0) / 1000.0;
+// }
 
 static latency_sample measure_gpu_hot(
         llama_context * ctx,
-        llama_adapter_lora * adapter,
+        llama_adapter_lora * gpu_adapter,
         int round,
         int adapter_id,
         float scale) {
@@ -129,9 +112,8 @@ static latency_sample measure_gpu_hot(
     sample.round = round;
     sample.adapter_id = adapter_id;
 
-    // GPU 热区表示 adapter 已经是当前可复用状态。
-    // 这里测的是重复绑定同一个 adapter 的轻量级开销。
-    sample.bind_ms = bind_adapter(ctx, adapter, scale);
+    sample.load_ms = 0.0;
+    sample.bind_ms = bind_adapter(ctx, gpu_adapter, scale);
     sample.total_ms = sample.bind_ms;
 
     return sample;
@@ -139,9 +121,7 @@ static latency_sample measure_gpu_hot(
 
 static latency_sample measure_cpu_warm(
         llama_context * ctx,
-        const llama_vocab * vocab,
-        llama_adapter_lora * adapter,
-        llama_adapter_lora * different_adapter,
+        llama_adapter_lora * cpu_adapter,
         int round,
         int adapter_id,
         float scale) {
@@ -150,17 +130,22 @@ static latency_sample measure_cpu_warm(
     sample.round = round;
     sample.adapter_id = adapter_id;
 
-    // 先绑定到另一个 adapter，避免 llama_set_adapters_lora 走“adapter 相同”的快速路径。
-    if (different_adapter != nullptr && different_adapter != adapter) {
-        bind_adapter(ctx, different_adapter, scale);
-    } else {
-        clear_adapter(ctx);
+    const auto t0 = ggml_time_us();
+    llama_adapter_lora * gpu_adapter =
+            llama_adapter_lora_clone_to_model_buft(cpu_adapter);
+    const auto t1 = ggml_time_us();
+
+    if (gpu_adapter == nullptr) {
+        fprintf(stderr, "failed to promote CPU LoRA adapter\n");
+        return sample;
     }
 
-    // CPU 温区表示 adapter 已初始化在进程内，但当前 context 需要切换到它。
-    sample.bind_ms = bind_adapter(ctx, adapter, scale);
-    sample.decode_ms = run_one_token_decode(ctx, vocab);
-    sample.total_ms = sample.bind_ms + sample.decode_ms;
+    sample.load_ms = (t1 - t0) / 1000.0;
+    sample.bind_ms = bind_adapter(ctx, gpu_adapter, scale);
+    sample.total_ms = sample.load_ms + sample.bind_ms;
+
+    clear_adapter(ctx);
+    llama_adapter_lora_free(gpu_adapter);
 
     return sample;
 }
@@ -168,9 +153,7 @@ static latency_sample measure_cpu_warm(
 static latency_sample measure_file_load(
         llama_model * model,
         llama_context * ctx,
-        const llama_vocab * vocab,
         const std::string & path,
-        llama_adapter_lora * different_adapter,
         int round,
         int adapter_id,
         float scale) {
@@ -179,28 +162,22 @@ static latency_sample measure_file_load(
     sample.round = round;
     sample.adapter_id = adapter_id;
 
-    if (different_adapter != nullptr) {
-        bind_adapter(ctx, different_adapter, scale);
-    } else {
-        clear_adapter(ctx);
-    }
+    const auto t0 = ggml_time_us();
+    llama_adapter_lora * gpu_adapter =
+            llama_adapter_lora_init(model, path.c_str());
+    const auto t1 = ggml_time_us();
 
-    const auto t_init0 = ggml_time_us();
-    llama_adapter_lora * adapter = llama_adapter_lora_init(model, path.c_str());
-    const auto t_init1 = ggml_time_us();
-
-    if (adapter == nullptr) {
-        fprintf(stderr, "failed to initialize LoRA adapter: %s\n", path.c_str());
+    if (gpu_adapter == nullptr) {
+        fprintf(stderr, "failed to load LoRA adapter from file: %s\n", path.c_str());
         return sample;
     }
 
-    sample.init_ms = (t_init1 - t_init0) / 1000.0;
-    sample.bind_ms = bind_adapter(ctx, adapter, scale);
-    sample.decode_ms = run_one_token_decode(ctx, vocab);
-    sample.total_ms = sample.init_ms + sample.bind_ms + sample.decode_ms;
+    sample.load_ms = (t1 - t0) / 1000.0;
+    sample.bind_ms = bind_adapter(ctx, gpu_adapter, scale);
+    sample.total_ms = sample.load_ms + sample.bind_ms;
 
     clear_adapter(ctx);
-    llama_adapter_lora_free(adapter);
+    llama_adapter_lora_free(gpu_adapter);
 
     return sample;
 }
@@ -211,16 +188,15 @@ static void save_samples(const std::vector<latency_sample> & samples) {
     const std::string csv_path = output_dir + "/lora_load_path_latency.csv";
     std::ofstream fout(csv_path);
 
-    fout << "path_type,round,adapter_id,init_ms,bind_ms,decode_ms,total_ms\n";
+    fout << "path_type,round,adapter_id,load_ms,bind_ms,total_ms\n";
 
     for (const auto & s : samples) {
         fout << s.path_type << ","
-             << s.round << ","
-             << s.adapter_id << ","
-             << s.init_ms << ","
-             << s.bind_ms << ","
-             << s.decode_ms << ","
-             << s.total_ms << "\n";
+            << s.round << ","
+            << s.adapter_id << ","
+            << s.load_ms << ","
+            << s.bind_ms << ","
+            << s.total_ms << "\n";
     }
 
     fout.close();
@@ -270,78 +246,62 @@ int main() {
         return 1;
     }
 
-    const llama_vocab * vocab = llama_model_get_vocab(model);
 
     std::vector<latency_sample> samples;
-    std::vector<llama_adapter_lora *> warm_adapters;
+
+    std::vector<llama_adapter_lora *> gpu_hot_adapters;
+    std::vector<llama_adapter_lora *> cpu_warm_adapters;
 
     // 预加载 adapter，作为 CPU 温区和 GPU 热区实验的基础。
     // 这些 adapter 已经完成 llama_adapter_lora_init，不再重复从文件解析。
     for (int i = 0; i < (int) lora_paths.size(); i++) {
-        fprintf(stderr, "preloading LoRA adapter %d: %s\n", i, lora_paths[i].c_str());
+        llama_adapter_lora * gpu_adapter =
+                llama_adapter_lora_init(model, lora_paths[i].c_str());
 
-        llama_adapter_lora * adapter = llama_adapter_lora_init(model, lora_paths[i].c_str());
+        llama_adapter_lora * cpu_adapter =
+                llama_adapter_lora_init_cpu(model, lora_paths[i].c_str());
 
-        if (adapter == nullptr) {
-            fprintf(stderr, "failed to preload LoRA adapter: %s\n", lora_paths[i].c_str());
-
-            for (auto * a : warm_adapters) {
-                llama_adapter_lora_free(a);
-            }
-
-            llama_free(ctx);
-            llama_model_free(model);
+        if (gpu_adapter == nullptr || cpu_adapter == nullptr) {
+            fprintf(stderr, "failed to preload LoRA adapter %d\n", i);
             return 1;
         }
 
-        warm_adapters.push_back(adapter);
+        gpu_hot_adapters.push_back(gpu_adapter);
+        cpu_warm_adapters.push_back(cpu_adapter);
     }
 
-    // 先做一次预热，避免把首次 graph reserve 全部算进第一轮样本。
-    for (int i = 0; i < (int) warm_adapters.size(); i++) {
-        bind_adapter(ctx, warm_adapters[i], lora_scale);
-        run_one_token_decode(ctx, vocab);
+    // 预热：避免把首次 set adapter 的一些一次性开销全部算进第一轮样本。
+    for (int i = 0; i < (int) gpu_hot_adapters.size(); i++) {
+        bind_adapter(ctx, gpu_hot_adapters[i], lora_scale);
+        clear_adapter(ctx);
     }
 
     for (int round = 0; round < n_rounds; round++) {
         for (int adapter_id = 0; adapter_id < (int) lora_paths.size(); adapter_id++) {
-            const int other_id = (adapter_id + 1) % (int) warm_adapters.size();
-
             fprintf(stderr,
                     "round %d/%d, adapter %d\n",
                     round + 1,
                     n_rounds,
                     adapter_id);
 
-            // 路径 1：GPU 热区。
-            // 先绑定目标 adapter，使其成为当前 context 的活跃 adapter。
-            bind_adapter(ctx, warm_adapters[adapter_id], lora_scale);
             samples.push_back(measure_gpu_hot(
                     ctx,
-                    warm_adapters[adapter_id],
+                    gpu_hot_adapters[adapter_id],
                     round,
                     adapter_id,
                     lora_scale));
 
-            // 路径 2：CPU 温区。
-            // adapter 已经初始化，但需要从另一个 adapter 切换过来，并完成一次前向。
             samples.push_back(measure_cpu_warm(
                     ctx,
-                    vocab,
-                    warm_adapters[adapter_id],
-                    warm_adapters[other_id],
+                    cpu_warm_adapters[adapter_id],
                     round,
                     adapter_id,
                     lora_scale));
 
-            // 路径 3：文件加载。
-            // adapter 不复用预加载对象，而是重新从 GGUF 初始化，并完成一次前向。
             samples.push_back(measure_file_load(
                     model,
                     ctx,
-                    vocab,
                     lora_paths[adapter_id],
-                    warm_adapters[other_id],
                     round,
                     adapter_id,
                     lora_scale));
@@ -352,7 +312,11 @@ int main() {
 
     clear_adapter(ctx);
 
-    for (auto * adapter : warm_adapters) {
+    for (auto * adapter : gpu_hot_adapters) {
+        llama_adapter_lora_free(adapter);
+    }
+
+    for (auto * adapter : cpu_warm_adapters) {
         llama_adapter_lora_free(adapter);
     }
 
