@@ -45,9 +45,10 @@ def setup_chinese_font():
         "Microsoft YaHei",
         "SimHei",
         "Noto Sans CJK SC",
+        "Noto Sans CJK JP",      # 加上
+        "Noto Serif CJK JP",     # 加上
         "Source Han Sans SC",
     ]
-
     available = {f.name for f in font_manager.fontManager.ttflist}
 
     for name in candidates:
