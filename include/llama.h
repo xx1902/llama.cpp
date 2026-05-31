@@ -640,6 +640,13 @@ extern "C" {
             struct llama_model * model,
             const char * path_lora);
 
+    LLAMA_API struct llama_adapter_lora * llama_adapter_lora_init_cpu(
+        struct llama_model * model,
+        const char * path_lora);
+
+    LLAMA_API struct llama_adapter_lora * llama_adapter_lora_clone_to_model_buft(
+            const struct llama_adapter_lora * adapter);
+
     // Functions to access the adapter's GGUF metadata scalar values
     // - The functions return the length of the string on success, or -1 on failure
     // - The output string is always null-terminated and cleared on failure

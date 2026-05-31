@@ -49,7 +49,6 @@ def setup_chinese_font():
         "Noto Serif CJK JP",     # 加上
         "Source Han Sans SC",
     ]
-
     available = {f.name for f in font_manager.fontManager.ttflist}
 
     for name in candidates:

@@ -1,5 +1,6 @@
 // simple-lora.cpp
 //
+<<<<<<< HEAD
 // Profiling 时间分布实验
 //
 // 本程序用于单独测试多 LoRA 批处理推理中的时间组成。
@@ -17,6 +18,25 @@
 // 注意：
 // 这里统计的是代码层时间分布，不是严格的 CUDA kernel profiling。
 // 更细粒度的 kernel 启动开销和显存 IO 时间需要使用 Nsight Systems / Nsight Compute。
+=======
+// 图 5-9 延迟分布实验代码
+//
+// 本程序用于测量多 LoRA 推理场景下三种执行方式的端到端延迟分布：
+// 1. sequential：4 个请求同时到达，但系统按顺序逐个处理。
+//    因此第 2、3、4 个请求的 TTFT 和总延迟需要包含前面请求的等待时间。
+// 2. batch_unfused：4 个请求组成 batch，但 LoRA 交错排列：0,1,0,1。
+// 3. batch_grouped：4 个请求组成 batch，并按 LoRA 分组排列：0,0,1,1。
+//
+// 主要统计指标：
+// - TTFT：Time To First Token，从请求到达系统到生成第一个 token 的时间。
+// - TGI：Token Generation Interval，同一请求相邻生成 token 之间的平均间隔。
+// - Total Latency：从请求到达系统到该请求生成结束的总时间。
+// - P50 / P95 / P99：延迟分位值。
+//
+// 输出文件：
+// D:/ecnu_experiment/LLama.cpp/llama.cpp/examples/simple-lora/output/latency_samples.csv
+// D:/ecnu_experiment/LLama.cpp/llama.cpp/examples/simple-lora/output/latency_summary.csv
+>>>>>>> 50c34b2fbe4deb16c3ce50ca17b211d4d3f402c1
 
 #include "llama.h"
 
@@ -29,10 +49,15 @@
 #include <vector>
 
 enum class experiment_mode {
+<<<<<<< HEAD
+=======
+    sequential,
+>>>>>>> 50c34b2fbe4deb16c3ce50ca17b211d4d3f402c1
     batch_unfused,
     batch_grouped,
 };
 
+<<<<<<< HEAD
 struct profiling_result {
     std::string scheme;
     int n_lora = 0;
@@ -45,10 +70,57 @@ struct profiling_result {
     double decode_ms = 0.0;
     double sampling_ms = 0.0;
     double other_ms = 0.0;
+=======
+struct request_latency {
+    std::string scheme;
+    int round = 0;
+    int request_id = 0;
+    int adapter_id = 0;
+    int n_tokens = 0;
+
+    // TTFT：从请求共同到达到生成第一个 token 的时间。
+    double ttft_ms = 0.0;
+
+    // 用户感知 TGI：同一个请求内部，相邻 token 之间的平均间隔。
+    // 这个指标反映用户看到流式输出时是否平滑。
+    double user_tgi_ms = 0.0;
+
+    // 系统级 TGI：系统整体每生成一个 token 的平均耗时。
+    // 批处理每一步会同时为多个请求生成 token，因此需要用总耗时 / 总 token 数来衡量系统效率。
+    double system_tgi_ms = 0.0;
+
+    // 总延迟：从请求共同到达到该请求生成结束的时间。
+    double total_latency_ms = 0.0;
+};
+
+struct latency_summary {
+    std::string scheme;
+    int n_samples = 0;
+    double ttft_p50 = 0.0;
+    double ttft_p95 = 0.0;
+    double ttft_p99 = 0.0;
+
+    double user_tgi_p50 = 0.0;
+    double user_tgi_p95 = 0.0;
+    double user_tgi_p99 = 0.0;
+
+    double system_tgi_p50 = 0.0;
+    double system_tgi_p95 = 0.0;
+    double system_tgi_p99 = 0.0;
+    
+    double total_p50 = 0.0;
+    double total_p95 = 0.0;
+    double total_p99 = 0.0;
+>>>>>>> 50c34b2fbe4deb16c3ce50ca17b211d4d3f402c1
 };
 
 static const char * mode_name(experiment_mode mode) {
     switch (mode) {
+<<<<<<< HEAD
+=======
+        case experiment_mode::sequential:
+            return "sequential";
+>>>>>>> 50c34b2fbe4deb16c3ce50ca17b211d4d3f402c1
         case experiment_mode::batch_unfused:
             return "batch_unfused";
         case experiment_mode::batch_grouped:
@@ -58,6 +130,7 @@ static const char * mode_name(experiment_mode mode) {
     return "unknown";
 }
 
+<<<<<<< HEAD
 // 构造 seq_id -> LoRA id 的映射。
 // batch_unfused 示例：0,1,2,3,0,1,2,3
 // batch_grouped 示例：0,0,1,1,2,2,3,3
@@ -101,6 +174,49 @@ static std::vector<std::string> build_prompts(
 }
 
 // 向 llama_batch 中加入一个 token。
+=======
+static double percentile(std::vector<double> values, double p) {
+    if (values.empty()) {
+        return 0.0;
+    }
+
+    std::sort(values.begin(), values.end());
+
+    const double rank = (p / 100.0) * (values.size() - 1);
+    const size_t lo = (size_t) rank;
+    const size_t hi = std::min(lo + 1, values.size() - 1);
+    const double frac = rank - lo;
+
+    return values[lo] * (1.0 - frac) + values[hi] * frac;
+}
+
+// 4 个请求、2 个 LoRA。
+// batch_unfused: 0,1,0,1
+// batch_grouped: 0,0,1,1
+// static std::vector<int> build_seq_to_lora(experiment_mode mode) {
+//     if (mode == experiment_mode::batch_grouped) {
+//         return { 0, 0, 1, 1 };
+//     }
+
+//     return { 0, 1, 0, 1 };
+// }
+
+// 8 个请求、4 个 LoRA。
+// batch_unfused: 0,1,2,3,0,1,2,3
+// batch_grouped: 0,0,1,1,2,2,3,3
+//
+// 这样设计的目的：
+// - batch_unfused 表示 LoRA 请求交错排列，底层会产生更多 LoRA group。
+// - batch_grouped 表示相同 LoRA 的请求连续排列，便于按 adapter 分组执行。
+static std::vector<int> build_seq_to_lora(experiment_mode mode) {
+    if (mode == experiment_mode::batch_grouped) {
+        return { 0, 0, 1, 1, 2, 2, 3, 3 };
+    }
+
+    return { 0, 1, 2, 3, 0, 1, 2, 3 };
+}
+
+>>>>>>> 50c34b2fbe4deb16c3ce50ca17b211d4d3f402c1
 static void batch_add(
         llama_batch & batch,
         llama_token token,
@@ -121,7 +237,10 @@ static void batch_add(
     batch.n_tokens++;
 }
 
+<<<<<<< HEAD
 // 对多个 prompt 进行分词，并返回 prompt token 总数。
+=======
+>>>>>>> 50c34b2fbe4deb16c3ce50ca17b211d4d3f402c1
 static bool tokenize_prompts(
         const llama_vocab * vocab,
         const std::vector<std::string> & prompts,
@@ -150,7 +269,11 @@ static bool tokenize_prompts(
                     prompt_tokens[i].size(),
                     true,
                     true) < 0) {
+<<<<<<< HEAD
             fprintf(stderr, "error: failed to tokenize prompt %d\n", i);
+=======
+            fprintf(stderr, "failed to tokenize prompt %d\n", i);
+>>>>>>> 50c34b2fbe4deb16c3ce50ca17b211d4d3f402c1
             return false;
         }
 
@@ -160,14 +283,21 @@ static bool tokenize_prompts(
     return true;
 }
 
+<<<<<<< HEAD
 // 执行一次 batch Profiling 实验。
 // 该函数会拆分统计 LoRA 映射、prefill、decode、sampling 和 other 的时间。
 static profiling_result run_profiling_experiment(
+=======
+// 批处理延迟实验。
+// 4 个请求同时进入 batch，因此每个请求的 TTFT 和 total latency 都从 t_arrival 开始算。
+static std::vector<request_latency> run_batch_latency_experiment(
+>>>>>>> 50c34b2fbe4deb16c3ce50ca17b211d4d3f402c1
         llama_model * model,
         const llama_vocab * vocab,
         const std::vector<std::string> & prompts,
         const std::vector<std::vector<llama_token>> & prompt_tokens,
         const std::vector<llama_adapter_lora *> & lora_adapters,
+<<<<<<< HEAD
         const std::vector<std::string> & lora_paths,
         experiment_mode mode,
         int logical_n_lora,
@@ -184,6 +314,17 @@ static profiling_result run_profiling_experiment(
     result.n_requests = batch_size;
 
     const int64_t t_total_start = ggml_time_us();
+=======
+        experiment_mode mode,
+        int n_prompt_total,
+        int n_predict,
+        float lora_scale,
+        int round_id) {
+    std::vector<request_latency> samples;
+
+    const int batch_size = (int) prompts.size();
+    std::vector<int> seq_to_lora = build_seq_to_lora(mode);
+>>>>>>> 50c34b2fbe4deb16c3ce50ca17b211d4d3f402c1
 
     llama_context_params ctx_params = llama_context_default_params();
     ctx_params.n_ctx = 256;
@@ -193,12 +334,18 @@ static profiling_result run_profiling_experiment(
 
     llama_context * ctx = llama_init_from_model(model, ctx_params);
     if (ctx == nullptr) {
+<<<<<<< HEAD
         fprintf(stderr, "%s: failed to create context\n", __func__);
         return result;
     }
 
     std::vector<int> seq_to_lora = build_seq_to_lora(mode, logical_n_lora, n_real_lora);
 
+=======
+        return samples;
+    }
+
+>>>>>>> 50c34b2fbe4deb16c3ce50ca17b211d4d3f402c1
     std::vector<llama_seq_id> seq_lora_ids;
     std::vector<llama_adapter_lora *> seq_lora_adapters;
     std::vector<float> seq_lora_scales;
@@ -209,6 +356,7 @@ static profiling_result run_profiling_experiment(
         seq_lora_ids.push_back((llama_seq_id) s);
         seq_lora_adapters.push_back(lora_adapters[adapter_id]);
         seq_lora_scales.push_back(lora_scale);
+<<<<<<< HEAD
 
         fprintf(stderr, "[%s] seq %d -> LoRA %d (%s)\n",
                 mode_name(mode),
@@ -220,12 +368,17 @@ static profiling_result run_profiling_experiment(
     // 统计 LoRA 映射时间。
     const int64_t t_lora_mapping_start = ggml_time_us();
 
+=======
+    }
+
+>>>>>>> 50c34b2fbe4deb16c3ce50ca17b211d4d3f402c1
     if (llama_set_seq_adapters_lora(
                 ctx,
                 seq_lora_ids.data(),
                 seq_lora_adapters.data(),
                 seq_lora_scales.data(),
                 seq_lora_ids.size()) != 0) {
+<<<<<<< HEAD
         fprintf(stderr, "%s: failed to set seq LoRA mapping\n", __func__);
         llama_free(ctx);
         return result;
@@ -234,12 +387,21 @@ static profiling_result run_profiling_experiment(
     const int64_t t_lora_mapping_end = ggml_time_us();
     result.lora_mapping_ms = (t_lora_mapping_end - t_lora_mapping_start) / 1000.0;
 
+=======
+        llama_free(ctx);
+        return samples;
+    }
+
+>>>>>>> 50c34b2fbe4deb16c3ce50ca17b211d4d3f402c1
     std::vector<llama_sampler *> samplers(batch_size);
 
     for (int s = 0; s < batch_size; s++) {
         auto sparams = llama_sampler_chain_default_params();
         sparams.no_perf = true;
+<<<<<<< HEAD
 
+=======
+>>>>>>> 50c34b2fbe4deb16c3ce50ca17b211d4d3f402c1
         samplers[s] = llama_sampler_chain_init(sparams);
         llama_sampler_chain_add(samplers[s], llama_sampler_init_greedy());
     }
@@ -266,6 +428,7 @@ static profiling_result run_profiling_experiment(
         }
     }
 
+<<<<<<< HEAD
     // 统计 prefill 时间，即 prompt batch 的一次 decode。
     const int64_t t_prefill_start = ggml_time_us();
 
@@ -286,12 +449,38 @@ static profiling_result run_profiling_experiment(
 
     std::vector<int> seq_pos(batch_size);
     std::vector<bool> done(batch_size, false);
+=======
+    std::vector<int> seq_pos(batch_size);
+    std::vector<bool> done(batch_size, false);
+    std::vector<int> generated_tokens(batch_size, 0);
+    std::vector<int64_t> ttft_us(batch_size, -1);
+    std::vector<int64_t> last_token_us(batch_size, -1);
+    std::vector<int64_t> tgi_sum_us(batch_size, 0);
+    std::vector<int> tgi_count(batch_size, 0);
+    std::vector<int64_t> finish_us(batch_size, -1);
+>>>>>>> 50c34b2fbe4deb16c3ce50ca17b211d4d3f402c1
 
     for (int s = 0; s < batch_size; s++) {
         seq_pos[s] = (int) prompt_tokens[s].size();
     }
 
+<<<<<<< HEAD
     int n_decode_total = 0;
+=======
+    const int64_t t_arrival = ggml_time_us();
+    const int64_t t_system_start = t_arrival;
+
+    int system_generated_tokens = 0;
+
+    if (llama_decode(ctx, batch)) {
+        llama_batch_free(batch);
+        for (auto * sampler : samplers) {
+            llama_sampler_free(sampler);
+        }
+        llama_free(ctx);
+        return samples;
+    }
+>>>>>>> 50c34b2fbe4deb16c3ce50ca17b211d4d3f402c1
 
     for (int step = 0; step < n_predict; step++) {
         llama_batch next_batch = llama_batch_init(batch_size, 0, batch_size);
