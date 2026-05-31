@@ -27,7 +27,7 @@ struct latency_sample {
 };
 
 static const std::string output_dir =
-        "D:/ecnu_experiment/LLama.cpp/llama.cpp/examples/simple-lora-memory/output";
+        "/home/agx_orin/ecnu_experiment/LLama.cpp/llama.cpp/examples/simple-lora-memory/output";
 
 static double bind_adapter(
         llama_context * ctx,
@@ -208,13 +208,13 @@ int main() {
     std::setlocale(LC_NUMERIC, "C");
 
     const std::string model_path =
-            "D:/ecnu_experiment/Model/Qwen3.5-4B-BF16.gguf";
+            "/home/agx_orin/ecnu_experiment/Model/Qwen3.5-4B-BF16.gguf";
 
     std::vector<std::string> lora_paths = {
-        "D:/ecnu_experiment/Model/qwen35-marketing-adapter.gguf",
-        "D:/ecnu_experiment/Model/subliminal-monkey.gguf",
-        "D:/ecnu_experiment/Model/subliminal-qwen35-4b-tiger.gguf",
-        "D:/ecnu_experiment/Model/subliminal-qwen35-4b-wolf.gguf",
+        "/home/agx_orin/ecnu_experiment/Model/qwen35-marketing-adapter.gguf",
+        "/home/agx_orin/ecnu_experiment/Model/subliminal-monkey.gguf",
+        "/home/agx_orin/ecnu_experiment/Model/subliminal-qwen35-4b-tiger.gguf",
+        "/home/agx_orin/ecnu_experiment/Model/subliminal-qwen35-4b-wolf.gguf",
     };
 
     const int ngl = 99;

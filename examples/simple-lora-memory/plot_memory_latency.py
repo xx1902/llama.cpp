@@ -4,7 +4,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib import font_manager
 
-OUTPUT_DIR = "D:/ecnu_experiment/LLama.cpp/llama.cpp/examples/simple-lora-memory/output"
+OUTPUT_DIR = "/home/agx_orin/ecnu_experiment/LLama.cpp/llama.cpp/examples/simple-lora-memory/output"
 CSV_PATH = os.path.join(OUTPUT_DIR, "lora_load_path_latency.csv")
 OUT_PATH = os.path.join(OUTPUT_DIR, "lora_load_path_latency_box.png")
 
