@@ -6,7 +6,7 @@ from matplotlib import font_manager
 
 from matplotlib.lines import Line2D
 
-OUTPUT_DIR = "D:/ecnu_experiment/LLama.cpp/llama.cpp/examples/simple-lora/output"
+OUTPUT_DIR = "/home/agx_orin/ecnu_experiment/LLama.cpp/llama.cpp/examples/simple-lora/output"
 SAMPLES_CSV = os.path.join(OUTPUT_DIR, "latency_samples.csv")
 SUMMARY_CSV = os.path.join(OUTPUT_DIR, "latency_summary.csv")
 
@@ -39,6 +39,8 @@ def setup_chinese_font():
         "Microsoft YaHei",
         "SimHei",
         "Noto Sans CJK SC",
+        "Noto Sans CJK JP",      # 加上
+        "Noto Serif CJK JP",     # 加上
         "Source Han Sans SC",
     ]
 

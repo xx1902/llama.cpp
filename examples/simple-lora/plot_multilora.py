@@ -3,8 +3,8 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib import font_manager
 
-CSV_PATH = "D:/ecnu_experiment/LLama.cpp/llama.cpp/examples/simple-lora/output/multilora_results.csv"
-OUT_PATH = "D:/ecnu_experiment/LLama.cpp/llama.cpp/examples/simple-lora/output/multilora_tps.png"
+CSV_PATH = "/home/agx_orin/ecnu_experiment/LLama.cpp/llama.cpp/examples/simple-lora/output/multilora_results.csv"
+OUT_PATH = "/home/agx_orin/ecnu_experiment/LLama.cpp/llama.cpp/examples/simple-lora/output/multilora_tps.png"
 
 
 def setup_chinese_font():
@@ -12,9 +12,10 @@ def setup_chinese_font():
         "Microsoft YaHei",
         "SimHei",
         "Noto Sans CJK SC",
+        "Noto Sans CJK JP",      # 加上
+        "Noto Serif CJK JP",     # 加上
         "Source Han Sans SC",
     ]
-
     available = {f.name for f in font_manager.fontManager.ttflist}
 
     for name in candidates:
