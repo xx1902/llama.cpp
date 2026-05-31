@@ -12,7 +12,7 @@
 // - 因此 8、16 表示更大的逻辑并发请求规模，不表示 8、16 个真实不同 adapter 文件。
 //
 // 输出 CSV：
-// D:/ecnu_experiment/LLama.cpp/llama.cpp/examples/simple-lora/output/multilora_results.csv
+// /home/agx_orin/ecnu_experiment/LLama.cpp/llama.cpp/examples/simple-lora/output/multilora_results.csv
 
 #include "llama.h"
 
@@ -456,9 +456,9 @@ static experiment_result run_sequential_experiment(
 }
 
 static void save_results(const std::vector<experiment_result> & results) {
-    const std::string csv_path = "D:/ecnu_experiment/LLama.cpp/llama.cpp/examples/simple-lora/output/multilora_results.csv";
+    const std::string csv_path = "/home/agx_orin/ecnu_experiment/LLama.cpp/llama.cpp/examples/simple-lora/output/multilora_results.csv";
 
-    std::filesystem::create_directories("D:/ecnu_experiment/LLama.cpp/llama.cpp/examples/simple-lora/output");
+    std::filesystem::create_directories("/home/agx_orin/ecnu_experiment/LLama.cpp/llama.cpp/examples/simple-lora/output");
 
     std::ofstream fout(csv_path);
     fout << "scheme,n_lora,n_requests,n_tokens,elapsed_s,tps,rps\n";
@@ -484,13 +484,13 @@ int main(int argc, char ** argv) {
 
     std::setlocale(LC_NUMERIC, "C");
 
-    std::string model_path = "D:/ecnu_experiment/Model/Qwen3.5-4B-BF16.gguf";
+    std::string model_path = "/home/agx_orin/ecnu_experiment/Model/Qwen3.5-4B-BF16.gguf";
 
     std::vector<std::string> lora_paths = {
-        "D:/ecnu_experiment/Model/qwen35-marketing-adapter.gguf",
-        "D:/ecnu_experiment/Model/subliminal-monkey.gguf",
-        "D:/ecnu_experiment/Model/subliminal-qwen35-4b-tiger.gguf",
-        "D:/ecnu_experiment/Model/subliminal-qwen35-4b-wolf.gguf",
+        "/home/agx_orin/ecnu_experiment/Model/qwen35-marketing-adapter.gguf",
+        "/home/agx_orin/ecnu_experiment/Model/subliminal-monkey.gguf",
+        "/home/agx_orin/ecnu_experiment/Model/subliminal-qwen35-4b-tiger.gguf",
+        "/home/agx_orin/ecnu_experiment/Model/subliminal-qwen35-4b-wolf.gguf",
     };
 
     std::vector<std::string> prompt_pool = {

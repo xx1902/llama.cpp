@@ -15,15 +15,15 @@ static void print_usage(int, char ** argv) {
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C"); // 设置数字格式，避免不同地区设置影响浮点数解析
     // 基座模型 GGUF 文件路径
-    std::string model_path = "D:/ecnu_experiment/Model/Qwen3.5-4B-BF16.gguf";
+    std::string model_path = "/home/agx_orin/ecnu_experiment/Model/Qwen3.5-4B-BF16.gguf";
 
     // LoRA 适配器 GGUF 文件路径
-    // std::string lora_path = "D:/ecnu_experiment/Model/qwen35-marketing-adapter.gguf";
+    // std::string lora_path = "/home/agx_orin/ecnu_experiment/Model/qwen35-marketing-adapter.gguf";
     std::vector<std::string> lora_paths = {
-        "D:/ecnu_experiment/Model/qwen35-marketing-adapter.gguf",
-        "D:/ecnu_experiment/Model/subliminal-monkey.gguf",
-        "D:/ecnu_experiment/Model/subliminal-qwen35-4b-tiger.gguf",
-        "D:/ecnu_experiment/Model/subliminal-qwen35-4b-wolf.gguf",
+        "/home/agx_orin/ecnu_experiment/Model/qwen35-marketing-adapter.gguf",
+        "/home/agx_orin/ecnu_experiment/Model/subliminal-monkey.gguf",
+        "/home/agx_orin/ecnu_experiment/Model/subliminal-qwen35-4b-tiger.gguf",
+        "/home/agx_orin/ecnu_experiment/Model/subliminal-qwen35-4b-wolf.gguf",
     };
     float lora_scale = 1.0f; // LoRA 缩放系数，1.0 表示使用默认适配强度
 

@@ -15,8 +15,8 @@
 // - P50 / P95 / P99：延迟分位值。
 //
 // 输出文件：
-// D:/ecnu_experiment/LLama.cpp/llama.cpp/examples/simple-lora/output/latency_samples.csv
-// D:/ecnu_experiment/LLama.cpp/llama.cpp/examples/simple-lora/output/latency_summary.csv
+// /home/agx_orin/ecnu_experiment/LLama.cpp/llama.cpp/examples/simple-lora/output/latency_samples.csv
+// /home/agx_orin/ecnu_experiment/LLama.cpp/llama.cpp/examples/simple-lora/output/latency_summary.csv
 
 #include "llama.h"
 
@@ -563,7 +563,7 @@ static latency_summary build_summary(
 }
 
 static void save_latency_samples(const std::vector<request_latency> & samples) {
-    const std::string output_dir = "D:/ecnu_experiment/LLama.cpp/llama.cpp/examples/simple-lora/output";
+    const std::string output_dir = "/home/agx_orin/ecnu_experiment/LLama.cpp/llama.cpp/examples/simple-lora/output";
     const std::string csv_path = output_dir + "/latency_samples.csv";
 
     std::filesystem::create_directories(output_dir);
@@ -588,7 +588,7 @@ static void save_latency_samples(const std::vector<request_latency> & samples) {
 }
 
 static void save_latency_summary(const std::vector<latency_summary> & summaries) {
-    const std::string output_dir = "D:/ecnu_experiment/LLama.cpp/llama.cpp/examples/simple-lora/output";
+    const std::string output_dir = "/home/agx_orin/ecnu_experiment/LLama.cpp/llama.cpp/examples/simple-lora/output";
     const std::string csv_path = output_dir + "/latency_summary.csv";
 
     std::filesystem::create_directories(output_dir);
@@ -627,17 +627,17 @@ int main(int argc, char ** argv) {
 
     std::setlocale(LC_NUMERIC, "C");
 
-    std::string model_path = "D:/ecnu_experiment/Model/Qwen3.5-4B-BF16.gguf";
+    std::string model_path = "/home/agx_orin/ecnu_experiment/Model/Qwen3.5-4B-BF16.gguf";
 
     // std::vector<std::string> lora_paths = {
-    //     "D:/ecnu_experiment/Model/qwen35-marketing-adapter.gguf",
-    //     "D:/ecnu_experiment/Model/subliminal-monkey.gguf",
+    //     "/home/agx_orin/ecnu_experiment/Model/qwen35-marketing-adapter.gguf",
+    //     "/home/agx_orin/ecnu_experiment/Model/subliminal-monkey.gguf",
     // };
     std::vector<std::string> lora_paths = {
-        "D:/ecnu_experiment/Model/qwen35-marketing-adapter.gguf",
-        "D:/ecnu_experiment/Model/subliminal-monkey.gguf",
-        // "D:/ecnu_experiment/Model/subliminal-qwen35-4b-tiger.gguf",
-        // "D:/ecnu_experiment/Model/subliminal-qwen35-4b-wolf.gguf",
+        "/home/agx_orin/ecnu_experiment/Model/qwen35-marketing-adapter.gguf",
+        "/home/agx_orin/ecnu_experiment/Model/subliminal-monkey.gguf",
+        // "/home/agx_orin/ecnu_experiment/Model/subliminal-qwen35-4b-tiger.gguf",
+        // "/home/agx_orin/ecnu_experiment/Model/subliminal-qwen35-4b-wolf.gguf",
     };
 
     // std::vector<std::string> prompts = {

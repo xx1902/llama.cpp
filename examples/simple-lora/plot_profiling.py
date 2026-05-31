@@ -4,7 +4,7 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib import font_manager
 
-OUTPUT_DIR = "D:/ecnu_experiment/LLama.cpp/llama.cpp/examples/simple-lora/output"
+OUTPUT_DIR = "/home/agx_orin/ecnu_experiment/LLama.cpp/llama.cpp/examples/simple-lora/output"
 CSV_PATH = os.path.join(OUTPUT_DIR, "profiling_results.csv")
 OUT_PATH = os.path.join(OUTPUT_DIR, "profiling_stage_distribution.png")
 

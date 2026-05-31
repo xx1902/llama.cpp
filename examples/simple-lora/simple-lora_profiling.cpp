@@ -379,7 +379,7 @@ static profiling_result run_profiling_experiment(
 }
 
 static void save_profiling_results(const std::vector<profiling_result> & results) {
-    const std::string output_dir = "D:/ecnu_experiment/LLama.cpp/llama.cpp/examples/simple-lora/output";
+    const std::string output_dir = "/home/agx_orin/ecnu_experiment/LLama.cpp/llama.cpp/examples/simple-lora/output";
     const std::string csv_path = output_dir + "/profiling_results.csv";
 
     std::filesystem::create_directories(output_dir);
@@ -413,13 +413,13 @@ int main(int argc, char ** argv) {
 
     std::setlocale(LC_NUMERIC, "C");
 
-    std::string model_path = "D:/ecnu_experiment/Model/Qwen3.5-4B-BF16.gguf";
+    std::string model_path = "/home/agx_orin/ecnu_experiment/Model/Qwen3.5-4B-BF16.gguf";
 
     std::vector<std::string> lora_paths = {
-        "D:/ecnu_experiment/Model/qwen35-marketing-adapter.gguf",
-        "D:/ecnu_experiment/Model/subliminal-monkey.gguf",
-        "D:/ecnu_experiment/Model/subliminal-qwen35-4b-tiger.gguf",
-        "D:/ecnu_experiment/Model/subliminal-qwen35-4b-wolf.gguf",
+        "/home/agx_orin/ecnu_experiment/Model/qwen35-marketing-adapter.gguf",
+        "/home/agx_orin/ecnu_experiment/Model/subliminal-monkey.gguf",
+        "/home/agx_orin/ecnu_experiment/Model/subliminal-qwen35-4b-tiger.gguf",
+        "/home/agx_orin/ecnu_experiment/Model/subliminal-qwen35-4b-wolf.gguf",
     };
 
     std::vector<std::string> prompt_pool = {
