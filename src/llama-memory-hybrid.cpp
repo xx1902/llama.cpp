@@ -28,8 +28,27 @@ llama_memory_hybrid::llama_memory_hybrid(
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn,
-    const layer_filter_cb & filter_recr) :
+    const layer_filter_cb & filter_recr,
+                     bool   physical_paged,
+                 uint32_t   physical_page_size) :
     hparams(model.hparams),
+    // mem_attn(new llama_kv_cache(
+    //     model,
+    //     type_k,
+    //     type_v,
+    //     v_trans,
+    //     offload,
+    //     unified,
+    //     kv_size,
+    //     n_seq_max,
+    //     n_pad,
+    //     n_swa,
+    //     swa_type,
+    //     filter_attn == nullptr ?
+    //         [&](int32_t il) { return !hparams.is_recurrent(il); }
+    //         : filter_attn,
+    //     nullptr
+    // )),
     mem_attn(new llama_kv_cache(
         model,
         type_k,
@@ -45,7 +64,9 @@ llama_memory_hybrid::llama_memory_hybrid(
         filter_attn == nullptr ?
             [&](int32_t il) { return !hparams.is_recurrent(il); }
             : filter_attn,
-        nullptr
+        nullptr,
+        physical_paged,
+        physical_page_size
     )),
     mem_recr(new llama_memory_recurrent(
         model,

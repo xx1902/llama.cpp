@@ -93,20 +93,36 @@ public:
 
     using slot_info_vec_t = std::vector<slot_info>;
 
+    // llama_kv_cache(
+    //         const llama_model & model,
+    //                 ggml_type   type_k,
+    //                 ggml_type   type_v,
+    //                      bool   v_trans,
+    //                      bool   offload,
+    //                      bool   unified,
+    //                  uint32_t   kv_size,
+    //                  uint32_t   n_seq_max,
+    //                  uint32_t   n_pad,
+    //                  uint32_t   n_swa,
+    //            llama_swa_type   swa_type,
+    //     const layer_filter_cb & filter,
+    //     const  layer_reuse_cb & reuse);
     llama_kv_cache(
-            const llama_model & model,
-                    ggml_type   type_k,
-                    ggml_type   type_v,
-                         bool   v_trans,
-                         bool   offload,
-                         bool   unified,
-                     uint32_t   kv_size,
-                     uint32_t   n_seq_max,
-                     uint32_t   n_pad,
-                     uint32_t   n_swa,
-               llama_swa_type   swa_type,
-        const layer_filter_cb & filter,
-        const  layer_reuse_cb & reuse);
+        const llama_model & model,
+                ggml_type   type_k,
+                ggml_type   type_v,
+                        bool   v_trans,
+                        bool   offload,
+                        bool   unified,
+                    uint32_t   kv_size,
+                    uint32_t   n_seq_max,
+                    uint32_t   n_pad,
+                    uint32_t   n_swa,
+            llama_swa_type   swa_type,
+    const layer_filter_cb & filter,
+    const  layer_reuse_cb & reuse,
+                        bool   physical_paged = false,
+                    uint32_t   physical_page_size = 16);
 
     ~llama_kv_cache() = default;
 
@@ -150,7 +166,31 @@ public:
     uint32_t get_size()     const;
     uint32_t get_n_stream() const;
 
+    bool get_physical_paged() const;
+    uint32_t get_physical_page_size() const;
+
+    // 新增固定分页
     bool get_has_shift() const;
+
+        struct memory_usage_stats {
+        uint32_t page_size = 0;
+
+        uint32_t total_cells = 0;
+        uint32_t used_cells = 0;
+
+        uint32_t total_pages = 0;
+        uint32_t used_pages = 0;
+        uint32_t free_pages = 0;
+
+        uint64_t continuous_bytes = 0;
+        uint64_t paged_bytes = 0;
+
+        double cell_used_rate = 0.0;
+        double page_used_rate = 0.0;
+        double page_waste_rate = 0.0;
+    };
+
+    memory_usage_stats get_memory_usage_stats(uint32_t page_size) const;
 
     //
     // graph_build API
@@ -203,6 +243,14 @@ private:
     const llama_model & model;
     const llama_hparams & hparams;
 
+    // 新增固定分页
+    ggml_type type_k_cache = GGML_TYPE_F16;
+    ggml_type type_v_cache = GGML_TYPE_F16;
+    bool offload_cache = true;
+
+    bool physical_paged = false;
+    uint32_t physical_page_size = 16;
+
     struct kv_layer {
         // layer index in the model
         // note: can be different from the layer index in the KV cache
@@ -213,6 +261,10 @@ private:
 
         std::vector<ggml_tensor *> k_stream;
         std::vector<ggml_tensor *> v_stream;
+
+        // 物理分页 KV 使用：记录这一层 KV 应该分配到哪个 backend。
+        // 例如 CUDA0 / CPU。这样分页 page buffer 可以和原 KV buffer 放在同一个设备上。
+        ggml_backend_buffer_type_t buft = nullptr;
     };
 
     bool v_trans = true;  // the value tensor is transposed
@@ -249,6 +301,33 @@ private:
 
     std::vector<kv_layer> layers;
 
+    // 新增分页
+    struct kv_page_layer {
+        ggml_tensor * k = nullptr;
+        ggml_tensor * v = nullptr;
+    };
+
+    struct kv_page {
+        uint32_t id = 0;
+        bool used = false;
+
+        uint32_t cell_begin = 0;
+        uint32_t cell_end = 0;
+
+        std::vector<kv_page_layer> layers;
+
+        ggml_context_ptr ctx;
+        ggml_backend_buffer_ptr buf;
+    };
+
+    struct kv_page_ref {
+        uint32_t page_id = UINT32_MAX;
+        uint32_t offset = 0;
+    };
+
+    std::vector<std::vector<kv_page_ref>> page_table;
+    std::vector<std::vector<kv_page>> physical_pages;
+
     // model layer id -> KV cache layer id
     std::unordered_map<int32_t, int32_t> map_layer_ids;
 
@@ -256,6 +335,15 @@ private:
 
     size_t size_k_bytes() const;
     size_t size_v_bytes() const;
+
+    // 新增分页
+    void init_physical_paged_storage();
+    void ensure_page_for_cell(
+            uint32_t stream_id,
+            uint32_t cell_id);
+    const kv_page_ref & get_page_ref(
+            uint32_t stream_id,
+            uint32_t cell_id) const;
 
     ggml_tensor * build_rope_shift(
             const llama_cparams & cparams,

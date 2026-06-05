@@ -8,6 +8,7 @@
 
 #include "llama-kv-cache.h"
 #include "llama-kv-cache-iswa.h"
+#include "llama-kv-cache-paged.h"
 #include "llama-memory-hybrid.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
@@ -8110,7 +8111,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
-                            /* filter_recr       */ std::move(filter_recr));
+                            /* filter_recr       */ std::move(filter_recr),
+                                                    cparams.experimental_physical_paged_kv,
+                                                    cparams.physical_kv_page_size);
                     }
                 } else {
                     llama_memory_i::layer_reuse_cb reuse = nullptr;
@@ -8145,20 +8148,36 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
 
+                        // res = new llama_kv_cache(
+                        //         *this,
+                        //         params.type_k,
+                        //         params.type_v,
+                        //         !cparams.flash_attn,
+                        //         cparams.offload_kqv,
+                        //         cparams.kv_unified,
+                        //         cparams.n_ctx_seq,
+                        //         cparams.n_seq_max,
+                        //         1,
+                        //         hparams.n_swa,
+                        //         hparams.swa_type,
+                        //         nullptr,
+                        //         nullptr);
                         res = new llama_kv_cache(
-                                *this,
-                                params.type_k,
-                                params.type_v,
-                                !cparams.flash_attn,
-                                cparams.offload_kqv,
-                                cparams.kv_unified,
-                                cparams.n_ctx_seq,
-                                cparams.n_seq_max,
-                                1,
-                                hparams.n_swa,
-                                hparams.swa_type,
-                                nullptr,
-                                nullptr);
+                            *this,
+                            params.type_k,
+                            params.type_v,
+                            !cparams.flash_attn,
+                            cparams.offload_kqv,
+                            cparams.kv_unified,
+                            cparams.n_ctx_seq,
+                            cparams.n_seq_max,
+                            1,
+                            hparams.n_swa,
+                            hparams.swa_type,
+                            nullptr,
+                            nullptr,
+                            cparams.experimental_paged_kv,
+                            cparams.kv_page_size);
                     }
                 }
             }

@@ -69,6 +69,9 @@ struct llama_context {
 
     // return true if the memory was updated
     bool memory_update(bool optimize);
+    // 新增固定页面
+    bool get_paged_kv_stats(llama_paged_kv_stats * stats) const;
+    bool get_kv_memory_stats(uint32_t page_size, llama_kv_memory_stats * stats) const;
 
     enum llama_pooling_type pooling_type() const;
 

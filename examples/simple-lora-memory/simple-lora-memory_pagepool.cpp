@@ -1,382 +1,641 @@
-// simple-page-pool.cpp
+// simple-lora-memory.cpp
 //
-// KV cache 与 LoRA adapter 统一页块池实验
+// 连续 KV 与分页 KV 的真实 GPU 显存生命周期采样实验
 //
-// 本程序用于验证连续分配与页块池化分配在长时间运行下的差异。
-// 它不执行真实 LLM 推理，而是实现真实的分配器逻辑，并用 KV cache / LoRA adapter
-// 的申请释放事件来测试外部碎片、页面利用率和分配失败率。
+// 本程序会分别运行两组真实实验：
 //
-// continuous:
-// - 每个对象必须占用连续页块。
-// - 总空闲容量足够但缺少连续空间时，分配失败。
+// 1. continuous_kv：原始连续 KV cache。
+//    输出：real_lora_kv_gpu_memory.csv
 //
-// paged_pool:
-// - 每个对象可以映射到多个离散页块。
-// - 只要总空闲页数足够，就可以分配成功。
+// 2. paged_kv：实验性分页 KV cache。
+//    输出：real_lora_kv_page_memory.csv
 //
-// 输出：
-// D:/ecnu_experiment/LLama.cpp/llama.cpp/examples/simple-lora-memory/output/page_pool_results.csv
+// 数据来源：
+// - GPU 显存：通过 nvidia-smi 读取当前 GPU memory.used。
+// - GPU 显存增量：当前 gpu_used_mb - 当前实验开始时 gpu_used_mb。
+// - 进程内存：Windows API GetProcessMemoryInfo。
+// - 每完成一个生命周期事件，就写一条采样记录。
+//
+// 生命周期事件：
+// - start
+// - model_loaded
+// - context_created
+// - lora_loaded
+// - lora_bound
+// - prompt_eval
+// - decode_step
+// - before_release
+// - released
+// - model_released
+//
+// 注意：
+// - 为了让显存曲线更明显，这里会保留多个 context / LoRA adapter，最后统一释放。
+// - 如果显存不足，可以降低 n_requests。
+// - 分页 KV 是否真正节省驱动层显存，还取决于你底层 paged KV 是否真的按页申请 GPU buffer。
+
+#include "llama.h"
 
 #include <algorithm>
+#include <clocale>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
-#include <random>
 #include <string>
-#include <unordered_map>
 #include <vector>
 
-enum class object_type {
-    kv_cache,
-    lora_adapter,
+#ifdef _WIN32
+#include <windows.h>
+#include <psapi.h>
+#pragma comment(lib, "psapi.lib")
+#endif
+
+enum class kv_mode {
+    continuous,
+    paged,
 };
 
-struct alloc_event {
+struct memory_sample {
+    std::string mode;
+
     int step = 0;
-    object_type type = object_type::kv_cache;
-    int pages = 0;
-    int ttl = 0;
+    int request_id = -1;
+    int generated_tokens = 0;
+
+    std::string event;
+
+    double gpu_used_mb = 0.0;
+    double gpu_delta_mb = 0.0;
+
+    double process_used_mb = 0.0;
+    double process_delta_mb = 0.0;
 };
 
-struct memory_object {
-    int id = -1;
-    object_type type = object_type::kv_cache;
-    int ttl = 0;
-    std::vector<int> pages;
-};
-
-struct metric_row {
-    std::string allocator;
-    int step = 0;
-    double memory_usage_gb = 0.0;
-    double used_rate = 0.0;
-    double external_fragmentation = 0.0;
-    double allocation_fail_rate = 0.0;
-    int live_kv = 0;
-    int live_lora = 0;
+struct live_request {
+    llama_context * ctx = nullptr;
+    llama_adapter_lora * adapter = nullptr;
 };
 
 static const std::string output_dir =
         "D:/ecnu_experiment/LLama.cpp/llama.cpp/examples/simple-lora-memory/output";
 
-// 每页 16 MiB，768 页约等于 12 GiB。
-static constexpr int N_PAGES = 768;
-static constexpr double PAGE_SIZE_GB = 16.0 / 1024.0;
-static constexpr int N_STEPS = 800;
-
-class continuous_allocator {
-public:
-    explicit continuous_allocator(int n_pages)
-        : pages(n_pages, -1) {}
-
-    bool allocate(memory_object & obj, int need_pages) {
-        int start = -1;
-        int run = 0;
-
-        for (int i = 0; i < (int) pages.size(); i++) {
-            if (pages[i] == -1) {
-                if (run == 0) {
-                    start = i;
-                }
-
-                run++;
-
-                if (run >= need_pages) {
-                    break;
-                }
-            } else {
-                start = -1;
-                run = 0;
-            }
-        }
-
-        if (start < 0 || run < need_pages) {
-            return false;
-        }
-
-        obj.pages.clear();
-
-        for (int i = start; i < start + need_pages; i++) {
-            pages[i] = obj.id;
-            obj.pages.push_back(i);
-        }
-
-        return true;
+static const char * mode_name(kv_mode mode) {
+    switch (mode) {
+        case kv_mode::continuous:
+            return "continuous_kv";
+        case kv_mode::paged:
+            return "paged_kv";
     }
 
-    void free_object(const memory_object & obj) {
-        for (int p : obj.pages) {
-            if (p >= 0 && p < (int) pages.size()) {
-                pages[p] = -1;
-            }
-        }
-    }
-
-    metric_row make_metric(
-            const std::string & name,
-            int step,
-            int alloc_count,
-            int fail_count,
-            int live_kv,
-            int live_lora) const {
-        int used = 0;
-        int free_pages = 0;
-        int current_free_run = 0;
-        int largest_free_run = 0;
-
-        for (int v : pages) {
-            if (v == -1) {
-                free_pages++;
-                current_free_run++;
-                largest_free_run = std::max(largest_free_run, current_free_run);
-            } else {
-                used++;
-                current_free_run = 0;
-            }
-        }
-
-        metric_row row;
-        row.allocator = name;
-        row.step = step;
-        row.memory_usage_gb = used * PAGE_SIZE_GB;
-        row.used_rate = (double) used / pages.size();
-        row.external_fragmentation =
-                free_pages > 0 ? 1.0 - (double) largest_free_run / free_pages : 0.0;
-        row.allocation_fail_rate =
-                alloc_count > 0 ? (double) fail_count / alloc_count : 0.0;
-        row.live_kv = live_kv;
-        row.live_lora = live_lora;
-
-        return row;
-    }
-
-private:
-    std::vector<int> pages;
-};
-
-class paged_pool_allocator {
-public:
-    explicit paged_pool_allocator(int n_pages)
-        : pages(n_pages, -1) {}
-
-    bool allocate(memory_object & obj, int need_pages) {
-        std::vector<int> free_pages;
-
-        for (int i = 0; i < (int) pages.size(); i++) {
-            if (pages[i] == -1) {
-                free_pages.push_back(i);
-            }
-        }
-
-        if ((int) free_pages.size() < need_pages) {
-            return false;
-        }
-
-        obj.pages.clear();
-
-        for (int i = 0; i < need_pages; i++) {
-            const int page_id = free_pages[i];
-            pages[page_id] = obj.id;
-            obj.pages.push_back(page_id);
-        }
-
-        return true;
-    }
-
-    void free_object(const memory_object & obj) {
-        for (int p : obj.pages) {
-            if (p >= 0 && p < (int) pages.size()) {
-                pages[p] = -1;
-            }
-        }
-    }
-
-    metric_row make_metric(
-            const std::string & name,
-            int step,
-            int alloc_count,
-            int fail_count,
-            int live_kv,
-            int live_lora) const {
-        int used = 0;
-
-        for (int v : pages) {
-            if (v != -1) {
-                used++;
-            }
-        }
-
-        metric_row row;
-        row.allocator = name;
-        row.step = step;
-        row.memory_usage_gb = used * PAGE_SIZE_GB;
-        row.used_rate = (double) used / pages.size();
-
-        // 分页池不要求连续物理页，因此外部碎片不会阻止对象分配。
-        row.external_fragmentation = 0.0;
-        row.allocation_fail_rate =
-                alloc_count > 0 ? (double) fail_count / alloc_count : 0.0;
-        row.live_kv = live_kv;
-        row.live_lora = live_lora;
-
-        return row;
-    }
-
-private:
-    std::vector<int> pages;
-};
-
-static std::vector<alloc_event> build_workload() {
-    std::mt19937 rng(42);
-
-    std::vector<alloc_event> events;
-
-    std::uniform_int_distribution<int> kv_count_dist(2, 6);
-    std::uniform_int_distribution<int> kv_pages_dist(2, 18);
-    std::uniform_int_distribution<int> kv_ttl_dist(4, 28);
-
-    std::uniform_int_distribution<int> lora_pages_dist(12, 48);
-    std::uniform_int_distribution<int> lora_ttl_dist(120, 360);
-    std::uniform_real_distribution<double> prob_dist(0.0, 1.0);
-
-    for (int step = 1; step <= N_STEPS; step++) {
-        // 多请求场景下，KV cache 频繁动态产生。
-        const int n_kv = kv_count_dist(rng);
-
-        for (int i = 0; i < n_kv; i++) {
-            alloc_event e;
-            e.step = step;
-            e.type = object_type::kv_cache;
-            e.pages = kv_pages_dist(rng);
-            e.ttl = kv_ttl_dist(rng);
-            events.push_back(e);
-        }
-
-        // LoRA adapter 生命周期更长，频率更低，但占用页块更大。
-        if (prob_dist(rng) < 0.22) {
-            alloc_event e;
-            e.step = step;
-            e.type = object_type::lora_adapter;
-            e.pages = lora_pages_dist(rng);
-            e.ttl = lora_ttl_dist(rng);
-            events.push_back(e);
-        }
-    }
-
-    return events;
+    return "unknown";
 }
 
-template <typename Allocator>
-static std::vector<metric_row> run_allocator(
-        const std::string & allocator_name,
-        const std::vector<alloc_event> & events) {
-    Allocator allocator(N_PAGES);
+static double get_process_private_mb() {
+#ifdef _WIN32
+    PROCESS_MEMORY_COUNTERS_EX pmc;
 
-    std::unordered_map<int, memory_object> live_objects;
-    std::vector<metric_row> rows;
-
-    int next_id = 0;
-    int alloc_count = 0;
-    int fail_count = 0;
-    size_t event_idx = 0;
-
-    for (int step = 1; step <= N_STEPS; step++) {
-        std::vector<int> expired;
-
-        for (auto & it : live_objects) {
-            it.second.ttl--;
-
-            if (it.second.ttl <= 0) {
-                expired.push_back(it.first);
-            }
-        }
-
-        for (int id : expired) {
-            allocator.free_object(live_objects[id]);
-            live_objects.erase(id);
-        }
-
-        while (event_idx < events.size() && events[event_idx].step == step) {
-            const alloc_event & e = events[event_idx++];
-
-            memory_object obj;
-            obj.id = next_id++;
-            obj.type = e.type;
-            obj.ttl = e.ttl;
-
-            alloc_count++;
-
-            if (allocator.allocate(obj, e.pages)) {
-                live_objects[obj.id] = obj;
-            } else {
-                fail_count++;
-            }
-        }
-
-        int live_kv = 0;
-        int live_lora = 0;
-
-        for (const auto & it : live_objects) {
-            if (it.second.type == object_type::kv_cache) {
-                live_kv++;
-            } else {
-                live_lora++;
-            }
-        }
-
-        rows.push_back(
-                allocator.make_metric(
-                        allocator_name,
-                        step,
-                        alloc_count,
-                        fail_count,
-                        live_kv,
-                        live_lora));
+    if (GetProcessMemoryInfo(
+                GetCurrentProcess(),
+                reinterpret_cast<PROCESS_MEMORY_COUNTERS *>(&pmc),
+                sizeof(pmc))) {
+        return (double) pmc.PrivateUsage / 1024.0 / 1024.0;
     }
+#endif
 
-    return rows;
+    return 0.0;
 }
 
-static void save_results(const std::vector<metric_row> & rows) {
+static double get_gpu_used_mb() {
+#ifdef _WIN32
+    FILE * pipe = _popen(
+            "nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits",
+            "r");
+#else
+    FILE * pipe = popen(
+            "nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits",
+            "r");
+#endif
+
+    if (pipe == nullptr) {
+        return 0.0;
+    }
+
+    char buffer[256];
+    double value = 0.0;
+
+    if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
+        value = atof(buffer);
+    }
+
+#ifdef _WIN32
+    _pclose(pipe);
+#else
+    pclose(pipe);
+#endif
+
+    return value;
+}
+
+static void add_sample(
+        std::vector<memory_sample> & samples,
+        kv_mode mode,
+        int & step,
+        int request_id,
+        const std::string & event,
+        int generated_tokens,
+        double gpu_base_mb,
+        double process_base_mb) {
+    memory_sample s;
+
+    s.mode = mode_name(mode);
+    s.step = step++;
+    s.request_id = request_id;
+    s.event = event;
+    s.generated_tokens = generated_tokens;
+
+    s.gpu_used_mb = get_gpu_used_mb();
+    s.gpu_delta_mb = s.gpu_used_mb - gpu_base_mb;
+
+    s.process_used_mb = get_process_private_mb();
+    s.process_delta_mb = s.process_used_mb - process_base_mb;
+
+    samples.push_back(s);
+
+    fprintf(stderr,
+            "[%s] step=%d event=%s request=%d gpu=%.2f MB gpu_delta=%.2f MB process=%.2f MB\n",
+            s.mode.c_str(),
+            s.step,
+            s.event.c_str(),
+            s.request_id,
+            s.gpu_used_mb,
+            s.gpu_delta_mb,
+            s.process_used_mb);
+}
+
+static bool tokenize_prompt(
+        const llama_vocab * vocab,
+        const std::string & prompt,
+        std::vector<llama_token> & tokens) {
+    const int n_tokens = -llama_tokenize(
+            vocab,
+            prompt.c_str(),
+            (int) prompt.size(),
+            nullptr,
+            0,
+            true,
+            true);
+
+    if (n_tokens <= 0) {
+        fprintf(stderr, "failed to get prompt token count\n");
+        return false;
+    }
+
+    tokens.resize(n_tokens);
+
+    const int ret = llama_tokenize(
+            vocab,
+            prompt.c_str(),
+            (int) prompt.size(),
+            tokens.data(),
+            (int) tokens.size(),
+            true,
+            true);
+
+    if (ret < 0) {
+        fprintf(stderr, "failed to tokenize prompt\n");
+        return false;
+    }
+
+    return true;
+}
+
+static void batch_add(
+        llama_batch & batch,
+        llama_token token,
+        llama_pos pos,
+        llama_seq_id seq_id,
+        bool logits) {
+    const int i = batch.n_tokens;
+
+    batch.token[i] = token;
+    batch.pos[i] = pos;
+    batch.n_seq_id[i] = 1;
+    batch.seq_id[i][0] = seq_id;
+    batch.logits[i] = logits ? 1 : 0;
+
+    batch.n_tokens++;
+}
+
+static bool eval_prompt(
+        llama_context * ctx,
+        const std::vector<llama_token> & tokens) {
+    llama_batch batch = llama_batch_init((int) tokens.size(), 0, 1);
+
+    for (int i = 0; i < (int) tokens.size(); i++) {
+        batch_add(
+                batch,
+                tokens[i],
+                i,
+                0,
+                i == (int) tokens.size() - 1);
+    }
+
+    const int ret = llama_decode(ctx, batch);
+
+    llama_batch_free(batch);
+
+    if (ret != 0) {
+        fprintf(stderr, "prompt eval failed\n");
+        return false;
+    }
+
+    return true;
+}
+
+static bool decode_one_token(
+        llama_context * ctx,
+        llama_token token,
+        int pos) {
+    llama_batch batch = llama_batch_init(1, 0, 1);
+
+    batch_add(
+            batch,
+            token,
+            pos,
+            0,
+            true);
+
+    const int ret = llama_decode(ctx, batch);
+
+    llama_batch_free(batch);
+
+    if (ret != 0) {
+        fprintf(stderr, "decode one token failed\n");
+        return false;
+    }
+
+    return true;
+}
+
+static bool bind_lora(
+        llama_context * ctx,
+        llama_adapter_lora * adapter,
+        float scale) {
+    llama_adapter_lora * adapters[] = { adapter };
+    float scales[] = { scale };
+
+    const int ret = llama_set_adapters_lora(
+            ctx,
+            adapters,
+            1,
+            scales);
+
+    if (ret != 0) {
+        fprintf(stderr, "failed to bind LoRA adapter\n");
+        return false;
+    }
+
+    return true;
+}
+
+static void save_samples(
+        const std::vector<memory_sample> & samples,
+        const std::string & file_name) {
     std::filesystem::create_directories(output_dir);
 
-    const std::string path = output_dir + "/page_pool_results.csv";
-    std::ofstream fout(path);
+    const std::string csv_path = output_dir + "/" + file_name;
 
-    fout << "allocator,step,memory_usage_gb,used_rate,external_fragmentation,"
-         << "allocation_fail_rate,live_kv,live_lora\n";
+    std::ofstream fout(csv_path);
 
-    for (const auto & r : rows) {
-        fout << r.allocator << ","
-             << r.step << ","
-             << r.memory_usage_gb << ","
-             << r.used_rate << ","
-             << r.external_fragmentation << ","
-             << r.allocation_fail_rate << ","
-             << r.live_kv << ","
-             << r.live_lora << "\n";
+    fout << "mode,step,request_id,event,generated_tokens,"
+         << "gpu_used_mb,gpu_delta_mb,"
+         << "process_used_mb,process_delta_mb\n";
+
+    for (const auto & s : samples) {
+        fout << s.mode << ","
+             << s.step << ","
+             << s.request_id << ","
+             << s.event << ","
+             << s.generated_tokens << ","
+             << s.gpu_used_mb << ","
+             << s.gpu_delta_mb << ","
+             << s.process_used_mb << ","
+             << s.process_delta_mb << "\n";
     }
 
-    fprintf(stderr, "saved results to %s\n", path.c_str());
+    fout.close();
+
+    fprintf(stderr, "saved memory trace to %s\n", csv_path.c_str());
+}
+
+static void release_live_requests(std::vector<live_request> & live_requests) {
+    for (auto & req : live_requests) {
+        if (req.ctx != nullptr) {
+            llama_set_adapters_lora(req.ctx, nullptr, 0, nullptr);
+        }
+
+        if (req.adapter != nullptr) {
+            llama_adapter_lora_free(req.adapter);
+            req.adapter = nullptr;
+        }
+
+        if (req.ctx != nullptr) {
+            llama_free(req.ctx);
+            req.ctx = nullptr;
+        }
+    }
+
+    live_requests.clear();
+}
+
+static bool run_memory_experiment(
+        kv_mode mode,
+        const std::string & csv_name,
+        const std::string & model_path,
+        const std::vector<std::string> & lora_paths,
+        const std::vector<std::string> & prompts) {
+    const int ngl = 99;
+    const int n_ctx = 256;
+    const int n_batch = 32;
+    const int n_seq_max = 1;
+
+    // 请求越多，保留的 context / LoRA 越多，显存变化越明显。
+    // 如果显存不足，改成 4。
+    const int n_requests = 8;
+
+    // 每个请求生成几个 token，用于触发真实 KV 写入路径。
+    const int n_decode_per_request = 4;
+
+    // 分页 KV 的页大小。
+    // 如果你之前 multi-page 已经跑通，可以用 16。
+    // 如果还不稳定，可以临时改成 32。
+    const int physical_kv_page_size = 16;
+
+    const float lora_scale = 1.0f;
+
+    std::vector<memory_sample> samples;
+    std::vector<live_request> live_requests;
+
+    int step = 0;
+
+    // 每个实验单独取 baseline。
+    // 这样 continuous_kv 和 paged_kv 的 gpu_delta_mb 可以公平对比。
+    const double gpu_base_mb = get_gpu_used_mb();
+    const double process_base_mb = get_process_private_mb();
+
+    add_sample(
+            samples,
+            mode,
+            step,
+            -1,
+            "start",
+            0,
+            gpu_base_mb,
+            process_base_mb);
+
+    llama_model_params model_params = llama_model_default_params();
+    model_params.n_gpu_layers = ngl;
+
+    llama_model * model = llama_model_load_from_file(
+            model_path.c_str(),
+            model_params);
+
+    if (model == nullptr) {
+        fprintf(stderr, "[%s] failed to load model: %s\n", mode_name(mode), model_path.c_str());
+        return false;
+    }
+
+    add_sample(
+            samples,
+            mode,
+            step,
+            -1,
+            "model_loaded",
+            0,
+            gpu_base_mb,
+            process_base_mb);
+
+    const llama_vocab * vocab = llama_model_get_vocab(model);
+
+    live_requests.reserve(n_requests);
+
+    for (int request_id = 0; request_id < n_requests; request_id++) {
+        fprintf(stderr,
+                "\n========== %s request %d ==========\n",
+                mode_name(mode),
+                request_id);
+
+        const int lora_id = request_id % (int) lora_paths.size();
+        const int prompt_id = request_id % (int) prompts.size();
+
+        llama_context_params ctx_params = llama_context_default_params();
+        ctx_params.n_ctx = n_ctx;
+        ctx_params.n_batch = n_batch;
+        ctx_params.n_seq_max = n_seq_max;
+        ctx_params.no_perf = true;
+
+        if (mode == kv_mode::paged) {
+            // 这里使用你已经在 llama.cpp 中新增的实验性分页 KV 参数。
+            ctx_params.experimental_physical_paged_kv = true;
+            ctx_params.physical_kv_page_size = physical_kv_page_size;
+        } else {
+            ctx_params.experimental_physical_paged_kv = false;
+            ctx_params.physical_kv_page_size = 0;
+        }
+
+        llama_context * ctx = llama_init_from_model(model, ctx_params);
+        if (ctx == nullptr) {
+            fprintf(stderr, "[%s] failed to create context for request %d\n",
+                    mode_name(mode),
+                    request_id);
+            break;
+        }
+
+        add_sample(
+                samples,
+                mode,
+                step,
+                request_id,
+                "context_created",
+                0,
+                gpu_base_mb,
+                process_base_mb);
+
+        llama_adapter_lora * adapter =
+                llama_adapter_lora_init(model, lora_paths[lora_id].c_str());
+
+        if (adapter == nullptr) {
+            fprintf(stderr, "[%s] failed to load LoRA adapter: %s\n",
+                    mode_name(mode),
+                    lora_paths[lora_id].c_str());
+
+            llama_free(ctx);
+            break;
+        }
+
+        add_sample(
+                samples,
+                mode,
+                step,
+                request_id,
+                "lora_loaded",
+                0,
+                gpu_base_mb,
+                process_base_mb);
+
+        if (!bind_lora(ctx, adapter, lora_scale)) {
+            llama_adapter_lora_free(adapter);
+            llama_free(ctx);
+            break;
+        }
+
+        add_sample(
+                samples,
+                mode,
+                step,
+                request_id,
+                "lora_bound",
+                0,
+                gpu_base_mb,
+                process_base_mb);
+
+        std::vector<llama_token> prompt_tokens;
+        if (!tokenize_prompt(vocab, prompts[prompt_id], prompt_tokens)) {
+            llama_adapter_lora_free(adapter);
+            llama_free(ctx);
+            break;
+        }
+
+        if (!eval_prompt(ctx, prompt_tokens)) {
+            llama_adapter_lora_free(adapter);
+            llama_free(ctx);
+            break;
+        }
+
+        add_sample(
+                samples,
+                mode,
+                step,
+                request_id,
+                "prompt_eval",
+                0,
+                gpu_base_mb,
+                process_base_mb);
+
+        const llama_token repeated_token = prompt_tokens.back();
+
+        for (int i = 0; i < n_decode_per_request; i++) {
+            const int pos = (int) prompt_tokens.size() + i;
+
+            if (!decode_one_token(ctx, repeated_token, pos)) {
+                break;
+            }
+
+            add_sample(
+                    samples,
+                    mode,
+                    step,
+                    request_id,
+                    "decode_step",
+                    i + 1,
+                    gpu_base_mb,
+                    process_base_mb);
+        }
+
+        // 这里故意不立即释放。
+        // 目的是让多个 LoRA/KV 生命周期同时存在，从真实显存上看到累积效果。
+        live_request req;
+        req.ctx = ctx;
+        req.adapter = adapter;
+        live_requests.push_back(req);
+    }
+
+    add_sample(
+            samples,
+            mode,
+            step,
+            -1,
+            "before_release",
+            0,
+            gpu_base_mb,
+            process_base_mb);
+
+    release_live_requests(live_requests);
+
+    add_sample(
+            samples,
+            mode,
+            step,
+            -1,
+            "released",
+            0,
+            gpu_base_mb,
+            process_base_mb);
+
+    llama_model_free(model);
+
+    add_sample(
+            samples,
+            mode,
+            step,
+            -1,
+            "model_released",
+            0,
+            gpu_base_mb,
+            process_base_mb);
+
+    save_samples(samples, csv_name);
+
+    return true;
 }
 
 int main() {
-    const std::vector<alloc_event> workload = build_workload();
+    std::setlocale(LC_NUMERIC, "C");
 
-    std::vector<metric_row> all_rows;
+    const std::string model_path =
+            "D:/ecnu_experiment/Model/Qwen3.5-4B-BF16.gguf";
 
-    auto continuous_rows =
-            run_allocator<continuous_allocator>("continuous", workload);
+    std::vector<std::string> lora_paths = {
+        "D:/ecnu_experiment/Model/qwen35-marketing-adapter.gguf",
+        "D:/ecnu_experiment/Model/subliminal-monkey.gguf",
+        "D:/ecnu_experiment/Model/subliminal-qwen35-4b-tiger.gguf",
+        "D:/ecnu_experiment/Model/subliminal-qwen35-4b-wolf.gguf",
+    };
 
-    auto paged_rows =
-            run_allocator<paged_pool_allocator>("paged_pool", workload);
+    std::vector<std::string> prompts = {
+        "Hello my name is",
+        "The future of marketing is",
+        "A good product slogan is",
+        "To attract customers, we should",
+    };
 
-    all_rows.insert(all_rows.end(), continuous_rows.begin(), continuous_rows.end());
-    all_rows.insert(all_rows.end(), paged_rows.begin(), paged_rows.end());
+    ggml_backend_load_all();
 
-    save_results(all_rows);
+    fprintf(stderr, "\n========== running continuous KV experiment ==========\n");
 
-    fprintf(stderr, "page pool experiment finished.\n");
+    if (!run_memory_experiment(
+                kv_mode::continuous,
+                "real_lora_kv_gpu_memory.csv",
+                model_path,
+                lora_paths,
+                prompts)) {
+        fprintf(stderr, "continuous KV experiment failed\n");
+        return 1;
+    }
+
+    fprintf(stderr, "\n========== running paged KV experiment ==========\n");
+
+    if (!run_memory_experiment(
+                kv_mode::paged,
+                "real_lora_kv_page_memory.csv",
+                model_path,
+                lora_paths,
+                prompts)) {
+        fprintf(stderr, "paged KV experiment failed\n");
+        return 1;
+    }
+
+    fprintf(stderr, "real continuous/paged KV GPU memory experiments finished.\n");
 
     return 0;
 }

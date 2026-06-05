@@ -40,6 +40,12 @@ struct llama_cparams {
     bool kv_unified;
     bool pipeline_parallel;
 
+    // 新增固定页面
+    bool experimental_paged_kv = false;
+    uint32_t kv_page_size = 16;
+    bool experimental_physical_paged_kv = false;
+    uint32_t physical_kv_page_size = 16;
+
     enum llama_pooling_type pooling_type;
 
     ggml_backend_sched_eval_callback cb_eval;

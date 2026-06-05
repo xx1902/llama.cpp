@@ -30,9 +30,26 @@ llama_kv_cache::llama_kv_cache(
                  uint32_t   n_swa,
            llama_swa_type   swa_type,
     const layer_filter_cb & filter,
-    const  layer_reuse_cb & reuse) :
-    model(model), hparams(model.hparams), v_trans(v_trans),
-    n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type) {
+    const  layer_reuse_cb & reuse,
+                        bool   physical_paged,
+                    uint32_t   physical_page_size) :
+    // const layer_filter_cb & filter,
+    // const  layer_reuse_cb & reuse) :
+    // model(model), hparams(model.hparams), v_trans(v_trans),
+    // n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type) {
+    model(model),
+    hparams(model.hparams),
+    type_k_cache(type_k),
+    type_v_cache(type_v),
+    offload_cache(offload),
+    physical_paged(physical_paged),
+    physical_page_size(physical_page_size == 0 ? 16 : physical_page_size),
+    v_trans(v_trans),
+    n_seq_max(n_seq_max),
+    n_stream(unified ? 1 : n_seq_max),
+    n_pad(n_pad),
+    n_swa(n_swa),
+    swa_type(swa_type) {
 
     GGML_ASSERT(kv_size % n_pad == 0);
 
@@ -151,7 +168,8 @@ llama_kv_cache::llama_kv_cache(
 
         map_layer_ids[il] = layers.size();
 
-        layers.push_back({ il, k, v, k_stream, v_stream, });
+        // layers.push_back({ il, k, v, k_stream, v_stream, });
+        layers.push_back({ il, k, v, k_stream, v_stream, buft });
     }
 
     if (reuse) {
@@ -176,6 +194,20 @@ llama_kv_cache::llama_kv_cache(
 
             LLAMA_LOG_DEBUG("%s: - layer %3d: reuse layer %d, is_swa = %d\n", __func__, il, il_reuse, hparams.is_swa(il));
         }
+    }
+
+    // 新增分页
+    if (this->physical_paged) {
+        init_physical_paged_storage();
+
+        LLAMA_LOG_INFO(
+                "%s: physical paged KV enabled, max cells = %u, page_size = %u, max_pages = %u\n",
+                __func__,
+                kv_size,
+                this->physical_page_size,
+                (kv_size + this->physical_page_size - 1) / this->physical_page_size);
+
+        return;
     }
 
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
@@ -211,6 +243,144 @@ llama_kv_cache::llama_kv_cache(
 
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
+}
+
+// 新增分页
+void llama_kv_cache::init_physical_paged_storage() {
+    page_table.resize(n_stream);
+    physical_pages.resize(n_stream);
+
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        page_table[s].resize(get_size());
+
+        for (uint32_t i = 0; i < get_size(); ++i) {
+            page_table[s][i].page_id = UINT32_MAX;
+            page_table[s][i].offset = 0;
+        }
+    }
+
+    for (auto & layer : layers) {
+        layer.k = nullptr;
+        layer.v = nullptr;
+        layer.k_stream.clear();
+        layer.v_stream.clear();
+    }
+
+    // graph_reserve 会在真实 decode 前提前构图，可能先调用 cpy_k/cpy_v。
+    // 因此这里先为每个 stream 预分配第 0 页，避免构图阶段 page_table 为空。
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        ensure_page_for_cell(s, 0);
+    }
+
+    LLAMA_LOG_INFO(
+            "%s: initialized physical paged KV metadata, no full KV buffer allocated\n",
+            __func__);
+}
+const llama_kv_cache::kv_page_ref & llama_kv_cache::get_page_ref(
+        uint32_t stream_id,
+        uint32_t cell_id) const {
+    GGML_ASSERT(stream_id < page_table.size());
+    GGML_ASSERT(cell_id < page_table[stream_id].size());
+
+    return page_table[stream_id][cell_id];
+}
+void llama_kv_cache::ensure_page_for_cell(
+        uint32_t stream_id,
+        uint32_t cell_id) {
+    GGML_ASSERT(stream_id < page_table.size());
+    GGML_ASSERT(cell_id < page_table[stream_id].size());
+
+    auto & ref = page_table[stream_id][cell_id];
+
+    if (ref.page_id != UINT32_MAX) {
+        return;
+    }
+
+    const uint32_t page_begin = (cell_id / physical_page_size) * physical_page_size;
+    const uint32_t page_end = std::min(page_begin + physical_page_size, get_size());
+    const uint32_t page_id = (uint32_t) physical_pages[stream_id].size();
+
+    kv_page page;
+    page.id = page_id;
+    page.used = true;
+    page.cell_begin = page_begin;
+    page.cell_end = page_end;
+
+    const size_t n_tensors = layers.size() * 2;
+    const size_t ctx_size =
+            ggml_tensor_overhead() * n_tensors
+            + ggml_graph_overhead();
+
+    struct ggml_init_params params = {
+        /*.mem_size   =*/ ctx_size,
+        /*.mem_buffer =*/ nullptr,
+        /*.no_alloc   =*/ true,
+    };
+
+    page.ctx.reset(ggml_init(params));
+    page.layers.resize(layers.size());
+
+    for (uint32_t ikv = 0; ikv < layers.size(); ++ikv) {
+        const uint32_t il = layers[ikv].il;
+
+        const uint32_t n_embd_k_gqa = hparams.n_embd_k_gqa(il);
+        const uint32_t n_embd_v_gqa = hparams.n_embd_v_gqa(il);
+
+        page.layers[ikv].k = ggml_new_tensor_2d(
+                page.ctx.get(),
+                type_k_cache,
+                n_embd_k_gqa,
+                physical_page_size);
+
+        if (!v_trans) {
+            page.layers[ikv].v = ggml_new_tensor_2d(
+                    page.ctx.get(),
+                    type_v_cache,
+                    n_embd_v_gqa,
+                    physical_page_size);
+        } else {
+            page.layers[ikv].v = ggml_new_tensor_2d(
+                    page.ctx.get(),
+                    type_v_cache,
+                    physical_page_size,
+                    n_embd_v_gqa);
+        }
+    }
+
+    // 注意：这里先用原 KV 构造过程中第一块 buffer 的 backend 类型不容易直接拿到。
+    GGML_ASSERT(!layers.empty());
+
+    // 当前实验模型的 attention KV 都在 CUDA0，所以一个 page 使用同一个 buft。
+    // 如果后面支持多 GPU / CPU+GPU 混合层，需要按 buft 分组创建多个 page buffer。
+    ggml_backend_buffer_type_t buft = layers[0].buft;
+    GGML_ASSERT(buft != nullptr);
+
+    for (const auto & layer : layers) {
+        GGML_ASSERT(layer.buft == buft && "physical paged KV currently expects all KV layers on the same backend");
+    }
+
+    page.buf.reset(ggml_backend_alloc_ctx_tensors_from_buft(page.ctx.get(), buft));
+
+    if (!page.buf) {
+        throw std::runtime_error("failed to allocate physical paged KV buffer");
+    }
+
+    ggml_backend_buffer_clear(page.buf.get(), 0);
+
+    physical_pages[stream_id].push_back(std::move(page));
+
+    for (uint32_t i = page_begin; i < page_end; ++i) {
+        page_table[stream_id][i].page_id = page_id;
+        page_table[stream_id][i].offset = i - page_begin;
+    }
+
+    LLAMA_LOG_INFO(
+            "%s: allocated physical KV page stream=%u page=%u cells=[%u,%u)\n",
+            __func__,
+            stream_id,
+            page_id,
+            page_begin,
+            page_end);
 }
 
 void llama_kv_cache::clear(bool data) {
@@ -585,6 +755,16 @@ llama_kv_cache::slot_info_vec_t llama_kv_cache::prepare(const std::vector<llama_
 
         // remember the position that we found
         res.push_back(sinfo_new);
+
+        if (physical_paged) {
+            for (uint32_t s = 0; s < sinfo_new.n_stream(); ++s) {
+                const uint32_t stream_id = sinfo_new.strm[s];
+
+                for (uint32_t idx : sinfo_new.idxs[s]) {
+                    ensure_page_for_cell(stream_id, idx);
+                }
+            }
+        }
 
         // store the old state of the cells in the recovery stack
         {
@@ -994,6 +1174,14 @@ uint32_t llama_kv_cache::get_n_stream() const {
     return n_stream;
 }
 
+bool llama_kv_cache::get_physical_paged() const {
+    return physical_paged;
+}
+
+uint32_t llama_kv_cache::get_physical_page_size() const {
+    return physical_page_size;
+}
+
 bool llama_kv_cache::get_has_shift() const {
     bool result = false;
 
@@ -1004,7 +1192,173 @@ bool llama_kv_cache::get_has_shift() const {
     return result;
 }
 
+// 新增固定分页统计
+llama_kv_cache::memory_usage_stats llama_kv_cache::get_memory_usage_stats(uint32_t page_size) const {
+    memory_usage_stats stats;
+
+    if (page_size == 0) {
+        page_size = physical_paged ? physical_page_size : 16;
+    }
+
+    stats.page_size = page_size;
+
+    const uint32_t cells_per_stream = get_size();
+
+    stats.total_cells = cells_per_stream * n_stream;
+
+    if (stats.total_cells == 0) {
+        return stats;
+    }
+
+    const uint32_t pages_per_stream =
+            (cells_per_stream + page_size - 1) / page_size;
+
+    stats.total_pages = pages_per_stream * n_stream;
+
+    // 物理分页模式下，layers[ikv].k/v 已经被置空，不能再用 size_k_bytes()/size_v_bytes()。
+    // 这里分别计算：
+    // - continuous_bytes：如果使用原始连续 KV，需要的理论完整 KV 大小。
+    // - paged_bytes：当前已经真实分配的 page buffer 大小。
+    if (physical_paged) {
+        uint64_t bytes_per_cell_all_layers = 0;
+
+        for (const auto & layer : layers) {
+            const uint32_t il = layer.il;
+
+            bytes_per_cell_all_layers += ggml_row_size(type_k_cache, hparams.n_embd_k_gqa(il));
+
+            if (!hparams.is_mla()) {
+                bytes_per_cell_all_layers += ggml_row_size(type_v_cache, hparams.n_embd_v_gqa(il));
+            }
+        }
+
+        stats.continuous_bytes =
+                bytes_per_cell_all_layers * (uint64_t) cells_per_stream * (uint64_t) n_stream;
+
+        for (uint32_t s = 0; s < n_stream; ++s) {
+            const auto & cells = v_cells[s];
+
+            for (uint32_t i = 0; i < cells.size(); ++i) {
+                if (!cells.is_empty(i)) {
+                    stats.used_cells++;
+                }
+            }
+
+            stats.used_pages += (uint32_t) physical_pages[s].size();
+
+            for (const auto & page : physical_pages[s]) {
+                if (page.buf) {
+                    stats.paged_bytes += ggml_backend_buffer_get_size(page.buf.get());
+                }
+            }
+        }
+
+        stats.free_pages =
+                stats.total_pages > stats.used_pages
+                ? stats.total_pages - stats.used_pages
+                : 0;
+
+        stats.cell_used_rate =
+                stats.total_cells > 0
+                ? (double) stats.used_cells / (double) stats.total_cells
+                : 0.0;
+
+        stats.page_used_rate =
+                stats.total_pages > 0
+                ? (double) stats.used_pages / (double) stats.total_pages
+                : 0.0;
+
+        const uint32_t committed_cells = stats.used_pages * page_size;
+
+        if (committed_cells > 0) {
+            stats.page_waste_rate =
+                    committed_cells > stats.used_cells
+                    ? (double) (committed_cells - stats.used_cells) / (double) committed_cells
+                    : 0.0;
+        }
+
+        return stats;
+    }
+
+    stats.continuous_bytes = (uint64_t) size_k_bytes() + (uint64_t) size_v_bytes();
+
+    std::vector<uint8_t> page_used(stats.total_pages, 0);
+
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        const auto & cells = v_cells[s];
+
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (cells.is_empty(i)) {
+                continue;
+            }
+
+            stats.used_cells++;
+
+            const uint32_t page_in_stream = i / page_size;
+            const uint32_t global_page_id = s * pages_per_stream + page_in_stream;
+
+            if (global_page_id < page_used.size()) {
+                page_used[global_page_id] = 1;
+            }
+        }
+    }
+
+    for (uint8_t used : page_used) {
+        if (used) {
+            stats.used_pages++;
+        }
+    }
+
+    stats.free_pages =
+            stats.total_pages > stats.used_pages
+            ? stats.total_pages - stats.used_pages
+            : 0;
+
+    const double bytes_per_cell =
+            (double) stats.continuous_bytes / (double) stats.total_cells;
+
+    stats.paged_bytes =
+            (uint64_t) (bytes_per_cell * (double) page_size * (double) stats.used_pages);
+
+    stats.cell_used_rate =
+            stats.total_cells > 0
+            ? (double) stats.used_cells / (double) stats.total_cells
+            : 0.0;
+
+    stats.page_used_rate =
+            stats.total_pages > 0
+            ? (double) stats.used_pages / (double) stats.total_pages
+            : 0.0;
+
+    const uint32_t committed_cells = stats.used_pages * page_size;
+
+    if (committed_cells > 0) {
+        stats.page_waste_rate =
+                (double) (committed_cells - stats.used_cells)
+                / (double) committed_cells;
+    }
+
+    return stats;
+}
+
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
+    if (physical_paged) {
+        uint32_t result = 0;
+
+        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+            const auto & cells = v_cells[sinfo.strm[s]];
+
+            // 分页 KV 不要再固定 pad 到 256，否则 page_size=16 时会马上要求读取 256 个 KV。
+            // 这里按 page_size 对齐，便于单页/多页管理。
+            const uint32_t used = cells.used_max_p1();
+            const uint32_t padded = used == 0 ? physical_page_size : GGML_PAD(used, physical_page_size);
+
+            result = std::max(result, std::min(cells.size(), padded));
+        }
+
+        return result;
+    }
+
     uint32_t result = 0;
 
     // pad the n_kv value so that the graph remains constant across batches and can be reused
@@ -1021,6 +1375,45 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
 }
 
 ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+    if (physical_paged) {
+        const int32_t ikv = map_layer_ids.at(il);
+
+        GGML_ASSERT(sinfo.n_stream() == 1);
+
+        const uint32_t stream_id = sinfo.strm[0];
+
+        GGML_ASSERT(stream_id < physical_pages.size());
+        GGML_ASSERT(!physical_pages[stream_id].empty());
+
+        const uint32_t last_cell =
+                sinfo.idxs[0].empty() ? 0 : sinfo.idxs[0].back();
+
+        const auto & ref = get_page_ref(stream_id, last_cell);
+        GGML_ASSERT(ref.page_id != UINT32_MAX);
+
+        ggml_tensor * k = physical_pages[stream_id][ref.page_id].layers[ikv].k;
+        GGML_ASSERT(k != nullptr);
+
+        const uint32_t n_kv_page = std::min<uint32_t>(n_kv, physical_page_size);
+        GGML_ASSERT(k != nullptr);
+
+        const uint64_t n_embd_k_gqa = k->ne[0];
+
+        GGML_ASSERT(n_embd_k_gqa == hparams.n_embd_k_gqa(il));
+
+        return ggml_view_4d(
+                ctx,
+                k,
+                hparams.n_embd_head_k(il),
+                hparams.n_head_kv(il),
+                n_kv_page,
+                1,
+                ggml_row_size(k->type, hparams.n_embd_head_k(il)),
+                ggml_row_size(k->type, n_embd_k_gqa),
+                ggml_row_size(k->type, n_embd_k_gqa*physical_page_size),
+                0);
+    }
+
     const int32_t ikv = map_layer_ids.at(il);
 
     auto * k = layers[ikv].k;
@@ -1041,6 +1434,64 @@ ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_k
 }
 
 ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+    if (physical_paged) {
+        const int32_t ikv = map_layer_ids.at(il);
+
+        GGML_ASSERT(sinfo.n_stream() == 1);
+
+        const uint32_t stream_id = sinfo.strm[0];
+
+        GGML_ASSERT(stream_id < physical_pages.size());
+        GGML_ASSERT(!physical_pages[stream_id].empty());
+
+        const uint32_t last_cell =
+                sinfo.idxs[0].empty() ? 0 : sinfo.idxs[0].back();
+
+        const auto & ref = get_page_ref(stream_id, last_cell);
+        GGML_ASSERT(ref.page_id != UINT32_MAX);
+
+        ggml_tensor * v = physical_pages[stream_id][ref.page_id].layers[ikv].v;
+        GGML_ASSERT(v != nullptr);
+
+        const uint32_t n_kv_page = std::min<uint32_t>(n_kv, physical_page_size);
+        GGML_ASSERT(v != nullptr);
+
+        if (!v_trans) {
+            const uint64_t n_embd_v_gqa = v->ne[0];
+
+            GGML_ASSERT(n_embd_v_gqa >= hparams.n_embd_v_gqa(il));
+
+            return ggml_view_4d(
+                    ctx,
+                    v,
+                    hparams.n_embd_head_v(il),
+                    hparams.n_head_kv(il),
+                    n_kv_page,
+                    1,
+                    ggml_row_size(v->type, hparams.n_embd_head_v(il)),
+                    ggml_row_size(v->type, n_embd_v_gqa),
+                    ggml_row_size(v->type, n_embd_v_gqa*physical_page_size),
+                    0);
+        }
+
+        // v_trans=true 时，V 的布局是 [kv, embd]，和原始逻辑一致。
+        const uint64_t n_embd_v_gqa = v->ne[1];
+
+        GGML_ASSERT(n_embd_v_gqa >= hparams.n_embd_v_gqa(il));
+
+        return ggml_view_4d(
+                ctx,
+                v,
+                n_kv_page,
+                hparams.n_head_kv(il),
+                hparams.n_embd_head_v(il),
+                1,
+                ggml_row_size(v->type, physical_page_size*hparams.n_embd_head_v(il)),
+                ggml_row_size(v->type, physical_page_size),
+                ggml_row_size(v->type, physical_page_size*n_embd_v_gqa),
+                0);
+    }
+
     const int32_t ikv = map_layer_ids.at(il);
 
     auto * v = layers[ikv].v;
@@ -1073,9 +1524,40 @@ ggml_tensor * llama_kv_cache::get_v(ggml_context * ctx, int32_t il, uint32_t n_k
 }
 
 ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * k_idxs, int32_t il, const slot_info & sinfo) const {
-    GGML_UNUSED(sinfo);
+    // GGML_UNUSED(sinfo);
 
     const int32_t ikv = map_layer_ids.at(il);
+
+    if (physical_paged) {
+        GGML_ASSERT(sinfo.n_stream() == 1);
+        GGML_ASSERT(!sinfo.idxs.empty());
+        GGML_ASSERT(!sinfo.idxs[0].empty());
+
+        const uint32_t stream_id = sinfo.strm[0];
+        const auto & first_ref = get_page_ref(stream_id, sinfo.idxs[0][0]);
+        GGML_ASSERT(first_ref.page_id != UINT32_MAX);
+
+        // 第一版先要求一个 ubatch 写入同一个 page。
+        // 如果跨 page，需要后续把 k_cur 按 page 拆成多次 ggml_set_rows。
+        for (uint32_t idx : sinfo.idxs[0]) {
+            const auto & ref = get_page_ref(stream_id, idx);
+            GGML_ASSERT(ref.page_id == first_ref.page_id && "physical paged cpy_k currently requires one ubatch within one page");
+        }
+
+        ggml_tensor * page_k = physical_pages[stream_id][first_ref.page_id].layers[ikv].k;
+
+        const int64_t n_embd_head = k_cur->ne[0];
+        const int64_t n_head      = k_cur->ne[1];
+        const int64_t n_tokens    = k_cur->ne[2];
+
+        const int64_t n_embd_gqa = n_embd_head*n_head;
+
+        GGML_ASSERT(ggml_row_size(k_cur->type, n_embd_head) == k_cur->nb[1]);
+
+        k_cur = ggml_view_2d(ctx, k_cur, n_embd_gqa, n_tokens, k_cur->nb[2], 0);
+
+        return ggml_set_rows(ctx, page_k, k_cur, k_idxs);
+    }
 
     ggml_tensor * k = layers[ikv].k;
 
@@ -1108,9 +1590,45 @@ ggml_tensor * llama_kv_cache::cpy_k(ggml_context * ctx, ggml_tensor * k_cur, ggm
 }
 
 ggml_tensor * llama_kv_cache::cpy_v(ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * v_idxs, int32_t il, const slot_info & sinfo) const {
-    GGML_UNUSED(sinfo);
+    // GGML_UNUSED(sinfo);
 
     const int32_t ikv = map_layer_ids.at(il);
+
+    if (physical_paged) {
+        GGML_ASSERT(sinfo.n_stream() == 1);
+        GGML_ASSERT(!sinfo.idxs.empty());
+        GGML_ASSERT(!sinfo.idxs[0].empty());
+
+        const uint32_t stream_id = sinfo.strm[0];
+        const auto & first_ref = get_page_ref(stream_id, sinfo.idxs[0][0]);
+        GGML_ASSERT(first_ref.page_id != UINT32_MAX);
+
+        // 第一版先要求一个 ubatch 写入同一个 page。
+        for (uint32_t idx : sinfo.idxs[0]) {
+            const auto & ref = get_page_ref(stream_id, idx);
+            GGML_ASSERT(ref.page_id == first_ref.page_id && "physical paged cpy_v currently requires one ubatch within one page");
+        }
+
+        ggml_tensor * page_v = physical_pages[stream_id][first_ref.page_id].layers[ikv].v;
+
+        const int64_t n_embd_head = v_cur->ne[0];
+        const int64_t n_head      = v_cur->ne[1];
+        const int64_t n_tokens    = v_cur->ne[2];
+
+        const int64_t n_embd_gqa = n_embd_head*n_head;
+
+        GGML_ASSERT(ggml_row_size(v_cur->type, n_embd_head) == v_cur->nb[1]);
+
+        if (!v_trans) {
+            v_cur = ggml_view_2d(ctx, v_cur, n_embd_gqa, n_tokens, v_cur->nb[2], 0);
+            return ggml_set_rows(ctx, page_v, v_cur, v_idxs);
+        }
+
+        v_cur = ggml_cont(ctx, ggml_transpose(ctx, v_cur));
+        v_cur = ggml_reshape_2d(ctx, v_cur, n_tokens, n_embd_gqa);
+
+        return ggml_set_rows(ctx, page_v, v_cur, v_idxs);
+    }
 
     auto * v = layers[ikv].v;
 
@@ -1196,11 +1714,24 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     int64_t * data = (int64_t *) dst->data;
 
+    // for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+    //     const int64_t offs = sinfo.strm[s]*get_size();
+
+    //     for (uint32_t i = 0; i < sinfo.size(); ++i) {
+    //         data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
+    //     }
+    // }
     for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
         const int64_t offs = sinfo.strm[s]*get_size();
 
         for (uint32_t i = 0; i < sinfo.size(); ++i) {
-            data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
+            if (physical_paged) {
+                const auto & ref = get_page_ref(sinfo.strm[s], sinfo.idxs[s][i]);
+                GGML_ASSERT(ref.page_id != UINT32_MAX);
+                data[s*sinfo.size() + i] = ref.offset;
+            } else {
+                data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
+            }
         }
     }
 }
@@ -1213,25 +1744,61 @@ void llama_kv_cache::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ub
     int64_t * data = (int64_t *) dst->data;
 
     if (!v_trans) {
+        // for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        //     const int64_t offs = sinfo.strm[s]*get_size();
+
+        //     for (uint32_t i = 0; i < sinfo.size(); ++i) {
+        //         data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
+        //     }
+        // }
         for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
             const int64_t offs = sinfo.strm[s]*get_size();
 
             for (uint32_t i = 0; i < sinfo.size(); ++i) {
-                data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
+                if (physical_paged) {
+                    const auto & ref = get_page_ref(sinfo.strm[s], sinfo.idxs[s][i]);
+                    GGML_ASSERT(ref.page_id != UINT32_MAX);
+                    data[s*sinfo.size() + i] = ref.offset;
+                } else {
+                    data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
+                }
             }
         }
     } else {
         // note: the V cache is transposed when not using flash attention
-        const int64_t kv_size = get_size();
+        // const int64_t kv_size = get_size();
+
+        // const int64_t n_embd_v_gqa = hparams.n_embd_v_gqa_max();
+
+        // for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
+        //     const int64_t offs = sinfo.strm[s]*kv_size*n_embd_v_gqa;
+
+        //     for (uint32_t i = 0; i < sinfo.size(); ++i) {
+        //         for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
+        //             data[s*sinfo.size()*n_embd_v_gqa + i*n_embd_v_gqa + j] = offs + j*kv_size + sinfo.idxs[s][i];
+        //         }
+        //     }
+        // }
+
+        const int64_t kv_size = physical_paged ? physical_page_size : get_size();
 
         const int64_t n_embd_v_gqa = hparams.n_embd_v_gqa_max();
 
         for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
-            const int64_t offs = sinfo.strm[s]*kv_size*n_embd_v_gqa;
+            const int64_t offs = physical_paged ? 0 : sinfo.strm[s]*kv_size*n_embd_v_gqa;
 
             for (uint32_t i = 0; i < sinfo.size(); ++i) {
+                const uint32_t idx = sinfo.idxs[s][i];
+
+                uint32_t page_offset = idx;
+                if (physical_paged) {
+                    const auto & ref = get_page_ref(sinfo.strm[s], idx);
+                    GGML_ASSERT(ref.page_id != UINT32_MAX);
+                    page_offset = ref.offset;
+                }
+
                 for (uint32_t j = 0; j < n_embd_v_gqa; ++j) {
-                    data[s*sinfo.size()*n_embd_v_gqa + i*n_embd_v_gqa + j] = offs + j*kv_size + sinfo.idxs[s][i];
+                    data[s*sinfo.size()*n_embd_v_gqa + i*n_embd_v_gqa + j] = offs + j*kv_size + page_offset;
                 }
             }
         }
@@ -2165,10 +2732,25 @@ bool llama_kv_cache::state_read_data(llama_io_read_i & io, uint32_t strm, uint32
 
 llama_kv_cache_context::llama_kv_cache_context(llama_memory_status status) : status(status) {}
 
+// llama_kv_cache_context::llama_kv_cache_context(
+//         llama_kv_cache * kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
+//     n_kv = kv->get_size();
+
+//     const uint32_t n_stream = kv->get_n_stream();
+
+//     // create a dummy slot info - the actual data is irrelevant. we just need to build the graph
+//     sinfos.resize(1);
+//     sinfos[0].s0 = 0;
+//     sinfos[0].s1 = n_stream - 1;
+//     sinfos[0].idxs.resize(n_stream);
+//     for (uint32_t s = 0; s < n_stream; ++s) {
+//         sinfos[0].strm.push_back(s);
+//         sinfos[0].idxs[s].resize(1, 0);
+//     }
+// }
+
 llama_kv_cache_context::llama_kv_cache_context(
         llama_kv_cache * kv) : status(LLAMA_MEMORY_STATUS_SUCCESS), kv(kv) {
-    n_kv = kv->get_size();
-
     const uint32_t n_stream = kv->get_n_stream();
 
     // create a dummy slot info - the actual data is irrelevant. we just need to build the graph
@@ -2176,9 +2758,18 @@ llama_kv_cache_context::llama_kv_cache_context(
     sinfos[0].s0 = 0;
     sinfos[0].s1 = n_stream - 1;
     sinfos[0].idxs.resize(n_stream);
+
     for (uint32_t s = 0; s < n_stream; ++s) {
         sinfos[0].strm.push_back(s);
         sinfos[0].idxs[s].resize(1, 0);
+    }
+
+    // 原始连续 KV 在 reserve 阶段仍然使用完整 KV size。
+    // 物理分页 KV 在 reserve 阶段只构建一个 page 的图，否则 get_k/get_v 会要求读取完整 512 cells。
+    if (kv->get_physical_paged()) {
+        n_kv = kv->get_physical_page_size();
+    } else {
+        n_kv = kv->get_size();
     }
 }
 

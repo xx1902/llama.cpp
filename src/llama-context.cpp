@@ -5,6 +5,9 @@
 #include "llama-batch.h"
 #include "llama-io.h"
 #include "llama-memory.h"
+#include "llama-kv-cache.h"
+#include "llama-kv-cache-paged.h"
+#include "llama-memory-hybrid.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -63,6 +66,12 @@ llama_context::llama_context(
 
     cparams.cb_eval           = params.cb_eval;
     cparams.cb_eval_user_data = params.cb_eval_user_data;
+
+    // 新增KV转化
+    cparams.experimental_paged_kv = params.experimental_paged_kv;
+    cparams.kv_page_size = params.kv_page_size;
+    cparams.experimental_physical_paged_kv = params.experimental_physical_paged_kv;
+    cparams.physical_kv_page_size = params.physical_kv_page_size;
 
     // Initialize backend samplers here so they are part of the sampling graph
     // before the reserve passes run later in this function. This avoids a later
@@ -767,6 +776,81 @@ bool llama_context::memory_update(bool optimize) {
 
     return true;
 }
+
+// 新增固定页面
+bool llama_context::get_paged_kv_stats(llama_paged_kv_stats * stats) const {
+    if (stats == nullptr) {
+        return false;
+    }
+
+    auto * paged = dynamic_cast<llama_kv_cache_paged *>(memory.get());
+    if (paged == nullptr) {
+        return false;
+    }
+
+    const auto s = paged->get_page_stats();
+
+    stats->page_size = s.page_size;
+    stats->total_pages = s.total_pages;
+    stats->used_pages = s.used_pages;
+    stats->free_pages = s.free_pages;
+    stats->used_rate = s.used_rate;
+
+    return true;
+}
+static void llama_fill_kv_memory_stats(
+        llama_kv_memory_stats * dst,
+        const llama_kv_cache::memory_usage_stats & src) {
+    dst->page_size = src.page_size;
+
+    dst->total_cells = src.total_cells;
+    dst->used_cells = src.used_cells;
+
+    dst->total_pages = src.total_pages;
+    dst->used_pages = src.used_pages;
+    dst->free_pages = src.free_pages;
+
+    dst->continuous_bytes = src.continuous_bytes;
+    dst->paged_bytes = src.paged_bytes;
+
+    dst->cell_used_rate = src.cell_used_rate;
+    dst->page_used_rate = src.page_used_rate;
+    dst->page_waste_rate = src.page_waste_rate;
+}
+
+bool llama_context::get_kv_memory_stats(uint32_t page_size, llama_kv_memory_stats * stats) const {
+    if (stats == nullptr) {
+        return false;
+    }
+
+    // 普通 KV cache 路径。
+    if (auto * kv = dynamic_cast<llama_kv_cache *>(memory.get())) {
+        llama_fill_kv_memory_stats(stats, kv->get_memory_usage_stats(page_size));
+        return true;
+    }
+
+    // 实验 paged KV wrapper 路径。
+    if (auto * paged = dynamic_cast<llama_kv_cache_paged *>(memory.get())) {
+        llama_fill_kv_memory_stats(stats, paged->get_memory_usage_stats(page_size));
+        return true;
+    }
+
+    // 当前 Qwen3.5 这类模型会走 hybrid memory：
+    // 外层是 llama_memory_hybrid，里面的 attention 部分才是 llama_kv_cache。
+    if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+        llama_kv_cache * kv = hybrid->get_mem_attn();
+
+        if (kv == nullptr) {
+            return false;
+        }
+
+        llama_fill_kv_memory_stats(stats, kv->get_memory_usage_stats(page_size));
+        return true;
+    }
+
+    return false;
+}
+
 
 enum llama_pooling_type llama_context::pooling_type() const {
     return cparams.pooling_type;
@@ -2946,8 +3030,11 @@ llama_context_params llama_context_default_params() {
         /*.kv_unified                  =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
+        /*.experimental_paged_kv =*/ false,
+        /*.kv_page_size          =*/ 16,
+        /*.experimental_physical_paged_kv =*/ false,
+        /*.physical_kv_page_size          =*/ 16,
     };
-
     return result;
 }
 

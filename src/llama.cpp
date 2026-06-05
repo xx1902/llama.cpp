@@ -10,6 +10,7 @@
 #include "llama-model-loader.h"
 #include "llama-model-saver.h"
 #include "llama-model.h"
+#include "llama-kv-cache-paged.h"
 
 #include "ggml.h"
 #include "ggml-backend.h"
@@ -793,6 +794,27 @@ bool llama_supports_gpu_offload(void) {
 
 bool llama_supports_rpc(void) {
     return ggml_backend_reg_by_name("RPC") != nullptr;
+}
+
+// 新增固定分页
+bool llama_get_paged_kv_stats(
+        const llama_context * ctx,
+        llama_paged_kv_stats * stats) {
+    if (ctx == nullptr || stats == nullptr) {
+        return false;
+    }
+
+    return ctx->get_paged_kv_stats(stats);
+}
+bool llama_get_kv_memory_stats(
+        const llama_context * ctx,
+        uint32_t page_size,
+        llama_kv_memory_stats * stats) {
+    if (ctx == nullptr || stats == nullptr) {
+        return false;
+    }
+
+    return ctx->get_kv_memory_stats(page_size, stats);
 }
 
 void llama_backend_init(void) {

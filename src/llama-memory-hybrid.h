@@ -38,7 +38,9 @@ public:
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn = nullptr,
-    const layer_filter_cb & filter_recr = nullptr);
+    const layer_filter_cb & filter_recr = nullptr,
+                     bool   physical_paged = false,
+                 uint32_t   physical_page_size = 16);
 
     ~llama_memory_hybrid() = default;
 

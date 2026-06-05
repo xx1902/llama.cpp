@@ -378,6 +378,25 @@ extern "C" {
         // note: the samplers must be sampler chains (i.e. use llama_sampler_chain_init)
         struct llama_sampler_seq_config * samplers;
         size_t                            n_samplers;
+
+        // 新增固定页面的
+        // Experimental paged KV cache.
+        // false: use the original contiguous KV cache.
+        // true : use the experimental paged KV cache path.
+        bool experimental_paged_kv;
+
+        // Number of token positions stored in one KV page.
+        // Only used when experimental_paged_kv is true.
+        uint32_t kv_page_size;
+        // 新增固定页面的
+        // Experimental physical paged KV cache.
+        // false: original contiguous KV cache.
+        // true : allocate KV storage by fixed-size pages.
+        bool experimental_physical_paged_kv;
+
+        // Number of KV cells in one physical KV page.
+        uint32_t physical_kv_page_size;
+
     };
 
     // model quantization parameters
@@ -712,6 +731,54 @@ extern "C" {
     LLAMA_API void llama_memory_clear(
             llama_memory_t mem,
                       bool data);
+
+    // 新增固定分页
+    struct llama_paged_kv_stats {
+        uint32_t page_size;
+        uint32_t total_pages;
+        uint32_t used_pages;
+        uint32_t free_pages;
+        double used_rate;
+    };
+
+    LLAMA_API bool llama_get_paged_kv_stats(
+            const struct llama_context * ctx,
+            struct llama_paged_kv_stats * stats);
+
+    // KV cache memory usage comparison.
+    //
+    // continuous_bytes:
+    //   原始连续 KV cache 的完整预留内存。
+    //
+    // paged_bytes:
+    //   按固定 page_size 对真实已用 KV cell 进行页块化后，需要提交的内存。
+    //
+    // 注意：
+    // - 这里的 used_cells 来自 llama_kv_cache 内部真实 cell 状态。
+    // - paged_bytes 是固定分页布局下的真实生命周期占用估计。
+    // - 当前阶段不改变物理 K/V tensor layout，因此 GPU 实际分配仍由原始 KV buffer 决定。
+    struct llama_kv_memory_stats {
+        uint32_t page_size;
+
+        uint32_t total_cells;
+        uint32_t used_cells;
+
+        uint32_t total_pages;
+        uint32_t used_pages;
+        uint32_t free_pages;
+
+        uint64_t continuous_bytes;
+        uint64_t paged_bytes;
+
+        double cell_used_rate;
+        double page_used_rate;
+        double page_waste_rate;
+    };
+
+    LLAMA_API bool llama_get_kv_memory_stats(
+            const struct llama_context * ctx,
+            uint32_t page_size,
+            struct llama_kv_memory_stats * stats);
 
     // Removes all tokens that belong to the specified sequence and have positions in [p0, p1)
     // Returns false if a partial sequence cannot be removed. Removing a whole sequence never fails
