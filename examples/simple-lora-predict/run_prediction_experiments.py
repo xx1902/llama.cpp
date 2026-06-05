@@ -21,7 +21,7 @@ ROOT = Path(__file__).resolve().parents[1]
 SCRIPT_DIR = Path(__file__).resolve().parent
 sys.path.insert(0, str(ROOT))
 
-from predictor.fusion_engine import evaluate_lru, evaluate_model_and_fusion
+from predictor.fusion_engine import evaluate_lru, evaluate_lfu, evaluate_model_and_fusion
 from predictor.gru_model import TinyGRUPredictor
 from predictor.relation_table import build_global_relation_tables, build_user_relation_tables
 
@@ -432,15 +432,22 @@ def main() -> None:
     torch.save(model.state_dict(), out_dir / "gru_global.pt")
     plot_training_curve(history, out_dir / "fig5_1_training_curve.png")
 
-    print("[7/9] Evaluating LRU and fusion methods...", flush=True)
+    print("[7/9] Evaluating LRU, LFU and fusion methods...", flush=True)
+
     lru = evaluate_lru(samples)
+    lfu = evaluate_lfu(samples)
+
     fusion = evaluate_model_and_fusion(
         model, samples, id_to_name, name_to_id, global_seq, global_co, user_seq, user_co,
         alpha=0.8, temperature=0.05, device=device, desc="Fusion eval alpha=0.8 T=0.05"
     )
 
     latency = measure_prediction_latency(model, samples, device)
-    rows = [{"method": "LRU", **lru}]
+
+    rows = [
+        {"method": "LRU", **lru},
+        {"method": "LFU", **lfu},
+    ]
     rows.extend({"method": k, **v} for k, v in fusion.items())
 
     metrics = pd.DataFrame(rows)

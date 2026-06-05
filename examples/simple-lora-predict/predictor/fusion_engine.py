@@ -46,6 +46,87 @@ def evaluate_lru(samples_by_user: dict, capacity: int = 3) -> dict:
         "mrr": rr_sum / total,
     }
 
+def evaluate_lfu(samples_by_user: dict, capacity: int = 5) -> dict:
+    """Evaluate an online LFU cache baseline.
+
+    LFU 含义：
+    - 对每个用户维护一个访问频率表。
+    - 预测时优先选择历史访问次数最高的 adapter。
+    - 每次真实 target 出现后，再更新频率。
+    - Top-k 命中表示真实 target 是否在当前频率最高的 k 个 adapter 中。
+
+    注意：
+    - 这里的 LFU 是缓存策略基线，不调用 GRU。
+    - 它和 LRU 使用同一份 samples_by_user 测试窗口。
+    """
+    from collections import Counter
+
+    hits = {1: 0, 3: 0, 5: 0}
+    total = 0
+    rr_sum = 0.0
+
+    for _, data in tqdm(samples_by_user.items(), desc="LFU baseline", unit="user", leave=False):
+        x_train, _, y_train = data["train"]
+        x_test, _, y_test = data["test"]
+
+        freq = Counter()
+        last_seen = {}
+        time_step = 0
+
+        # 用训练集初始化用户历史频率。
+        for seq, target in zip(x_train, y_train):
+            for item in seq.tolist():
+                item = int(item)
+                freq[item] += 1
+                last_seen[item] = time_step
+                time_step += 1
+
+            target = int(target)
+            freq[target] += 1
+            last_seen[target] = time_step
+            time_step += 1
+
+        for seq, target in zip(x_test, y_test):
+            target = int(target)
+
+            # 当前窗口也作为预测前可见历史。
+            for item in seq.tolist():
+                item = int(item)
+
+                if item not in freq:
+                    freq[item] = 0
+
+                last_seen[item] = time_step
+                time_step += 1
+
+            ranked = sorted(
+                freq.keys(),
+                key=lambda item: (freq[item], last_seen.get(item, -1)),
+                reverse=True,
+            )
+
+            candidates = ranked[:max(5, capacity)]
+
+            for k in hits:
+                hits[k] += int(target in candidates[:k])
+
+            if target in candidates:
+                rr_sum += 1.0 / (candidates.index(target) + 1)
+
+            # 预测完成后再更新真实访问。
+            freq[target] += 1
+            last_seen[target] = time_step
+            time_step += 1
+
+            total += 1
+
+    return {
+        "top1": hits[1] / total,
+        "top3": hits[3] / total,
+        "top5": hits[5] / total,
+        "mrr": rr_sum / total,
+    }
+
 
 def evaluate_model_and_fusion(
     model: torch.nn.Module,
