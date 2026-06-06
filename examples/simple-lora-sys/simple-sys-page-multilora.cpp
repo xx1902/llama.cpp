@@ -2,8 +2,8 @@
 
 int main() {
     return run_sys_experiment(
-            "page_nomultilora",
-            "page_nomultilora.csv",
+            "page_multilora",
+            "page_multilora.csv",
             true,
-            false);
+            true);
 }
