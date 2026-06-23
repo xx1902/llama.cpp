@@ -113,6 +113,8 @@ poetry.toml
 /examples/simple-lora-sys/output
 /examples/simple-lora-kv/output
 
+/examples/lora-base/output
+
 # Test binaries
 /tests/test-backend-ops
 /tests/test-double-float
