@@ -87,29 +87,6 @@ struct kv_group_cache_entry {
     std::vector<llama_token> prefix_tokens;
 };
 
-struct online_prefix_node {
-    int node_id = -1;
-    int group_id = -1;
-
-    llama_seq_id cache_seq_id = -1;
-
-    int prefix_len = 0;
-    int hit_count = 0;
-
-    std::string group_name;
-    std::vector<llama_token> prefix_tokens;
-};
-
-struct online_route_result {
-    int node_id = -1;
-    int group_id = -1;
-
-    int exact_prefix_len = 0;
-    int suffix_len = 0;
-
-    bool exact_prefix_hit = false;
-};
-
 struct sample_result {
     std::string mode;
     std::string group_name;
@@ -120,11 +97,6 @@ struct sample_result {
     int n_prefix_tokens = 0;
     int n_suffix_tokens = 0;
     int n_predict = 0;
-
-    int online_node_id = -1;
-    int exact_prefix_hit = 0;
-
-    double estimated_saved_kv_mb = 0.0;
 
     double route_ms = 0.0;
     double prefix_ms = 0.0;
@@ -309,40 +281,6 @@ static int common_prefix_len(
     return i;
 }
 
-static size_t ggml_type_size_simple(enum ggml_type type) {
-    switch (type) {
-        case GGML_TYPE_F32:
-            return 4;
-        case GGML_TYPE_F16:
-        case GGML_TYPE_BF16:
-            return 2;
-        case GGML_TYPE_Q8_0:
-            return 1;
-        default:
-            return 2;
-    }
-}
-
-static double estimate_kv_mb_per_token(
-        const llama_model * model,
-        enum ggml_type type_k,
-        enum ggml_type type_v) {
-    const int n_layer = llama_model_n_layer(model);
-    const int n_embd = llama_model_n_embd(model);
-    const int n_head = llama_model_n_head(model);
-    const int n_head_kv = llama_model_n_head_kv(model);
-
-    const int n_embd_kv =
-            n_embd * n_head_kv / std::max(1, n_head);
-
-    const size_t bytes_per_token =
-            (size_t) n_layer *
-            ((size_t) n_embd_kv * ggml_type_size_simple(type_k) +
-             (size_t) n_embd_kv * ggml_type_size_simple(type_v));
-
-    return (double) bytes_per_token / 1024.0 / 1024.0;
-}
-
 static std::vector<lora_node_runtime> make_runtime_lora_nodes() {
     std::vector<lora_node_runtime> nodes;
 
@@ -423,52 +361,6 @@ static const lora_group_runtime * find_group(
     for (const auto & group : groups) {
         if (group.group_id == group_id) {
             return &group;
-        }
-    }
-
-    return nullptr;
-}
-
-static online_route_result route_online_prefix_node(
-        const std::vector<online_prefix_node> & nodes,
-        int routed_group_id,
-        const std::vector<llama_token> & prompt_tokens) {
-    online_route_result result;
-
-    result.group_id = routed_group_id;
-    result.suffix_len = (int) prompt_tokens.size();
-
-    int best_node_id = -1;
-    int best_prefix_len = 0;
-
-    for (const auto & node : nodes) {
-        if (node.group_id != routed_group_id) {
-            continue;
-        }
-
-        const int prefix_len =
-                common_prefix_len(prompt_tokens, node.prefix_tokens);
-
-        if (prefix_len > best_prefix_len) {
-            best_prefix_len = prefix_len;
-            best_node_id = node.node_id;
-        }
-    }
-
-    result.node_id = best_node_id;
-    result.exact_prefix_len = best_prefix_len;
-    result.suffix_len = (int) prompt_tokens.size() - best_prefix_len;
-    result.exact_prefix_hit = best_node_id >= 0 && best_prefix_len > 0;
-
-    return result;
-}
-
-static const online_prefix_node * find_online_node(
-        const std::vector<online_prefix_node> & nodes,
-        int node_id) {
-    for (const auto & node : nodes) {
-        if (node.node_id == node_id) {
-            return &node;
         }
     }
 
@@ -627,203 +519,6 @@ static sample_result run_baseline_request(
     return r;
 }
 
-static sample_result run_online_build_prefix_request(
-        llama_context * ctx,
-        llama_memory_t mem,
-        const std::vector<lora_node_runtime> & lora_nodes,
-        const std::vector<lora_group_runtime> & groups,
-        const request_item & req,
-        const request_tokens & toks,
-        llama_seq_id cache_seq_id,
-        llama_seq_id request_seq_id,
-        int node_id,
-        int n_predict) {
-    sample_result r;
-
-    const lora_group_runtime * group =
-            find_group(groups, toks.routed_group_id);
-
-    r.mode = "online_prefix_build";
-    r.group_name = group ? group->group_name : "unknown";
-    r.lora_name = lora_nodes[req.leaf_lora_id].short_name;
-    r.leaf_lora_id = req.leaf_lora_id;
-    r.online_node_id = node_id;
-    r.exact_prefix_hit = 0;
-
-    r.n_prompt_tokens = (int) toks.full.size();
-    r.n_prefix_tokens = 0;
-    r.n_suffix_tokens = (int) toks.full.size();
-    r.n_predict = n_predict;
-
-    if (r.n_prompt_tokens > 0) {
-        r.prefix_reuse_rate = 0.0;
-        r.suffix_delta_rate = 1.0;
-    }
-
-    const double gpu_start = get_gpu_used_mb();
-    double gpu_peak = gpu_start;
-
-    const double t0 = now_ms();
-
-    clear_lora(ctx);
-
-    const double prefix0 = now_ms();
-
-    eval_tokens(
-            ctx,
-            toks.full,
-            cache_seq_id,
-            0,
-            false);
-
-    const double prefix1 = now_ms();
-
-    r.prefix_ms = prefix1 - prefix0;
-
-    llama_memory_seq_cp(
-            mem,
-            cache_seq_id,
-            request_seq_id,
-            0,
-            (int) toks.full.size());
-
-    r.lora_bind_ms =
-            bind_lora_path(ctx, lora_nodes, req.leaf_lora_id);
-
-    const llama_token repeated = toks.full.back();
-
-    const double decode0 = now_ms();
-
-    for (int i = 0; i < n_predict; i++) {
-        const int pos = (int) toks.full.size() + i;
-
-        decode_one(ctx, repeated, request_seq_id, pos);
-
-        if (i == 0) {
-            r.ttft_ms = now_ms() - t0;
-        }
-
-        gpu_peak = std::max(gpu_peak, get_gpu_used_mb());
-    }
-
-    const double decode1 = now_ms();
-
-    r.decode_ms = decode1 - decode0;
-    r.total_ms = decode1 - t0;
-    r.tps = n_predict / std::max(0.001, r.decode_ms / 1000.0);
-    r.gpu_start_mb = gpu_start;
-    r.gpu_peak_mb = gpu_peak;
-    r.gpu_peak_delta_mb = gpu_peak - gpu_start;
-
-    return r;
-}
-
-static sample_result run_online_prefix_reuse_request(
-        llama_context * ctx,
-        llama_memory_t mem,
-        const std::vector<lora_node_runtime> & lora_nodes,
-        const std::vector<lora_group_runtime> & groups,
-        const online_prefix_node & node,
-        const request_item & req,
-        const request_tokens & toks,
-        llama_seq_id request_seq_id,
-        int matched_prefix_len,
-        int n_predict,
-        double kv_mb_per_token) {
-    sample_result r;
-
-    const lora_group_runtime * group =
-            find_group(groups, toks.routed_group_id);
-
-    r.mode = "online_prefix_reuse";
-    r.group_name = group ? group->group_name : "unknown";
-    r.lora_name = lora_nodes[req.leaf_lora_id].short_name;
-    r.leaf_lora_id = req.leaf_lora_id;
-    r.online_node_id = node.node_id;
-    r.exact_prefix_hit = 1;
-
-    r.n_prompt_tokens = (int) toks.full.size();
-    r.n_prefix_tokens = matched_prefix_len;
-    r.n_suffix_tokens = (int) toks.full.size() - matched_prefix_len;
-    r.n_predict = n_predict;
-
-    if (r.n_prompt_tokens > 0) {
-        r.prefix_reuse_rate =
-                (double) r.n_prefix_tokens / (double) r.n_prompt_tokens;
-        r.suffix_delta_rate =
-                (double) r.n_suffix_tokens / (double) r.n_prompt_tokens;
-    }
-
-    r.estimated_saved_kv_mb =
-            (double) matched_prefix_len * kv_mb_per_token;
-
-    const double gpu_start = get_gpu_used_mb();
-    double gpu_peak = gpu_start;
-
-    const double t0 = now_ms();
-
-    const double prefix0 = now_ms();
-
-    llama_memory_seq_cp(
-            mem,
-            node.cache_seq_id,
-            request_seq_id,
-            0,
-            matched_prefix_len);
-
-    const double prefix1 = now_ms();
-
-    r.prefix_ms = prefix1 - prefix0;
-
-    r.lora_bind_ms =
-            bind_lora_path(ctx, lora_nodes, req.leaf_lora_id);
-
-    std::vector<llama_token> suffix(
-            toks.full.begin() + matched_prefix_len,
-            toks.full.end());
-
-    const double suffix0 = now_ms();
-
-    eval_tokens(
-            ctx,
-            suffix,
-            request_seq_id,
-            matched_prefix_len,
-            true);
-
-    const double suffix1 = now_ms();
-
-    r.suffix_ms = suffix1 - suffix0;
-
-    const llama_token repeated =
-            suffix.empty() ? toks.full.back() : suffix.back();
-
-    const double decode0 = now_ms();
-
-    for (int i = 0; i < n_predict; i++) {
-        const int pos = (int) toks.full.size() + i;
-
-        decode_one(ctx, repeated, request_seq_id, pos);
-
-        if (i == 0) {
-            r.ttft_ms = now_ms() - t0;
-        }
-
-        gpu_peak = std::max(gpu_peak, get_gpu_used_mb());
-    }
-
-    const double decode1 = now_ms();
-
-    r.decode_ms = decode1 - decode0;
-    r.total_ms = decode1 - t0;
-    r.tps = n_predict / std::max(0.001, r.decode_ms / 1000.0);
-    r.gpu_start_mb = gpu_start;
-    r.gpu_peak_mb = gpu_peak;
-    r.gpu_peak_delta_mb = gpu_peak - gpu_start;
-
-    return r;
-}
-
 static sample_result run_group_kv_reuse_request(
         llama_context * ctx,
         llama_memory_t mem,
@@ -947,21 +642,17 @@ static void save_results(
     std::ofstream fout(path);
 
     fout << "mode,group_name,lora_name,leaf_lora_id,"
-        << "online_node_id,exact_prefix_hit,"
         << "n_prompt_tokens,n_prefix_tokens,n_suffix_tokens,"
         << "prefix_reuse_rate,suffix_delta_rate,n_predict,"
         << "route_ms,prefix_ms,lora_bind_ms,suffix_ms,"
         << "ttft_ms,decode_ms,total_ms,tps,"
-        << "gpu_start_mb,gpu_peak_mb,gpu_peak_delta_mb,"
-        << "estimated_saved_kv_mb\n";
+        << "gpu_start_mb,gpu_peak_mb,gpu_peak_delta_mb\n";
 
     for (const auto & r : results) {
         fout << r.mode << ","
              << r.group_name << ","
              << r.lora_name << ","
              << r.leaf_lora_id << ","
-             << r.online_node_id << ","
-             << r.exact_prefix_hit << ","
              << r.n_prompt_tokens << ","
              << r.n_prefix_tokens << ","
              << r.n_suffix_tokens << ","
@@ -978,8 +669,7 @@ static void save_results(
              << r.tps << ","
              << r.gpu_start_mb << ","
              << r.gpu_peak_mb << ","
-             << r.gpu_peak_delta_mb << ","
-             << r.estimated_saved_kv_mb << "\n";
+             << r.gpu_peak_delta_mb << "\n";
     }
 
     fprintf(stderr, "saved results to %s\n", path.c_str());
@@ -1130,11 +820,10 @@ int main() {
     }
 
     {
-        std::vector<online_prefix_node> online_nodes;
+        std::vector<kv_group_cache_entry> cache_entries;
 
-        const int min_reuse_prefix_tokens = 4;
-        const int cache_seq_base = 0;
-        const int request_seq_base = 128;
+        const int n_groups = (int) groups.size();
+        const int request_seq_base = n_groups;
 
         llama_context_params ctx_params =
                 llama_context_default_params();
@@ -1143,7 +832,7 @@ int main() {
         ctx_params.n_batch = 256;
         ctx_params.n_ubatch = 64;
         ctx_params.n_seq_max =
-                (uint32_t) (cache_seq_base + request_seq_base + requests.size() + 16);
+                (uint32_t) (n_groups + requests.size() + 4);
         ctx_params.no_perf = true;
         ctx_params.kv_unified = true;
 
@@ -1151,140 +840,79 @@ int main() {
                 llama_init_from_model(model, ctx_params);
 
         if (ctx == nullptr) {
-            fprintf(stderr, "failed to create online-prefix context\n");
+            fprintf(stderr, "failed to create group-kv context\n");
             return 1;
         }
 
         llama_memory_t mem =
                 llama_get_memory(ctx);
 
-        const double kv_mb_per_token =
-                estimate_kv_mb_per_token(
-                        model,
-                        ctx_params.type_k,
-                        ctx_params.type_v);
+        clear_lora(ctx);
 
-        fprintf(stderr,
-                "estimated kv memory per token: %.6f MB\n",
-                kv_mb_per_token);
+        for (const auto & group : groups) {
+            std::vector<int> indices;
 
-        for (int i = 0; i < (int) requests.size(); i++) {
-            const request_item & req = requests[i];
-            const request_tokens & toks = tokenized[i];
+            for (int i = 0; i < (int) tokenized.size(); i++) {
+                if (tokenized[i].routed_group_id == group.group_id) {
+                    indices.push_back(i);
+                }
+            }
 
-            const lora_group_runtime * group =
-                    find_group(groups, toks.routed_group_id);
-
-            if (group == nullptr) {
-                fprintf(stderr, "request %d has no routed group\n", i);
+            if (indices.empty()) {
                 continue;
             }
 
-            online_route_result route =
-                    route_online_prefix_node(
-                            online_nodes,
-                            toks.routed_group_id,
-                            toks.full);
+            std::vector<llama_token> prefix =
+                    group_common_prefix(tokenized, indices);
 
-            const llama_seq_id request_seq_id =
-                    (llama_seq_id) (request_seq_base + i);
-
-            if (route.exact_prefix_hit &&
-                    route.exact_prefix_len >= min_reuse_prefix_tokens) {
-                const online_prefix_node * hit =
-                        find_online_node(online_nodes, route.node_id);
-
-                if (hit == nullptr) {
-                    fprintf(stderr,
-                            "online prefix node not found: %d\n",
-                            route.node_id);
-                    continue;
-                }
-
-                sample_result r =
-                        run_online_prefix_reuse_request(
-                                ctx,
-                                mem,
-                                lora_nodes,
-                                groups,
-                                *hit,
-                                req,
-                                toks,
-                                request_seq_id,
-                                route.exact_prefix_len,
-                                n_predict,
-                                kv_mb_per_token);
-
-                results.push_back(r);
-
-                for (auto & node : online_nodes) {
-                    if (node.node_id == route.node_id) {
-                        node.hit_count++;
-                        break;
-                    }
-                }
-
-                fprintf(stderr,
-                        "online prefix hit: request=%d group=%s node=%d prefix=%d suffix=%d saved_kv=%.4f MB\n",
-                        i,
-                        group->group_name.c_str(),
-                        route.node_id,
-                        route.exact_prefix_len,
-                        route.suffix_len,
-                        r.estimated_saved_kv_mb);
-
+            if (prefix.empty()) {
                 continue;
             }
-
-            const int node_id = (int) online_nodes.size();
 
             const llama_seq_id cache_seq_id =
-                    (llama_seq_id) (cache_seq_base + node_id);
+                    (llama_seq_id) group.group_id;
 
+            const double p0 = now_ms();
+
+            eval_tokens(
+                    ctx,
+                    prefix,
+                    cache_seq_id,
+                    0,
+                    false);
+
+            const double p1 = now_ms();
+
+            kv_group_cache_entry entry;
+
+            entry.group_id = group.group_id;
+            entry.seq_id = cache_seq_id;
+            entry.prefix_len = (int) prefix.size();
+            entry.prefix_tokens = prefix;
+
+            cache_entries.push_back(entry);
+
+            fprintf(stderr,
+                    "group %s cached prefix_len=%d eval_ms=%.3f\n",
+                    group.group_name.c_str(),
+                    (int) prefix.size(),
+                    p1 - p0);
+        }
+
+        for (int i = 0; i < (int) requests.size(); i++) {
             sample_result r =
-                    run_online_build_prefix_request(
+                    run_group_kv_reuse_request(
                             ctx,
                             mem,
                             lora_nodes,
                             groups,
-                            req,
-                            toks,
-                            cache_seq_id,
-                            request_seq_id,
-                            node_id,
+                            cache_entries,
+                            requests[i],
+                            tokenized[i],
+                            request_seq_base + i,
                             n_predict);
 
             results.push_back(r);
-
-            online_prefix_node node;
-
-            node.node_id = node_id;
-            node.group_id = toks.routed_group_id;
-            node.group_name = group->group_name;
-            node.cache_seq_id = cache_seq_id;
-            node.prefix_len = (int) toks.full.size();
-            node.prefix_tokens = toks.full;
-            node.hit_count = 0;
-
-            online_nodes.push_back(node);
-
-            fprintf(stderr,
-                    "online prefix node created: request=%d group=%s node=%d prefix_len=%d\n",
-                    i,
-                    group->group_name.c_str(),
-                    node.node_id,
-                    node.prefix_len);
-        }
-
-        fprintf(stderr, "\nonline prefix tree summary:\n");
-
-        for (const auto & node : online_nodes) {
-            fprintf(stderr,
-                    "  node=%d group=%s prefix_len=%d hit_count=%d\n",
-                    node.node_id,
-                    node.group_name.c_str(),
-                    node.prefix_len,
-                    node.hit_count);
         }
 
         clear_lora(ctx);
