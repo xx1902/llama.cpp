@@ -812,6 +812,20 @@ extern "C" {
 
         struct llama_kv_delta_layer_stats layers[LLAMA_KV_DELTA_MAX_LAYERS];
     };
+    struct llama_kv_delta_materialize_stats {
+        int32_t n_layers;
+        int32_t n_tokens;
+
+        int32_t materialized_layers;
+        int32_t materialized_tokens;
+        int32_t missing_cell_count;
+
+        uint64_t delta_fp32_bytes;
+        uint64_t materialized_kv_bytes;
+
+        char memory_kind[64];
+        char status[64];
+    };
     LLAMA_API bool llama_kv_seq_delta_probe(
             const struct llama_context * ctx,
             llama_seq_id seq_a,
@@ -819,7 +833,14 @@ extern "C" {
             llama_pos p0,
             llama_pos p1,
             struct llama_kv_delta_probe_stats * stats);
-
+    LLAMA_API bool llama_kv_seq_delta_materialize(
+            struct llama_context * ctx,
+            llama_seq_id seq_anchor,
+            llama_seq_id seq_child_full,
+            llama_seq_id seq_dst,
+            llama_pos p0,
+            llama_pos p1,
+            struct llama_kv_delta_materialize_stats * stats);
     LLAMA_API bool llama_get_kv_memory_stats(
             const struct llama_context * ctx,
             uint32_t page_size,

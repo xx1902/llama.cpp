@@ -1362,6 +1362,25 @@ static float kv_probe_read_scalar(
             return 0.0f;
     }
 }
+static void kv_probe_write_scalar(
+        std::vector<uint8_t> & raw,
+        ggml_type type,
+        uint32_t i,
+        float value) {
+    if (type == GGML_TYPE_F32) {
+        float * ptr = reinterpret_cast<float *>(raw.data());
+        ptr[i] = value;
+        return;
+    }
+
+    if (type == GGML_TYPE_F16) {
+        ggml_fp16_t * ptr = reinterpret_cast<ggml_fp16_t *>(raw.data());
+        ptr[i] = ggml_fp32_to_fp16(value);
+        return;
+    }
+
+    // 实验版先只支持 F16/F32 KV cache。
+}
 
 static void kv_probe_accumulate(
         const std::vector<float> & a,
@@ -1703,6 +1722,257 @@ bool llama_kv_cache::seq_delta_probe(
             stats.kv_cos_avg > 0.98 || stats.kv_l2_avg < 0.05;
 
     return true;
+}
+
+bool llama_kv_cache::seq_delta_materialize(
+        llama_seq_id seq_anchor,
+        llama_seq_id seq_child_full,
+        llama_seq_id seq_dst,
+        llama_pos p0,
+        llama_pos p1,
+        kv_delta_materialize_stats & stats) {
+    stats = {};
+
+    if (seq_anchor < 0 || seq_child_full < 0 || seq_dst < 0) {
+        return false;
+    }
+
+    if ((size_t) seq_anchor >= seq_to_stream.size() ||
+            (size_t) seq_child_full >= seq_to_stream.size() ||
+            (size_t) seq_dst >= seq_to_stream.size()) {
+        return false;
+    }
+
+    if (p0 < 0) {
+        p0 = 0;
+    }
+
+    if (p1 <= p0) {
+        return false;
+    }
+
+    const uint32_t stream_anchor = seq_to_stream[seq_anchor];
+    const uint32_t stream_child  = seq_to_stream[seq_child_full];
+    const uint32_t stream_dst    = seq_to_stream[seq_dst];
+
+    auto & cells_anchor = v_cells[stream_anchor];
+    auto & cells_child  = v_cells[stream_child];
+    auto & cells_dst    = v_cells[stream_dst];
+
+    auto find_cell = [](
+            const llama_kv_cells & cells,
+            llama_seq_id seq_id,
+            llama_pos pos,
+            uint32_t & cell_id) -> bool {
+        for (uint32_t i = 0; i < cells.size(); i++) {
+            if (!cells.seq_has(i, seq_id)) {
+                continue;
+            }
+
+            if (cells.pos_get(i) == pos) {
+                cell_id = i;
+                return true;
+            }
+        }
+
+        return false;
+    };
+
+    stats.n_layers = (int32_t) layers.size();
+    stats.n_tokens = (int32_t) (p1 - p0);
+
+    int materialized_token_count = 0;
+
+    for (llama_pos pos = p0; pos < p1; pos++) {
+        uint32_t cell_anchor = 0;
+        uint32_t cell_child  = 0;
+        uint32_t cell_dst    = 0;
+
+        const bool has_anchor = find_cell(cells_anchor, seq_anchor, pos, cell_anchor);
+        const bool has_child  = find_cell(cells_child,  seq_child_full, pos, cell_child);
+        const bool has_dst    = find_cell(cells_dst,    seq_dst, pos, cell_dst);
+
+        if (!has_anchor || !has_child || !has_dst) {
+            stats.missing_cell_count++;
+            continue;
+        }
+
+        materialized_token_count++;
+
+        for (const auto & layer : layers) {
+            const uint32_t il = layer.il;
+
+            const uint32_t n_embd_k_gqa =
+                    hparams.n_embd_k_gqa(il);
+
+            const uint32_t n_embd_v_gqa =
+                    hparams.n_embd_v_gqa(il);
+
+            ggml_tensor * k_anchor = layer.k_stream[stream_anchor];
+            ggml_tensor * k_child  = layer.k_stream[stream_child];
+            ggml_tensor * k_dst    = layer.k_stream[stream_dst];
+
+            ggml_tensor * v_anchor = layer.v_stream[stream_anchor];
+            ggml_tensor * v_child  = layer.v_stream[stream_child];
+            ggml_tensor * v_dst    = layer.v_stream[stream_dst];
+
+            if (k_anchor != nullptr && k_child != nullptr && k_dst != nullptr) {
+                const size_t k_size_row =
+                        ggml_row_size(k_anchor->type, n_embd_k_gqa);
+
+                std::vector<uint8_t> raw_anchor(k_size_row);
+                std::vector<uint8_t> raw_child(k_size_row);
+                std::vector<uint8_t> raw_dst(k_size_row);
+
+                ggml_backend_tensor_get(
+                        k_anchor,
+                        raw_anchor.data(),
+                        cell_anchor * k_size_row,
+                        k_size_row);
+
+                ggml_backend_tensor_get(
+                        k_child,
+                        raw_child.data(),
+                        cell_child * k_size_row,
+                        k_size_row);
+
+                for (uint32_t i = 0; i < n_embd_k_gqa; i++) {
+                    const float a =
+                            kv_probe_read_scalar(raw_anchor, k_anchor->type, i);
+
+                    const float b =
+                            kv_probe_read_scalar(raw_child, k_child->type, i);
+
+                    const float delta = b - a;
+                    const float out = a + delta;
+
+                    kv_probe_write_scalar(raw_dst, k_dst->type, i, out);
+                }
+
+                ggml_backend_tensor_set(
+                        k_dst,
+                        raw_dst.data(),
+                        cell_dst * k_size_row,
+                        k_size_row);
+
+                stats.delta_fp32_bytes +=
+                        (uint64_t) n_embd_k_gqa * sizeof(float);
+
+                stats.materialized_kv_bytes +=
+                        (uint64_t) k_size_row;
+            }
+
+            if (v_anchor != nullptr && v_child != nullptr && v_dst != nullptr) {
+                const size_t v_size_el =
+                        ggml_type_size(v_anchor->type);
+
+                if (!v_trans) {
+                    const size_t v_size_row =
+                            ggml_row_size(v_anchor->type, n_embd_v_gqa);
+
+                    std::vector<uint8_t> raw_anchor(v_size_row);
+                    std::vector<uint8_t> raw_child(v_size_row);
+                    std::vector<uint8_t> raw_dst(v_size_row);
+
+                    ggml_backend_tensor_get(
+                            v_anchor,
+                            raw_anchor.data(),
+                            cell_anchor * v_size_row,
+                            v_size_row);
+
+                    ggml_backend_tensor_get(
+                            v_child,
+                            raw_child.data(),
+                            cell_child * v_size_row,
+                            v_size_row);
+
+                    for (uint32_t i = 0; i < n_embd_v_gqa; i++) {
+                        const float a =
+                                kv_probe_read_scalar(raw_anchor, v_anchor->type, i);
+
+                        const float b =
+                                kv_probe_read_scalar(raw_child, v_child->type, i);
+
+                        const float delta = b - a;
+                        const float out = a + delta;
+
+                        kv_probe_write_scalar(raw_dst, v_dst->type, i, out);
+                    }
+
+                    ggml_backend_tensor_set(
+                            v_dst,
+                            raw_dst.data(),
+                            cell_dst * v_size_row,
+                            v_size_row);
+
+                    stats.delta_fp32_bytes +=
+                            (uint64_t) n_embd_v_gqa * sizeof(float);
+
+                    stats.materialized_kv_bytes +=
+                            (uint64_t) v_size_row;
+                } else {
+                    for (uint32_t i = 0; i < n_embd_v_gqa; i++) {
+                        std::vector<uint8_t> raw_anchor(v_size_el);
+                        std::vector<uint8_t> raw_child(v_size_el);
+                        std::vector<uint8_t> raw_dst(v_size_el);
+
+                        const size_t offset_anchor =
+                                (cell_anchor + i * cells_anchor.size()) * v_size_el;
+
+                        const size_t offset_child =
+                                (cell_child + i * cells_child.size()) * v_size_el;
+
+                        const size_t offset_dst =
+                                (cell_dst + i * cells_dst.size()) * v_size_el;
+
+                        ggml_backend_tensor_get(
+                                v_anchor,
+                                raw_anchor.data(),
+                                offset_anchor,
+                                v_size_el);
+
+                        ggml_backend_tensor_get(
+                                v_child,
+                                raw_child.data(),
+                                offset_child,
+                                v_size_el);
+
+                        const float a =
+                                kv_probe_read_scalar(raw_anchor, v_anchor->type, 0);
+
+                        const float b =
+                                kv_probe_read_scalar(raw_child, v_child->type, 0);
+
+                        const float delta = b - a;
+                        const float out = a + delta;
+
+                        kv_probe_write_scalar(raw_dst, v_dst->type, 0, out);
+
+                        ggml_backend_tensor_set(
+                                v_dst,
+                                raw_dst.data(),
+                                offset_dst,
+                                v_size_el);
+                    }
+
+                    stats.delta_fp32_bytes +=
+                            (uint64_t) n_embd_v_gqa * sizeof(float);
+
+                    stats.materialized_kv_bytes +=
+                            (uint64_t) n_embd_v_gqa * v_size_el;
+                }
+            }
+
+            stats.materialized_layers++;
+        }
+    }
+
+    stats.materialized_tokens = materialized_token_count;
+    stats.ok =
+            materialized_token_count > 0 &&
+            stats.missing_cell_count == 0;
+
+    return stats.ok;
 }
 
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {

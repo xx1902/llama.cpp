@@ -1087,6 +1087,136 @@ bool llama_kv_seq_delta_probe(
 
     return true;
 }
+static void llama_kv_delta_materialize_set_text(
+        char * dst,
+        size_t dst_size,
+        const char * text) {
+    if (dst == nullptr || dst_size == 0) {
+        return;
+    }
+
+    memset(dst, 0, dst_size);
+    strncpy(dst, text, dst_size - 1);
+}
+
+static bool llama_kv_delta_materialize_one_kv(
+        llama_kv_cache * kv,
+        llama_seq_id seq_anchor,
+        llama_seq_id seq_child_full,
+        llama_seq_id seq_dst,
+        llama_pos p0,
+        llama_pos p1,
+        llama_kv_delta_materialize_stats * out) {
+    if (kv == nullptr || out == nullptr) {
+        return false;
+    }
+
+    llama_kv_cache::kv_delta_materialize_stats inner;
+
+    if (!kv->seq_delta_materialize(
+                seq_anchor,
+                seq_child_full,
+                seq_dst,
+                p0,
+                p1,
+                inner)) {
+        return false;
+    }
+
+    out->n_layers += inner.n_layers;
+    out->n_tokens = inner.n_tokens;
+    out->materialized_layers += inner.materialized_layers;
+    out->materialized_tokens = inner.materialized_tokens;
+    out->missing_cell_count += inner.missing_cell_count;
+    out->delta_fp32_bytes += inner.delta_fp32_bytes;
+    out->materialized_kv_bytes += inner.materialized_kv_bytes;
+
+    return true;
+}
+
+bool llama_kv_seq_delta_materialize(
+        llama_context * ctx,
+        llama_seq_id seq_anchor,
+        llama_seq_id seq_child_full,
+        llama_seq_id seq_dst,
+        llama_pos p0,
+        llama_pos p1,
+        llama_kv_delta_materialize_stats * stats) {
+    if (ctx == nullptr || stats == nullptr) {
+        return false;
+    }
+
+    memset(stats, 0, sizeof(*stats));
+
+    llama_kv_delta_materialize_set_text(
+            stats->memory_kind,
+            sizeof(stats->memory_kind),
+            "unsupported");
+
+    llama_kv_delta_materialize_set_text(
+            stats->status,
+            sizeof(stats->status),
+            "failed");
+
+    llama_memory_t mem = ctx->get_memory();
+
+    bool ok = false;
+
+    if (auto * kv = dynamic_cast<llama_kv_cache *>(mem)) {
+        llama_kv_delta_materialize_set_text(
+                stats->memory_kind,
+                sizeof(stats->memory_kind),
+                "pure_kv_cache");
+
+        ok = llama_kv_delta_materialize_one_kv(
+                kv,
+                seq_anchor,
+                seq_child_full,
+                seq_dst,
+                p0,
+                p1,
+                stats);
+    } else if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        llama_kv_delta_materialize_set_text(
+                stats->memory_kind,
+                sizeof(stats->memory_kind),
+                "hybrid_kv_recurrent");
+
+        ok = llama_kv_delta_materialize_one_kv(
+                hybrid->get_mem_attn(),
+                seq_anchor,
+                seq_child_full,
+                seq_dst,
+                p0,
+                p1,
+                stats);
+    }
+
+    if (!ok) {
+        llama_kv_delta_materialize_set_text(
+                stats->status,
+                sizeof(stats->status),
+                "materialize_failed");
+
+        return false;
+    }
+
+    llama_kv_delta_materialize_set_text(
+            stats->status,
+            sizeof(stats->status),
+            "ok");
+
+    LLAMA_LOG_INFO(
+            "%s: memory_kind=%s, tokens=%d, layers=%d, delta_fp32=%.4f MiB, materialized_kv=%.4f MiB\n",
+            __func__,
+            stats->memory_kind,
+            stats->materialized_tokens,
+            stats->materialized_layers,
+            (double) stats->delta_fp32_bytes / 1024.0 / 1024.0,
+            (double) stats->materialized_kv_bytes / 1024.0 / 1024.0);
+
+    return true;
+}
 
 void llama_backend_init(void) {
     ggml_time_init();

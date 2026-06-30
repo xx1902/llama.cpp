@@ -220,6 +220,27 @@ public:
 
         std::vector<kv_delta_layer_stats> layers;
     };
+    struct kv_delta_materialize_stats {
+        int32_t n_layers = 0;
+        int32_t n_tokens = 0;
+
+        int32_t materialized_layers = 0;
+        int32_t materialized_tokens = 0;
+        int32_t missing_cell_count = 0;
+
+        uint64_t delta_fp32_bytes = 0;
+        uint64_t materialized_kv_bytes = 0;
+
+        bool ok = false;
+    };
+
+    bool seq_delta_materialize(
+            llama_seq_id seq_anchor,
+            llama_seq_id seq_child_full,
+            llama_seq_id seq_dst,
+            llama_pos p0,
+            llama_pos p1,
+            kv_delta_materialize_stats & stats);
     bool seq_delta_probe(
             llama_seq_id seq_a,
             llama_seq_id seq_b,
