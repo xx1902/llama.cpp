@@ -775,6 +775,51 @@ extern "C" {
         double page_waste_rate;
     };
 
+    // kv 差值相关
+    #define LLAMA_KV_DELTA_MAX_LAYERS 256
+
+    struct llama_kv_delta_layer_stats {
+        int32_t layer_id;
+
+        double k_l2_avg;
+        double v_l2_avg;
+        double kv_l2_avg;
+
+        double k_cos_avg;
+        double v_cos_avg;
+        double kv_cos_avg;
+    };
+    struct llama_kv_delta_probe_stats {
+        int32_t n_layers;
+        int32_t n_tokens;
+
+        int32_t probed_kv_modules;
+        int32_t probed_layers;
+        int32_t skipped_recurrent_layers;
+
+        int32_t can_reuse_as_delta;
+
+        char memory_kind[64];
+        char probe_status[64];
+
+        double k_l2_avg;
+        double v_l2_avg;
+        double kv_l2_avg;
+
+        double k_cos_avg;
+        double v_cos_avg;
+        double kv_cos_avg;
+
+        struct llama_kv_delta_layer_stats layers[LLAMA_KV_DELTA_MAX_LAYERS];
+    };
+    LLAMA_API bool llama_kv_seq_delta_probe(
+            const struct llama_context * ctx,
+            llama_seq_id seq_a,
+            llama_seq_id seq_b,
+            llama_pos p0,
+            llama_pos p1,
+            struct llama_kv_delta_probe_stats * stats);
+
     LLAMA_API bool llama_get_kv_memory_stats(
             const struct llama_context * ctx,
             uint32_t page_size,

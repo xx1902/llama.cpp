@@ -192,6 +192,41 @@ public:
 
     memory_usage_stats get_memory_usage_stats(uint32_t page_size) const;
 
+    // kv 差值相关
+    struct kv_delta_layer_stats {
+        int32_t layer_id = -1;
+
+        double k_l2_avg = 0.0;
+        double v_l2_avg = 0.0;
+        double kv_l2_avg = 0.0;
+
+        double k_cos_avg = 0.0;
+        double v_cos_avg = 0.0;
+        double kv_cos_avg = 0.0;
+    };
+    struct kv_delta_probe_stats {
+        int32_t n_layers = 0;
+        int32_t n_tokens = 0;
+
+        double k_l2_avg = 0.0;
+        double v_l2_avg = 0.0;
+        double kv_l2_avg = 0.0;
+
+        double k_cos_avg = 0.0;
+        double v_cos_avg = 0.0;
+        double kv_cos_avg = 0.0;
+
+        bool can_reuse_as_delta = false;
+
+        std::vector<kv_delta_layer_stats> layers;
+    };
+    bool seq_delta_probe(
+            llama_seq_id seq_a,
+            llama_seq_id seq_b,
+            llama_pos p0,
+            llama_pos p1,
+            kv_delta_probe_stats & stats) const;
+
     //
     // graph_build API
     //

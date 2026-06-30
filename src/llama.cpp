@@ -25,6 +25,12 @@
 #include <cstring>
 #include <ctime>
 #include <stdexcept>
+// kv差值相关引用
+#include "llama-kv-cache.h"
+#include "llama-kv-cache-iswa.h"
+#include "llama-kv-cache-paged.h"
+#include "llama-memory-hybrid.h"
+#include "llama-memory-hybrid-iswa.h"
 
 #if defined(_MSC_VER)
 #pragma warning(disable: 4244 4267) // possible loss of data
@@ -815,6 +821,271 @@ bool llama_get_kv_memory_stats(
     }
 
     return ctx->get_kv_memory_stats(page_size, stats);
+}
+
+// KV 差值相关
+static void llama_kv_delta_probe_set_text(
+        char * dst,
+        size_t dst_size,
+        const char * text) {
+    if (dst == nullptr || dst_size == 0) {
+        return;
+    }
+
+    memset(dst, 0, dst_size);
+    strncpy(dst, text, dst_size - 1);
+}
+
+static void llama_kv_delta_probe_accumulate(
+        const llama_kv_cache::kv_delta_probe_stats & src,
+        llama_kv_delta_probe_stats * dst,
+        int & module_count) {
+    if (src.layers.empty()) {
+        return;
+    }
+
+    module_count++;
+
+    dst->n_tokens = src.n_tokens;
+    dst->probed_layers += src.n_layers;
+
+    dst->k_l2_avg += src.k_l2_avg;
+    dst->v_l2_avg += src.v_l2_avg;
+    dst->kv_l2_avg += src.kv_l2_avg;
+
+    dst->k_cos_avg += src.k_cos_avg;
+    dst->v_cos_avg += src.v_cos_avg;
+    dst->kv_cos_avg += src.kv_cos_avg;
+
+    const int layer_offset = dst->n_layers;
+
+    const int n_copy =
+            std::min(
+                    (int) src.layers.size(),
+                    LLAMA_KV_DELTA_MAX_LAYERS - layer_offset);
+
+    for (int i = 0; i < n_copy; i++) {
+        dst->layers[layer_offset + i].layer_id =
+                src.layers[i].layer_id;
+
+        dst->layers[layer_offset + i].k_l2_avg =
+                src.layers[i].k_l2_avg;
+
+        dst->layers[layer_offset + i].v_l2_avg =
+                src.layers[i].v_l2_avg;
+
+        dst->layers[layer_offset + i].kv_l2_avg =
+                src.layers[i].kv_l2_avg;
+
+        dst->layers[layer_offset + i].k_cos_avg =
+                src.layers[i].k_cos_avg;
+
+        dst->layers[layer_offset + i].v_cos_avg =
+                src.layers[i].v_cos_avg;
+
+        dst->layers[layer_offset + i].kv_cos_avg =
+                src.layers[i].kv_cos_avg;
+    }
+
+    dst->n_layers += n_copy;
+}
+
+static bool llama_kv_delta_probe_one_kv(
+        llama_kv_cache * kv,
+        llama_seq_id seq_a,
+        llama_seq_id seq_b,
+        llama_pos p0,
+        llama_pos p1,
+        llama_kv_delta_probe_stats * out,
+        int & module_count) {
+    if (kv == nullptr) {
+        return false;
+    }
+
+    llama_kv_cache::kv_delta_probe_stats inner;
+
+    if (!kv->seq_delta_probe(seq_a, seq_b, p0, p1, inner)) {
+        return false;
+    }
+
+    llama_kv_delta_probe_accumulate(inner, out, module_count);
+
+    return true;
+}
+
+static bool llama_kv_delta_probe_iswa(
+        llama_kv_cache_iswa * kv_iswa,
+        llama_seq_id seq_a,
+        llama_seq_id seq_b,
+        llama_pos p0,
+        llama_pos p1,
+        llama_kv_delta_probe_stats * out,
+        int & module_count) {
+    if (kv_iswa == nullptr) {
+        return false;
+    }
+
+    bool ok = false;
+
+    ok |= llama_kv_delta_probe_one_kv(
+            kv_iswa->get_base(),
+            seq_a,
+            seq_b,
+            p0,
+            p1,
+            out,
+            module_count);
+
+    ok |= llama_kv_delta_probe_one_kv(
+            kv_iswa->get_swa(),
+            seq_a,
+            seq_b,
+            p0,
+            p1,
+            out,
+            module_count);
+
+    return ok;
+}
+
+bool llama_kv_seq_delta_probe(
+        const llama_context * ctx,
+        llama_seq_id seq_a,
+        llama_seq_id seq_b,
+        llama_pos p0,
+        llama_pos p1,
+        llama_kv_delta_probe_stats * stats) {
+    if (ctx == nullptr || stats == nullptr) {
+        return false;
+    }
+
+    memset(stats, 0, sizeof(*stats));
+
+    llama_kv_delta_probe_set_text(
+            stats->memory_kind,
+            sizeof(stats->memory_kind),
+            "unsupported");
+
+    llama_kv_delta_probe_set_text(
+            stats->probe_status,
+            sizeof(stats->probe_status),
+            "failed");
+
+    llama_memory_t mem = ctx->get_memory();
+
+    int module_count = 0;
+    bool ok = false;
+
+    if (auto * kv = dynamic_cast<llama_kv_cache *>(mem)) {
+        llama_kv_delta_probe_set_text(
+                stats->memory_kind,
+                sizeof(stats->memory_kind),
+                "pure_kv_cache");
+
+        ok = llama_kv_delta_probe_one_kv(
+                kv,
+                seq_a,
+                seq_b,
+                p0,
+                p1,
+                stats,
+                module_count);
+    } else if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        llama_kv_delta_probe_set_text(
+                stats->memory_kind,
+                sizeof(stats->memory_kind),
+                "hybrid_kv_recurrent");
+
+        ok = llama_kv_delta_probe_one_kv(
+                hybrid->get_mem_attn(),
+                seq_a,
+                seq_b,
+                p0,
+                p1,
+                stats,
+                module_count);
+
+        // stats->skipped_recurrent_layers =
+        //         std::max(0, stats->n_layers - stats->probed_layers);
+        stats->skipped_recurrent_layers = -1;
+    } else if (auto * kv_iswa = dynamic_cast<llama_kv_cache_iswa *>(mem)) {
+        llama_kv_delta_probe_set_text(
+                stats->memory_kind,
+                sizeof(stats->memory_kind),
+                "kv_cache_iswa");
+
+        ok = llama_kv_delta_probe_iswa(
+                kv_iswa,
+                seq_a,
+                seq_b,
+                p0,
+                p1,
+                stats,
+                module_count);
+    } else if (auto * hybrid_iswa = dynamic_cast<llama_memory_hybrid_iswa *>(mem)) {
+        llama_kv_delta_probe_set_text(
+                stats->memory_kind,
+                sizeof(stats->memory_kind),
+                "hybrid_iswa");
+
+        ok = llama_kv_delta_probe_iswa(
+                hybrid_iswa->get_mem_attn(),
+                seq_a,
+                seq_b,
+                p0,
+                p1,
+                stats,
+                module_count);
+
+        // stats->skipped_recurrent_layers =
+        //         std::max(0, stats->n_layers - stats->probed_layers);
+        stats->skipped_recurrent_layers = -1;
+    }
+
+    stats->probed_kv_modules = module_count;
+
+    if (!ok || module_count == 0 || stats->probed_layers == 0) {
+        llama_kv_delta_probe_set_text(
+                stats->probe_status,
+                sizeof(stats->probe_status),
+                "no_kv_module");
+
+        LLAMA_LOG_WARN(
+                "%s: no usable KV module found, memory_kind=%s\n",
+                __func__,
+                stats->memory_kind);
+
+        return false;
+    }
+
+    stats->k_l2_avg /= module_count;
+    stats->v_l2_avg /= module_count;
+    stats->kv_l2_avg /= module_count;
+
+    stats->k_cos_avg /= module_count;
+    stats->v_cos_avg /= module_count;
+    stats->kv_cos_avg /= module_count;
+
+    stats->can_reuse_as_delta =
+            (stats->kv_cos_avg > 0.80 || stats->kv_l2_avg < 0.05) ? 1 : 0;
+
+    llama_kv_delta_probe_set_text(
+            stats->probe_status,
+            sizeof(stats->probe_status),
+            "ok");
+
+    LLAMA_LOG_INFO(
+            "%s: memory_kind=%s, modules=%d, probed_layers=%d, skipped_recurrent_layers=%d, kv_l2=%.6f, kv_cos=%.6f, reusable=%d\n",
+            __func__,
+            stats->memory_kind,
+            stats->probed_kv_modules,
+            stats->probed_layers,
+            stats->skipped_recurrent_layers,
+            stats->kv_l2_avg,
+            stats->kv_cos_avg,
+            stats->can_reuse_as_delta);
+
+    return true;
 }
 
 void llama_backend_init(void) {

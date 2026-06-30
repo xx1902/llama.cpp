@@ -1341,6 +1341,370 @@ llama_kv_cache::memory_usage_stats llama_kv_cache::get_memory_usage_stats(uint32
     return stats;
 }
 
+// 新增 kv 差值
+static float kv_probe_read_scalar(
+        const std::vector<uint8_t> & buf,
+        ggml_type type,
+        uint32_t index) {
+    switch (type) {
+        case GGML_TYPE_F32:
+            return reinterpret_cast<const float *>(buf.data())[index];
+
+        case GGML_TYPE_F16:
+            return ggml_fp16_to_fp32(
+                    reinterpret_cast<const ggml_fp16_t *>(buf.data())[index]);
+
+        case GGML_TYPE_BF16:
+            return ggml_bf16_to_fp32(
+                    reinterpret_cast<const ggml_bf16_t *>(buf.data())[index]);
+
+        default:
+            return 0.0f;
+    }
+}
+
+static void kv_probe_accumulate(
+        const std::vector<float> & a,
+        const std::vector<float> & b,
+        double & l2_sum,
+        double & cos_sum,
+        int & count) {
+    double dot = 0.0;
+    double na = 0.0;
+    double nb = 0.0;
+    double l2 = 0.0;
+
+    const int n = std::min((int) a.size(), (int) b.size());
+
+    for (int i = 0; i < n; i++) {
+        const double da = a[i];
+        const double db = b[i];
+        const double diff = da - db;
+
+        dot += da * db;
+        na += da * da;
+        nb += db * db;
+        l2 += diff * diff;
+    }
+
+    const double eps = 1e-12;
+
+    // 两边都是全 0，说明这个位置没有有效方向信息，不参与 cosine 平均。
+    if (na < eps && nb < eps) {
+        return;
+    }
+
+    const double cos =
+            dot / (std::sqrt(na) * std::sqrt(nb) + eps);
+
+    l2_sum += std::sqrt(l2 / std::max(1, n));
+    cos_sum += cos;
+    count++;
+}
+
+bool llama_kv_cache::seq_delta_probe(
+        llama_seq_id seq_a,
+        llama_seq_id seq_b,
+        llama_pos p0,
+        llama_pos p1,
+        kv_delta_probe_stats & stats) const {
+    if (seq_a < 0 || seq_b < 0) {
+        return false;
+    }
+
+    if ((size_t) seq_a >= seq_to_stream.size() ||
+            (size_t) seq_b >= seq_to_stream.size()) {
+        return false;
+    }
+
+    if (p0 < 0) {
+        p0 = 0;
+    }
+
+    if (p1 <= p0) {
+        return false;
+    }
+
+    const uint32_t stream_a = seq_to_stream[seq_a];
+    const uint32_t stream_b = seq_to_stream[seq_b];
+
+    const auto & cells_a = v_cells[stream_a];
+    const auto & cells_b = v_cells[stream_b];
+
+    auto find_cell = [](
+            const llama_kv_cells & cells,
+            llama_seq_id seq_id,
+            llama_pos pos,
+            uint32_t & cell_id) -> bool {
+        for (uint32_t i = 0; i < cells.size(); i++) {
+            if (!cells.seq_has(i, seq_id)) {
+                continue;
+            }
+
+            if (cells.pos_get(i) == pos) {
+                cell_id = i;
+                return true;
+            }
+        }
+
+        return false;
+    };
+
+    stats = {};
+    stats.n_layers = (int32_t) layers.size();
+    stats.n_tokens = (int32_t) (p1 - p0);
+    stats.layers.reserve(layers.size());
+
+    double k_l2_all = 0.0;
+    double v_l2_all = 0.0;
+    double k_cos_all = 0.0;
+    double v_cos_all = 0.0;
+    int k_count_all = 0;
+    int v_count_all = 0;
+
+    for (const auto & layer : layers) {
+        kv_delta_layer_stats layer_stats;
+
+        layer_stats.layer_id = (int32_t) layer.il;
+
+        double k_l2_layer = 0.0;
+        double v_l2_layer = 0.0;
+        double k_cos_layer = 0.0;
+        double v_cos_layer = 0.0;
+        int k_count_layer = 0;
+        int v_count_layer = 0;
+
+        const uint32_t il = layer.il;
+
+        const uint32_t n_embd_k_gqa =
+                hparams.n_embd_k_gqa(il);
+
+        const uint32_t n_embd_v_gqa =
+                hparams.n_embd_v_gqa(il);
+
+        ggml_tensor * k_a = layer.k_stream[stream_a];
+        ggml_tensor * k_b = layer.k_stream[stream_b];
+
+        ggml_tensor * v_a = layer.v_stream[stream_a];
+        ggml_tensor * v_b = layer.v_stream[stream_b];
+
+        const size_t k_size_row =
+                ggml_row_size(k_a->type, n_embd_k_gqa);
+
+        const size_t k_size_el =
+                ggml_type_size(k_a->type);
+
+        const size_t v_size_el =
+                v_a ? ggml_type_size(v_a->type) : 0;
+
+        int missing_cell_count = 0;
+        int debug_print_count = 0;
+
+        for (llama_pos pos = p0; pos < p1; pos++) {
+            uint32_t cell_a = 0;
+            uint32_t cell_b = 0;
+
+            const bool has_a = find_cell(cells_a, seq_a, pos, cell_a);
+            const bool has_b = find_cell(cells_b, seq_b, pos, cell_b);
+            // debug日志取消
+            const bool debug_kv_delta_cells = false;
+
+            if (!has_a || !has_b) {
+                missing_cell_count++;
+
+                if (debug_kv_delta_cells && debug_print_count < 16) {
+                    fprintf(stderr,
+                            "kv_delta_probe missing cell: seq_a=%d seq_b=%d pos=%d has_a=%d has_b=%d\n",
+                            seq_a,
+                            seq_b,
+                            (int) pos,
+                            has_a ? 1 : 0,
+                            has_b ? 1 : 0);
+                    debug_print_count++;
+                }
+
+                continue;
+            }
+
+            if (debug_kv_delta_cells && debug_print_count < 16) {
+                fprintf(stderr,
+                        "kv_delta_probe cell map: seq_a=%d seq_b=%d pos=%d cell_a=%u cell_b=%u\n",
+                        seq_a,
+                        seq_b,
+                        (int) pos,
+                        cell_a,
+                        cell_b);
+                debug_print_count++;
+            }
+
+            {
+                std::vector<uint8_t> raw_a(k_size_row);
+                std::vector<uint8_t> raw_b(k_size_row);
+
+                ggml_backend_tensor_get(
+                        k_a,
+                        raw_a.data(),
+                        cell_a * k_size_row,
+                        k_size_row);
+
+                ggml_backend_tensor_get(
+                        k_b,
+                        raw_b.data(),
+                        cell_b * k_size_row,
+                        k_size_row);
+
+                std::vector<float> fa(n_embd_k_gqa);
+                std::vector<float> fb(n_embd_k_gqa);
+
+                for (uint32_t i = 0; i < n_embd_k_gqa; i++) {
+                    fa[i] = kv_probe_read_scalar(raw_a, k_a->type, i);
+                    fb[i] = kv_probe_read_scalar(raw_b, k_b->type, i);
+                }
+
+                kv_probe_accumulate(
+                        fa,
+                        fb,
+                        k_l2_layer,
+                        k_cos_layer,
+                        k_count_layer);
+            }
+
+            if (v_a != nullptr && v_b != nullptr) {
+                std::vector<float> fa(n_embd_v_gqa);
+                std::vector<float> fb(n_embd_v_gqa);
+
+                if (!v_trans) {
+                    const size_t v_size_row =
+                            ggml_row_size(v_a->type, n_embd_v_gqa);
+
+                    std::vector<uint8_t> raw_a(v_size_row);
+                    std::vector<uint8_t> raw_b(v_size_row);
+
+                    ggml_backend_tensor_get(
+                            v_a,
+                            raw_a.data(),
+                            cell_a * v_size_row,
+                            v_size_row);
+
+                    ggml_backend_tensor_get(
+                            v_b,
+                            raw_b.data(),
+                            cell_b * v_size_row,
+                            v_size_row);
+
+                    for (uint32_t i = 0; i < n_embd_v_gqa; i++) {
+                        fa[i] = kv_probe_read_scalar(raw_a, v_a->type, i);
+                        fb[i] = kv_probe_read_scalar(raw_b, v_b->type, i);
+                    }
+                } else {
+                    for (uint32_t i = 0; i < n_embd_v_gqa; i++) {
+                        std::vector<uint8_t> raw_a(v_size_el);
+                        std::vector<uint8_t> raw_b(v_size_el);
+
+                        const size_t offset_a =
+                                (cell_a + i * cells_a.size()) * v_size_el;
+
+                        const size_t offset_b =
+                                (cell_b + i * cells_b.size()) * v_size_el;
+
+                        ggml_backend_tensor_get(
+                                v_a,
+                                raw_a.data(),
+                                offset_a,
+                                v_size_el);
+
+                        ggml_backend_tensor_get(
+                                v_b,
+                                raw_b.data(),
+                                offset_b,
+                                v_size_el);
+
+                        fa[i] = kv_probe_read_scalar(raw_a, v_a->type, 0);
+                        fb[i] = kv_probe_read_scalar(raw_b, v_b->type, 0);
+                    }
+                }
+
+                kv_probe_accumulate(
+                        fa,
+                        fb,
+                        v_l2_layer,
+                        v_cos_layer,
+                        v_count_layer);
+            }
+        }
+
+        if (k_count_layer > 0) {
+            layer_stats.k_l2_avg = k_l2_layer / k_count_layer;
+            layer_stats.k_cos_avg = k_cos_layer / k_count_layer;
+
+            k_l2_all += k_l2_layer;
+            k_cos_all += k_cos_layer;
+            k_count_all += k_count_layer;
+        }
+
+        if (v_count_layer > 0) {
+            layer_stats.v_l2_avg = v_l2_layer / v_count_layer;
+            layer_stats.v_cos_avg = v_cos_layer / v_count_layer;
+
+            v_l2_all += v_l2_layer;
+            v_cos_all += v_cos_layer;
+            v_count_all += v_count_layer;
+        }
+
+        layer_stats.kv_l2_avg =
+                (layer_stats.k_l2_avg + layer_stats.v_l2_avg) / 2.0;
+
+        layer_stats.kv_cos_avg =
+                (layer_stats.k_cos_avg + layer_stats.v_cos_avg) / 2.0;
+
+        stats.layers.push_back(layer_stats);
+
+        if (missing_cell_count > 0) {
+            fprintf(stderr,
+                    "kv_delta_probe warning: missing_cell_count=%d seq_a=%d seq_b=%d range=[%d,%d)\n",
+                    missing_cell_count,
+                    seq_a,
+                    seq_b,
+                    (int) p0,
+                    (int) p1);
+        }
+    }
+
+    if (k_count_all == 0 && v_count_all == 0) {
+        fprintf(stderr,
+                "kv_delta_probe failed: no comparable KV cells, seq_a=%d seq_b=%d range=[%d,%d)\n",
+                seq_a,
+                seq_b,
+                (int) p0,
+                (int) p1);
+
+        stats.layers.clear();
+        stats.can_reuse_as_delta = false;
+        return false;
+    }
+
+    if (k_count_all > 0) {
+        stats.k_l2_avg = k_l2_all / k_count_all;
+        stats.k_cos_avg = k_cos_all / k_count_all;
+    }
+
+    if (v_count_all > 0) {
+        stats.v_l2_avg = v_l2_all / v_count_all;
+        stats.v_cos_avg = v_cos_all / v_count_all;
+    }
+
+    stats.kv_l2_avg =
+            (stats.k_l2_avg + stats.v_l2_avg) / 2.0;
+
+    stats.kv_cos_avg =
+            (stats.k_cos_avg + stats.v_cos_avg) / 2.0;
+
+    stats.can_reuse_as_delta =
+            stats.kv_cos_avg > 0.98 || stats.kv_l2_avg < 0.05;
+
+    return true;
+}
+
 uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
     if (physical_paged) {
         uint32_t result = 0;

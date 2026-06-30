@@ -91,23 +91,11 @@ struct online_prefix_node {
     int node_id = -1;
     int group_id = -1;
 
-    // 用于表达树结构：当前节点挂在哪个 prefix / delta 父节点下面。
-    int parent_node_id = -1;
-    int delta_parent_node_id = -1;
-
     llama_seq_id cache_seq_id = -1;
 
     int prefix_len = 0;
     int hit_count = 0;
 
-    int prefix_can_reuse = 0;
-    int suffix_can_delta = 0;
-    int should_open_new_branch = 1;
-
-    double suffix_kv_cos = 0.0;
-    double suffix_kv_l2 = 0.0;
-
-    std::string reuse_decision = "new_branch";
     std::string group_name;
     std::vector<llama_token> prefix_tokens;
 };
@@ -126,9 +114,6 @@ struct sample_result {
     std::string mode;
     std::string group_name;
     std::string lora_name;
-
-    int routed_group_id = -1;
-    std::string reuse_decision = "unknown";
 
     int leaf_lora_id = 0;
     int n_prompt_tokens = 0;
@@ -190,80 +175,10 @@ struct kv_delta_probe_result {
     int prefix_can_reuse = 0;
     int suffix_can_delta = 0;
     int should_open_new_branch = 0;
-
-    int delta_parent_node_id = -1;
-    std::string reuse_decision = "unknown";
-    std::string tree_action = "unknown";
 };
-
-struct kv_delta_probe_case {
-    std::string group_name;
-    std::string pair_name;
-    std::string prompt_a;
-    std::string prompt_b;
-    llama_seq_id seq_a = -1;
-    llama_seq_id seq_b = -1;
-
-    // online tree 里：A 是 anchor 请求，B 是要挂到 anchor 下的请求
-    int anchor_request_index = -1;
-    int child_request_index = -1;
-};
-
-static kv_delta_probe_result run_kv_delta_probe_pair(
-        llama_context * ctx,
-        const llama_vocab * vocab,
-        const std::string & group_name,
-        const std::string & pair_name,
-        const std::string & prompt_a,
-        const std::string & prompt_b,
-        llama_seq_id seq_a,
-        llama_seq_id seq_b);
 
 static const std::string output_dir =
         "D:/ecnu_experiment/LLama.cpp/llama.cpp/examples/lora-base/output";
-
-static std::string make_reuse_decision(
-        int prefix_can_reuse,
-        int suffix_can_delta,
-        int should_open_new_branch) {
-    if (should_open_new_branch) {
-        return "new_branch";
-    }
-
-    if (prefix_can_reuse && suffix_can_delta) {
-        return "prefix_reuse_suffix_delta";
-    }
-
-    if (prefix_can_reuse && !suffix_can_delta) {
-        return "prefix_reuse_suffix_recompute";
-    }
-
-    if (!prefix_can_reuse && suffix_can_delta) {
-        return "suffix_delta_only";
-    }
-
-    return "unknown";
-}
-
-static std::string make_tree_action(const std::string & reuse_decision) {
-    if (reuse_decision == "new_branch") {
-        return "create_independent_branch";
-    }
-
-    if (reuse_decision == "prefix_reuse_suffix_delta") {
-        return "attach_delta_branch";
-    }
-
-    if (reuse_decision == "prefix_reuse_suffix_recompute") {
-        return "reuse_prefix_recompute_suffix";
-    }
-
-    if (reuse_decision == "suffix_delta_only") {
-        return "attach_suffix_delta_without_prefix";
-    }
-
-    return "unknown";
-}
 
 static double now_ms() {
     return ggml_time_us() / 1000.0;
@@ -445,8 +360,7 @@ static void save_kv_delta_probe_results(
          << "full_kv_l2_avg,full_kv_cos_avg,"
          << "prefix_kv_l2_avg,prefix_kv_cos_avg,"
          << "suffix_kv_l2_avg,suffix_kv_cos_avg,"
-         << "prefix_can_reuse,suffix_can_delta,should_open_new_branch,"
-         << "delta_parent_node_id,reuse_decision,tree_action\n";
+         << "prefix_can_reuse,suffix_can_delta,should_open_new_branch\n";
 
     for (const auto & r : results) {
         fout << r.pair_name << ","
@@ -470,182 +384,10 @@ static void save_kv_delta_probe_results(
              << r.suffix_kv_cos_avg << ","
              << r.prefix_can_reuse << ","
              << r.suffix_can_delta << ","
-             << r.should_open_new_branch << ","
-             << r.delta_parent_node_id << ","
-             << r.reuse_decision << ","
-             << r.tree_action << "\n";
+             << r.should_open_new_branch << "\n";
     }
 
     fprintf(stderr, "saved kv delta probe results to %s\n", path.c_str());
-}
-
-static std::vector<kv_delta_probe_case> make_kv_delta_probe_cases() {
-    return {
-        {
-            "sanity",
-            "same_prompt_code",
-            "You are a helpful coding assistant. Please write a Python function to sort a list.",
-            "You are a helpful coding assistant. Please write a Python function to sort a list.",
-            0,
-            1,
-            -1,
-            -1,
-        },
-        {
-            "code",
-            "code_write_vs_optimize",
-            "You are a helpful coding assistant. Please write a Python function to sort a list.",
-            "You are a helpful coding assistant. Please optimize this Python function to sort a list.",
-            2,
-            3,
-            0,
-            1,
-        },
-        {
-            "code",
-            "code_write_vs_explain",
-            "You are a helpful coding assistant. Please write a Python function to sort a list.",
-            "You are a helpful coding assistant. Please explain this Python function to sort a list.",
-            4,
-            5,
-            0,
-            2,
-        },
-        {
-            "mobile_like",
-            "same_article_summary_vs_rewrite",
-            "You are a document assistant. Article: Python is a popular programming language. It supports lists, dictionaries, functions, and classes. Python is widely used in data analysis, web development, automation, and machine learning. Please summarize this article.",
-            "You are a document assistant. Article: Python is a popular programming language. It supports lists, dictionaries, functions, and classes. Python is widely used in data analysis, web development, automation, and machine learning. Please rewrite this article.",
-            6,
-            7,
-            -1,
-            -1,
-        },
-        {
-            "cross_task",
-            "code_vs_correction",
-            "You are a helpful coding assistant. Please write a Python function to sort a list.",
-            "You are a Chinese text correction assistant. Please correct this sentence: I has a apple.",
-            8,
-            9,
-            0,
-            3,
-        },
-    };
-}
-
-static std::vector<kv_delta_probe_result> run_kv_delta_probe_suite(
-        llama_model * model,
-        const llama_vocab * vocab,
-        int n_ctx,
-        const std::vector<kv_delta_probe_case> & cases) {
-    std::vector<kv_delta_probe_result> results;
-
-    llama_context_params ctx_params =
-            llama_context_default_params();
-
-    ctx_params.n_ctx = n_ctx;
-    ctx_params.n_batch = 256;
-    ctx_params.n_ubatch = 64;
-    ctx_params.n_seq_max = 32;
-    ctx_params.no_perf = true;
-    ctx_params.kv_unified = true;
-
-    llama_context * ctx =
-            llama_init_from_model(model, ctx_params);
-
-    if (ctx == nullptr) {
-        fprintf(stderr, "failed to create kv-delta-probe context\n");
-        return results;
-    }
-
-    for (const auto & c : cases) {
-        results.push_back(
-                run_kv_delta_probe_pair(
-                        ctx,
-                        vocab,
-                        c.group_name,
-                        c.pair_name,
-                        c.prompt_a,
-                        c.prompt_b,
-                        c.seq_a,
-                        c.seq_b));
-    }
-
-    clear_lora(ctx);
-    llama_free(ctx);
-
-    return results;
-}
-
-static const kv_delta_probe_result * find_probe_for_child_request(
-        const std::vector<kv_delta_probe_result> & probe_results,
-        const std::vector<kv_delta_probe_case> & probe_cases,
-        int child_request_index) {
-    for (const auto & c : probe_cases) {
-        if (c.child_request_index != child_request_index) {
-            continue;
-        }
-
-        for (const auto & r : probe_results) {
-            if (r.pair_name == c.pair_name) {
-                return &r;
-            }
-        }
-    }
-
-    return nullptr;
-}
-
-static void apply_probe_to_online_node(
-        online_prefix_node & node,
-        const kv_delta_probe_result & probe,
-        int anchor_node_id) {
-    node.parent_node_id = anchor_node_id;
-    node.delta_parent_node_id =
-            probe.suffix_can_delta ? anchor_node_id : -1;
-
-    node.prefix_can_reuse = probe.prefix_can_reuse;
-    node.suffix_can_delta = probe.suffix_can_delta;
-    node.should_open_new_branch = probe.should_open_new_branch;
-
-    node.suffix_kv_cos = probe.suffix_kv_cos_avg;
-    node.suffix_kv_l2 = probe.suffix_kv_l2_avg;
-    node.reuse_decision = probe.reuse_decision;
-}
-
-static void save_online_prefix_delta_tree(
-        const std::vector<online_prefix_node> & nodes) {
-    std::filesystem::create_directories(output_dir);
-
-    const std::string path =
-            output_dir + "/online_prefix_delta_tree_summary.csv";
-
-    std::ofstream fout(path);
-
-    fout << "node_id,group_id,group_name,parent_node_id,delta_parent_node_id,"
-         << "cache_seq_id,prefix_len,hit_count,"
-         << "prefix_can_reuse,suffix_can_delta,should_open_new_branch,"
-         << "suffix_kv_cos,suffix_kv_l2,reuse_decision\n";
-
-    for (const auto & node : nodes) {
-        fout << node.node_id << ","
-             << node.group_id << ","
-             << node.group_name << ","
-             << node.parent_node_id << ","
-             << node.delta_parent_node_id << ","
-             << node.cache_seq_id << ","
-             << node.prefix_len << ","
-             << node.hit_count << ","
-             << node.prefix_can_reuse << ","
-             << node.suffix_can_delta << ","
-             << node.should_open_new_branch << ","
-             << node.suffix_kv_cos << ","
-             << node.suffix_kv_l2 << ","
-             << node.reuse_decision << "\n";
-    }
-
-    fprintf(stderr, "saved online prefix delta tree to %s\n", path.c_str());
 }
 
 struct kv_delta_range_result {
@@ -967,24 +709,12 @@ static kv_delta_probe_result run_kv_delta_probe_pair(
     r.should_open_new_branch =
             (r.prefix_can_reuse || r.suffix_can_delta) ? 0 : 1;
 
-    r.reuse_decision =
-            make_reuse_decision(
-                    r.prefix_can_reuse,
-                    r.suffix_can_delta,
-                    r.should_open_new_branch);
-
-    r.tree_action =
-            make_tree_action(r.reuse_decision);
-
-    r.delta_parent_node_id =
-            r.suffix_can_delta ? 0 : -1;
-
     fprintf(stderr,
             "kv delta probe pair=%s memory=%s status=%s "
             "tokens_a=%d tokens_b=%d common_prefix=%d compared=%d "
             "full_cos=%.6f prefix_cos=%.6f suffix_cos=%.6f "
             "full_l2=%.6f prefix_l2=%.6f suffix_l2=%.6f "
-            "prefix_reuse=%d suffix_delta=%d new_branch=%d decision=%s tree_action=%s\n",
+            "prefix_reuse=%d suffix_delta=%d new_branch=%d\n",
             pair_name.c_str(),
             r.memory_kind.c_str(),
             r.probe_status.c_str(),
@@ -1000,9 +730,7 @@ static kv_delta_probe_result run_kv_delta_probe_pair(
             r.suffix_kv_l2_avg,
             r.prefix_can_reuse,
             r.suffix_can_delta,
-            r.should_open_new_branch,
-            r.reuse_decision.c_str(),
-            r.tree_action.c_str());
+            r.should_open_new_branch);
 
     fprintf(stderr,
             "probe ranges: pair=%s full=[0,%d), prefix=[0,%d), suffix=[%d,%d)\n",
@@ -1356,9 +1084,6 @@ static sample_result run_online_build_prefix_request(
     r.online_node_id = node_id;
     r.exact_prefix_hit = 0;
 
-    r.routed_group_id = toks.routed_group_id;
-    r.reuse_decision = "create_prefix_node";
-
     r.n_prompt_tokens = (int) toks.full.size();
     r.n_prefix_tokens = 0;
     r.n_suffix_tokens = (int) toks.full.size();
@@ -1448,10 +1173,6 @@ static sample_result run_online_prefix_reuse_request(
     r.group_name = group ? group->group_name : "unknown";
     r.lora_name = lora_nodes[req.leaf_lora_id].short_name;
     r.leaf_lora_id = req.leaf_lora_id;
-
-    r.routed_group_id = toks.routed_group_id;
-    r.reuse_decision = "exact_prefix_reuse_suffix_recompute";
-
     r.online_node_id = node.node_id;
     r.exact_prefix_hit = 1;
 
@@ -1660,7 +1381,6 @@ static void save_results(
     std::ofstream fout(path);
 
     fout << "mode,group_name,lora_name,leaf_lora_id,"
-        << "routed_group_id,reuse_decision,"
         << "online_node_id,exact_prefix_hit,"
         << "n_prompt_tokens,n_prefix_tokens,n_suffix_tokens,"
         << "prefix_reuse_rate,suffix_delta_rate,n_predict,"
@@ -1674,8 +1394,6 @@ static void save_results(
              << r.group_name << ","
              << r.lora_name << ","
              << r.leaf_lora_id << ","
-             << r.routed_group_id << ","
-             << r.reuse_decision << ","
              << r.online_node_id << ","
              << r.exact_prefix_hit << ","
              << r.n_prompt_tokens << ","
@@ -1894,18 +1612,6 @@ int main() {
 
     std::vector<sample_result> results;
 
-    std::vector<kv_delta_probe_case> probe_cases =
-            make_kv_delta_probe_cases();
-
-    std::vector<kv_delta_probe_result> probe_results =
-            run_kv_delta_probe_suite(
-                    model,
-                    vocab,
-                    n_ctx,
-                    probe_cases);
-
-    save_kv_delta_probe_results(probe_results);
-
     {
         llama_context_params ctx_params =
                 llama_context_default_params();
@@ -2031,29 +1737,9 @@ int main() {
 
                 results.push_back(r);
 
-                const kv_delta_probe_result * probe =
-                        find_probe_for_child_request(
-                                probe_results,
-                                probe_cases,
-                                i);
-
                 for (auto & node : online_nodes) {
                     if (node.node_id == route.node_id) {
                         node.hit_count++;
-                        node.prefix_can_reuse = 1;
-                        node.should_open_new_branch = 0;
-
-                        if (probe != nullptr && probe->probe_status == "ok") {
-                            apply_probe_to_online_node(
-                                    node,
-                                    *probe,
-                                    route.node_id);
-                        } else {
-                            node.suffix_can_delta = 0;
-                            node.delta_parent_node_id = -1;
-                            node.reuse_decision = "exact_prefix_reuse_suffix_recompute";
-                        }
-
                         break;
                     }
                 }
@@ -2100,15 +1786,6 @@ int main() {
             node.prefix_tokens = toks.full;
             node.hit_count = 0;
 
-            node.parent_node_id = -1;
-            node.delta_parent_node_id = -1;
-            node.prefix_can_reuse = 0;
-            node.suffix_can_delta = 0;
-            node.should_open_new_branch = 1;
-            node.suffix_kv_cos = 0.0;
-            node.suffix_kv_l2 = 0.0;
-            node.reuse_decision = "create_prefix_node";
-
             online_nodes.push_back(node);
 
             fprintf(stderr,
@@ -2123,18 +1800,12 @@ int main() {
 
         for (const auto & node : online_nodes) {
             fprintf(stderr,
-                    "  node=%d group=%s parent=%d delta_parent=%d prefix_len=%d hit_count=%d decision=%s suffix_cos=%.6f suffix_l2=%.6f\n",
+                    "  node=%d group=%s prefix_len=%d hit_count=%d\n",
                     node.node_id,
                     node.group_name.c_str(),
-                    node.parent_node_id,
-                    node.delta_parent_node_id,
                     node.prefix_len,
-                    node.hit_count,
-                    node.reuse_decision.c_str(),
-                    node.suffix_kv_cos,
-                    node.suffix_kv_l2);
+                    node.hit_count);
         }
-        save_online_prefix_delta_tree(online_nodes);
 
         clear_lora(ctx);
         llama_free(ctx);
@@ -2142,87 +1813,87 @@ int main() {
 
     save_results(results);
 
-    // {
-    //     std::vector<kv_delta_probe_result> probe_results;
+    {
+        std::vector<kv_delta_probe_result> probe_results;
 
-    //     llama_context_params ctx_params =
-    //             llama_context_default_params();
+        llama_context_params ctx_params =
+                llama_context_default_params();
 
-    //     ctx_params.n_ctx = n_ctx;
-    //     ctx_params.n_batch = 256;
-    //     ctx_params.n_ubatch = 64;
-    //     ctx_params.n_seq_max = 16;
-    //     ctx_params.no_perf = true;
-    //     ctx_params.kv_unified = true;
+        ctx_params.n_ctx = n_ctx;
+        ctx_params.n_batch = 256;
+        ctx_params.n_ubatch = 64;
+        ctx_params.n_seq_max = 16;
+        ctx_params.no_perf = true;
+        ctx_params.kv_unified = true;
 
-    //     llama_context * ctx =
-    //             llama_init_from_model(model, ctx_params);
+        llama_context * ctx =
+                llama_init_from_model(model, ctx_params);
 
-    //     if (ctx == nullptr) {
-    //         fprintf(stderr, "failed to create kv-delta-probe context\n");
-    //         return 1;
-    //     }
+        if (ctx == nullptr) {
+            fprintf(stderr, "failed to create kv-delta-probe context\n");
+            return 1;
+        }
 
-    //     probe_results.push_back(
-    //             run_kv_delta_probe_pair(
-    //                     ctx,
-    //                     vocab,
-    //                     "sanity",
-    //                     "same_prompt_code",
-    //                     "You are a helpful coding assistant. Please write a Python function to sort a list.",
-    //                     "You are a helpful coding assistant. Please write a Python function to sort a list.",
-    //                     0,
-    //                     1));
+        probe_results.push_back(
+                run_kv_delta_probe_pair(
+                        ctx,
+                        vocab,
+                        "sanity",
+                        "same_prompt_code",
+                        "You are a helpful coding assistant. Please write a Python function to sort a list.",
+                        "You are a helpful coding assistant. Please write a Python function to sort a list.",
+                        0,
+                        1));
 
-    //     probe_results.push_back(
-    //             run_kv_delta_probe_pair(
-    //                     ctx,
-    //                     vocab,
-    //                     "code",
-    //                     "code_write_vs_optimize",
-    //                     "You are a helpful coding assistant. Please write a Python function to sort a list.",
-    //                     "You are a helpful coding assistant. Please optimize this Python function to sort a list.",
-    //                     2,
-    //                     3));
+        probe_results.push_back(
+                run_kv_delta_probe_pair(
+                        ctx,
+                        vocab,
+                        "code",
+                        "code_write_vs_optimize",
+                        "You are a helpful coding assistant. Please write a Python function to sort a list.",
+                        "You are a helpful coding assistant. Please optimize this Python function to sort a list.",
+                        2,
+                        3));
 
-    //     probe_results.push_back(
-    //             run_kv_delta_probe_pair(
-    //                     ctx,
-    //                     vocab,
-    //                     "code",
-    //                     "code_write_vs_explain",
-    //                     "You are a helpful coding assistant. Please write a Python function to sort a list.",
-    //                     "You are a helpful coding assistant. Please explain this Python function to sort a list.",
-    //                     4,
-    //                     5));
+        probe_results.push_back(
+                run_kv_delta_probe_pair(
+                        ctx,
+                        vocab,
+                        "code",
+                        "code_write_vs_explain",
+                        "You are a helpful coding assistant. Please write a Python function to sort a list.",
+                        "You are a helpful coding assistant. Please explain this Python function to sort a list.",
+                        4,
+                        5));
 
-    //     probe_results.push_back(
-    //             run_kv_delta_probe_pair(
-    //                     ctx,
-    //                     vocab,
-    //                     "mobile_like",
-    //                     "same_article_summary_vs_rewrite",
-    //                     "You are a document assistant. Article: Python is a popular programming language. It supports lists, dictionaries, functions, and classes. Python is widely used in data analysis, web development, automation, and machine learning. Please summarize this article.",
-    //                     "You are a document assistant. Article: Python is a popular programming language. It supports lists, dictionaries, functions, and classes. Python is widely used in data analysis, web development, automation, and machine learning. Please rewrite this article.",
-    //                     6,
-    //                     7));
+        probe_results.push_back(
+                run_kv_delta_probe_pair(
+                        ctx,
+                        vocab,
+                        "mobile_like",
+                        "same_article_summary_vs_rewrite",
+                        "You are a document assistant. Article: Python is a popular programming language. It supports lists, dictionaries, functions, and classes. Python is widely used in data analysis, web development, automation, and machine learning. Please summarize this article.",
+                        "You are a document assistant. Article: Python is a popular programming language. It supports lists, dictionaries, functions, and classes. Python is widely used in data analysis, web development, automation, and machine learning. Please rewrite this article.",
+                        6,
+                        7));
 
-    //     probe_results.push_back(
-    //             run_kv_delta_probe_pair(
-    //                     ctx,
-    //                     vocab,
-    //                     "cross_task",
-    //                     "code_vs_correction",
-    //                     "You are a helpful coding assistant. Please write a Python function to sort a list.",
-    //                     "You are a Chinese text correction assistant. Please correct this sentence: I has a apple.",
-    //                     8,
-    //                     9));
+        probe_results.push_back(
+                run_kv_delta_probe_pair(
+                        ctx,
+                        vocab,
+                        "cross_task",
+                        "code_vs_correction",
+                        "You are a helpful coding assistant. Please write a Python function to sort a list.",
+                        "You are a Chinese text correction assistant. Please correct this sentence: I has a apple.",
+                        8,
+                        9));
 
-    //     save_kv_delta_probe_results(probe_results);
+        save_kv_delta_probe_results(probe_results);
 
-    //     clear_lora(ctx);
-    //     llama_free(ctx);
-    // }
+        clear_lora(ctx);
+        llama_free(ctx);
+    }
 
     for (auto & node : lora_nodes) {
         if (node.adapter != nullptr) {
