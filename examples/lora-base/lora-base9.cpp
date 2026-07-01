@@ -492,78 +492,59 @@ static void save_kv_delta_probe_results(
     fprintf(stderr, "saved kv delta probe results to %s\n", path.c_str());
 }
 
-static std::string make_common_article_body(int repeat_blocks);
-
-static std::string make_mobile_like_prompt(
-        const std::string & article,
-        const std::string & task);
-
 static std::vector<kv_delta_probe_case> make_kv_delta_probe_cases() {
-    const std::string article_50 =
-            make_common_article_body(1);
-
-    const std::string article_100 =
-            make_common_article_body(2);
-
-    // const std::string article_200 =
-    //         make_common_article_body(4);
-
-    // const std::string article_500 =
-    //         make_common_article_body(10);
-
-    std::vector<kv_delta_probe_case> cases;
-
-    auto add_probe_case = [&](
-        const std::string & tag,
-        const std::string & article,
-        int seq_base,
-        int anchor_request_index,
-        int optimize_request_index,
-        int explain_request_index) {
-        const std::string prompt_a =
-                make_mobile_like_prompt(
-                        article,
-                        "Write a simple Python implementation based on this article.");
-
-        const std::string prompt_b =
-                make_mobile_like_prompt(
-                        article,
-                        "Optimize the Python implementation based on this article.");
-
-        const std::string prompt_c =
-                make_mobile_like_prompt(
-                        article,
-                        "Explain the Python implementation based on this article.");
-
-        cases.push_back({
+    return {
+        {
+            "sanity",
+            "same_prompt_code",
+            "You are a helpful coding assistant. Please write a Python function to sort a list.",
+            "You are a helpful coding assistant. Please write a Python function to sort a list.",
+            0,
+            1,
+            -1,
+            -1,
+        },
+        {
             "code",
-            tag + "_write_vs_optimize",
-            prompt_a,
-            prompt_b,
-            (llama_seq_id) seq_base,
-            (llama_seq_id) (seq_base + 1),
-            anchor_request_index,
-            optimize_request_index,
-        });
-
-        cases.push_back({
+            "code_write_vs_optimize",
+            "You are a helpful coding assistant. Please write a Python function to sort a list.",
+            "You are a helpful coding assistant. Please optimize this Python function to sort a list.",
+            2,
+            3,
+            0,
+            1,
+        },
+        {
             "code",
-            tag + "_write_vs_explain",
-            prompt_a,
-            prompt_c,
-            (llama_seq_id) (seq_base + 2),
-            (llama_seq_id) (seq_base + 3),
-            anchor_request_index,
-            explain_request_index,
-        });
+            "code_write_vs_explain",
+            "You are a helpful coding assistant. Please write a Python function to sort a list.",
+            "You are a helpful coding assistant. Please explain this Python function to sort a list.",
+            4,
+            5,
+            0,
+            2,
+        },
+        {
+            "mobile_like",
+            "same_article_summary_vs_rewrite",
+            "You are a document assistant. Article: Python is a popular programming language. It supports lists, dictionaries, functions, and classes. Python is widely used in data analysis, web development, automation, and machine learning. Please summarize this article.",
+            "You are a document assistant. Article: Python is a popular programming language. It supports lists, dictionaries, functions, and classes. Python is widely used in data analysis, web development, automation, and machine learning. Please rewrite this article.",
+            6,
+            7,
+            -1,
+            -1,
+        },
+        {
+            "cross_task",
+            "code_vs_correction",
+            "You are a helpful coding assistant. Please write a Python function to sort a list.",
+            "You are a Chinese text correction assistant. Please correct this sentence: I has a apple.",
+            8,
+            9,
+            0,
+            3,
+        },
     };
-
-    add_probe_case("ctx_50", article_50, 10, 0, 1, 2);
-    add_probe_case("ctx_100", article_100, 20, 3, 4, 5);
-    // add_probe_case("ctx_200", article_200, 30);
-    // add_probe_case("ctx_500", article_500, 40);
-
-    return cases;
 }
 
 static std::vector<kv_delta_probe_result> run_kv_delta_probe_suite(
@@ -579,7 +560,7 @@ static std::vector<kv_delta_probe_result> run_kv_delta_probe_suite(
     ctx_params.n_ctx = n_ctx;
     ctx_params.n_batch = 256;
     ctx_params.n_ubatch = 64;
-    ctx_params.n_seq_max = 64;
+    ctx_params.n_seq_max = 1024;
     ctx_params.no_perf = true;
     ctx_params.kv_unified = true;
 
@@ -606,12 +587,6 @@ static std::vector<kv_delta_probe_result> run_kv_delta_probe_suite(
 
     clear_lora(ctx);
     llama_free(ctx);
-
-    fprintf(stderr,
-        "kv delta probe suite: cases=%zu n_ctx=%d n_seq_max=%u\n",
-        cases.size(),
-        n_ctx,
-        ctx_params.n_seq_max);
 
     return results;
 }
@@ -2093,7 +2068,6 @@ int main() {
                         6,
                         7));
 
-            
         save_kv_delta_probe_results(probe_results);
 
         clear_lora(ctx);
@@ -2346,14 +2320,11 @@ int main() {
                 }
 
 
-                const int base_request_count = 6;
-                const int normalized_request_index = i % base_request_count;
-
                 const kv_delta_probe_result * probe =
                         find_probe_for_child_request(
                                 probe_results,
                                 probe_cases,
-                                normalized_request_index);
+                                i);
 
                 for (auto & node : online_nodes) {
                     if (node.node_id == route.node_id) {

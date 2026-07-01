@@ -1218,6 +1218,91 @@ bool llama_kv_seq_delta_materialize(
     return true;
 }
 
+// 量化相关
+bool llama_kv_seq_delta_build_branch(
+        llama_context * ctx,
+        llama_seq_id seq_anchor,
+        llama_seq_id seq_child_full,
+        llama_seq_id seq_child_delta,
+        llama_pos p0,
+        llama_pos p1,
+        int32_t parent_node_id,
+        int32_t child_node_id,
+        llama_kv_delta_branch_stats * stats) {
+    if (ctx == nullptr || stats == nullptr) {
+        return false;
+    }
+
+    memset(stats, 0, sizeof(*stats));
+
+    stats->anchor_seq_id = seq_anchor;
+    stats->child_seq_id = seq_child_delta;
+    stats->p0 = (int32_t) p0;
+    stats->p1 = (int32_t) p1;
+
+    llama_memory_t mem = ctx->get_memory();
+
+    llama_kv_cache * kv = nullptr;
+
+    if (auto * pure = dynamic_cast<llama_kv_cache *>(mem)) {
+        kv = pure;
+    } else if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        kv = hybrid->get_mem_attn();
+    }
+
+    if (kv == nullptr) {
+        stats->status = 0;
+        strncpy(stats->message, "no kv cache", sizeof(stats->message) - 1);
+        return false;
+    }
+
+    const bool ok =
+            kv->seq_delta_build_branch(
+                    seq_anchor,
+                    seq_child_full,
+                    seq_child_delta,
+                    p0,
+                    p1,
+                    parent_node_id,
+                    child_node_id);
+    if (ok) {
+        const llama_kv_cache::kv_delta_branch * branch =
+                kv->seq_delta_find_branch(seq_child_delta);
+
+        if (branch != nullptr) {
+            stats->full_kv_bytes_equivalent =
+                    branch->full_kv_bytes_equivalent;
+
+            stats->delta_q8_bytes =
+                    branch->delta_q8_bytes;
+
+            stats->delta_scale_bytes =
+                    branch->delta_scale_bytes;
+
+            const uint64_t delta_total =
+                    branch->delta_q8_bytes + branch->delta_scale_bytes;
+
+            stats->logical_saved_bytes =
+                    branch->full_kv_bytes_equivalent > delta_total ?
+                    branch->full_kv_bytes_equivalent - delta_total :
+                    0;
+
+            stats->logical_saved_rate =
+                    branch->full_kv_bytes_equivalent > 0 ?
+                    (double) stats->logical_saved_bytes /
+                    (double) branch->full_kv_bytes_equivalent :
+                    0.0;
+        }
+    }
+    stats->status = ok ? 1 : 0;
+    strncpy(
+            stats->message,
+            ok ? "ok" : "build branch failed",
+            sizeof(stats->message) - 1);
+
+    return ok;
+}
+
 void llama_backend_init(void) {
     ggml_time_init();
 

@@ -233,6 +233,64 @@ public:
 
         bool ok = false;
     };
+    // 量化相关
+    enum class kv_delta_dtype {
+        F16,
+        Q8,
+    };
+    struct kv_delta_tensor {
+        int32_t layer_id = -1;
+        bool is_k = true;
+
+        llama_pos p0 = 0;
+        llama_pos p1 = 0;
+
+        int32_t n_embd = 0;
+        kv_delta_dtype dtype = kv_delta_dtype::Q8;
+
+        // Q8: value ~= int8_value * scale
+        std::vector<int8_t> q8;
+        std::vector<float> scales;
+
+        // F16 fallback/debug
+        std::vector<ggml_fp16_t> f16;
+
+        // 后续 GPU graph 版本再使用；当前先保留为空指针。
+        ggml_tensor * q8_tensor = nullptr;
+        ggml_tensor * scale_tensor = nullptr;
+    };
+    struct kv_delta_branch {
+        llama_seq_id anchor_seq_id = -1;
+        llama_seq_id child_seq_id = -1;
+
+        llama_pos p0 = 0;
+        llama_pos p1 = 0;
+
+        int32_t parent_node_id = -1;
+        int32_t child_node_id = -1;
+
+        bool enabled = false;
+
+        std::vector<kv_delta_tensor> layer_deltas;
+
+        // 量化相关
+        uint64_t anchor_ref_bytes = 0;
+        uint64_t delta_q8_bytes = 0;
+        uint64_t delta_scale_bytes = 0;
+        uint64_t full_kv_bytes_equivalent = 0;
+    };
+    std::vector<kv_delta_branch> delta_branches;
+    bool seq_delta_build_branch(
+            llama_seq_id seq_anchor,
+            llama_seq_id seq_child_full,
+            llama_seq_id seq_child_delta,
+            llama_pos p0,
+            llama_pos p1,
+            int32_t parent_node_id,
+            int32_t child_node_id);
+
+    bool seq_delta_has_branch(llama_seq_id seq_id) const;
+    const kv_delta_branch * seq_delta_find_branch(llama_seq_id seq_id) const;
 
     bool seq_delta_materialize(
             llama_seq_id seq_anchor,
@@ -253,6 +311,14 @@ public:
     //
 
     uint32_t get_n_kv(const slot_info & sinfo) const;
+
+    // 量化相关
+    ggml_tensor * get_k_delta(
+        ggml_context * ctx,
+        int32_t il,
+        uint32_t n_kv,
+        const slot_info & sinfo,
+        const kv_delta_branch & branch) const;
 
     // get views of the current state of the cache
     ggml_tensor * get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const;

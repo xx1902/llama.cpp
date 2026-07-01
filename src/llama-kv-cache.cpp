@@ -1723,6 +1723,359 @@ bool llama_kv_cache::seq_delta_probe(
 
     return true;
 }
+// 量化相关
+static int8_t kv_delta_quant_q8(float x, float scale) {
+    if (scale <= 0.0f) {
+        return 0;
+    }
+
+    int v = (int) std::round(x / scale);
+    v = std::max(-127, std::min(127, v));
+
+    return (int8_t) v;
+}
+static float kv_delta_dequant_q8(int8_t x, float scale) {
+    return (float) x * scale;
+}
+bool llama_kv_cache::seq_delta_has_branch(llama_seq_id seq_id) const {
+    return seq_delta_find_branch(seq_id) != nullptr;
+}
+const llama_kv_cache::kv_delta_branch * llama_kv_cache::seq_delta_find_branch(
+        llama_seq_id seq_id) const {
+    for (const auto & branch : delta_branches) {
+        if (branch.child_seq_id == seq_id && branch.enabled) {
+            return &branch;
+        }
+    }
+
+    return nullptr;
+}
+bool llama_kv_cache::seq_delta_build_branch(
+        llama_seq_id seq_anchor,
+        llama_seq_id seq_child_full,
+        llama_seq_id seq_child_delta,
+        llama_pos p0,
+        llama_pos p1,
+        int32_t parent_node_id,
+        int32_t child_node_id) {
+    if (seq_anchor < 0 || seq_child_full < 0 || seq_child_delta < 0) {
+        return false;
+    }
+
+    if ((size_t) seq_anchor >= seq_to_stream.size() ||
+            (size_t) seq_child_full >= seq_to_stream.size() ||
+            (size_t) seq_child_delta >= seq_to_stream.size()) {
+        return false;
+    }
+
+    if (p0 < 0) {
+        p0 = 0;
+    }
+
+    if (p1 <= p0) {
+        return false;
+    }
+
+    const uint32_t stream_anchor = seq_to_stream[seq_anchor];
+    const uint32_t stream_child  = seq_to_stream[seq_child_full];
+
+    const auto & cells_anchor = v_cells[stream_anchor];
+    const auto & cells_child  = v_cells[stream_child];
+
+    auto find_cell = [](
+            const llama_kv_cells & cells,
+            llama_seq_id seq_id,
+            llama_pos pos,
+            uint32_t & cell_id) -> bool {
+        for (uint32_t i = 0; i < cells.size(); i++) {
+            if (!cells.seq_has(i, seq_id)) {
+                continue;
+            }
+
+            if (cells.pos_get(i) == pos) {
+                cell_id = i;
+                return true;
+            }
+        }
+
+        return false;
+    };
+
+    kv_delta_branch branch;
+
+    branch.anchor_seq_id = seq_anchor;
+    branch.child_seq_id = seq_child_delta;
+    branch.p0 = p0;
+    branch.p1 = p1;
+    branch.parent_node_id = parent_node_id;
+    branch.child_node_id = child_node_id;
+    branch.enabled = true;
+
+    for (const auto & layer : layers) {
+        const uint32_t il = layer.il;
+
+        const uint32_t n_embd_k_gqa =
+                hparams.n_embd_k_gqa(il);
+
+        const uint32_t n_embd_v_gqa =
+                hparams.n_embd_v_gqa(il);
+
+        ggml_tensor * k_anchor = layer.k_stream[stream_anchor];
+        ggml_tensor * k_child  = layer.k_stream[stream_child];
+
+        ggml_tensor * v_anchor = layer.v_stream[stream_anchor];
+        ggml_tensor * v_child  = layer.v_stream[stream_child];
+
+        if (k_anchor != nullptr && k_child != nullptr) {
+            kv_delta_tensor delta_k;
+
+            delta_k.layer_id = (int32_t) il;
+            delta_k.is_k = true;
+            delta_k.p0 = p0;
+            delta_k.p1 = p1;
+            delta_k.n_embd = (int32_t) n_embd_k_gqa;
+            delta_k.dtype = kv_delta_dtype::Q8;
+
+            const int n_tokens = (int) (p1 - p0);
+            delta_k.q8.resize((size_t) n_tokens * n_embd_k_gqa);
+            delta_k.scales.resize(n_tokens, 1.0f);
+
+            const size_t k_size_row =
+                    ggml_row_size(k_anchor->type, n_embd_k_gqa);
+
+            for (llama_pos pos = p0; pos < p1; pos++) {
+                uint32_t cell_anchor = 0;
+                uint32_t cell_child = 0;
+
+                if (!find_cell(cells_anchor, seq_anchor, pos, cell_anchor) ||
+                        !find_cell(cells_child, seq_child_full, pos, cell_child)) {
+                    return false;
+                }
+
+                std::vector<uint8_t> raw_anchor(k_size_row);
+                std::vector<uint8_t> raw_child(k_size_row);
+
+                ggml_backend_tensor_get(
+                        k_anchor,
+                        raw_anchor.data(),
+                        cell_anchor * k_size_row,
+                        k_size_row);
+
+                ggml_backend_tensor_get(
+                        k_child,
+                        raw_child.data(),
+                        cell_child * k_size_row,
+                        k_size_row);
+
+                const int token_idx = (int) (pos - p0);
+
+                float max_abs = 0.0f;
+
+                for (uint32_t i = 0; i < n_embd_k_gqa; i++) {
+                    const float a =
+                            kv_probe_read_scalar(raw_anchor, k_anchor->type, i);
+
+                    const float b =
+                            kv_probe_read_scalar(raw_child, k_child->type, i);
+
+                    const float d = b - a;
+
+                    max_abs = std::max(max_abs, std::fabs(d));
+                }
+
+                const float scale = max_abs > 0.0f ? max_abs / 127.0f : 1.0f;
+                delta_k.scales[token_idx] = scale;
+
+                for (uint32_t i = 0; i < n_embd_k_gqa; i++) {
+                    const float a =
+                            kv_probe_read_scalar(raw_anchor, k_anchor->type, i);
+
+                    const float b =
+                            kv_probe_read_scalar(raw_child, k_child->type, i);
+
+                    const float d = b - a;
+
+                    delta_k.q8[(size_t) token_idx * n_embd_k_gqa + i] =
+                            kv_delta_quant_q8(d, scale);
+                }
+            }
+
+            branch.delta_q8_bytes +=
+                    (uint64_t) delta_k.q8.size() * sizeof(int8_t);
+
+            branch.delta_scale_bytes +=
+                    (uint64_t) delta_k.scales.size() * sizeof(float);
+
+            branch.full_kv_bytes_equivalent +=
+                    (uint64_t) (p1 - p0) *
+                    (uint64_t) n_embd_k_gqa *
+                    (uint64_t) ggml_type_size(k_anchor->type);
+
+            branch.layer_deltas.push_back(std::move(delta_k));
+        }
+
+        if (v_anchor != nullptr && v_child != nullptr) {
+            kv_delta_tensor delta_v;
+
+            delta_v.layer_id = (int32_t) il;
+            delta_v.is_k = false;
+            delta_v.p0 = p0;
+            delta_v.p1 = p1;
+            delta_v.n_embd = (int32_t) n_embd_v_gqa;
+            delta_v.dtype = kv_delta_dtype::Q8;
+
+            const int n_tokens = (int) (p1 - p0);
+            delta_v.q8.resize((size_t) n_tokens * n_embd_v_gqa);
+            delta_v.scales.resize(n_tokens, 1.0f);
+
+            if (v_trans) {
+                const size_t v_size_el =
+                        ggml_type_size(v_anchor->type);
+
+                for (llama_pos pos = p0; pos < p1; pos++) {
+                    uint32_t cell_anchor = 0;
+                    uint32_t cell_child = 0;
+
+                    if (!find_cell(cells_anchor, seq_anchor, pos, cell_anchor) ||
+                            !find_cell(cells_child, seq_child_full, pos, cell_child)) {
+                        return false;
+                    }
+
+                    const int token_idx = (int) (pos - p0);
+                    std::vector<float> diff(n_embd_v_gqa);
+
+                    float max_abs = 0.0f;
+
+                    for (uint32_t i = 0; i < n_embd_v_gqa; i++) {
+                        std::vector<uint8_t> raw_anchor(v_size_el);
+                        std::vector<uint8_t> raw_child(v_size_el);
+
+                        const size_t offset_anchor =
+                                (cell_anchor + i * cells_anchor.size()) * v_size_el;
+
+                        const size_t offset_child =
+                                (cell_child + i * cells_child.size()) * v_size_el;
+
+                        ggml_backend_tensor_get(
+                                v_anchor,
+                                raw_anchor.data(),
+                                offset_anchor,
+                                v_size_el);
+
+                        ggml_backend_tensor_get(
+                                v_child,
+                                raw_child.data(),
+                                offset_child,
+                                v_size_el);
+
+                        const float a =
+                                kv_probe_read_scalar(raw_anchor, v_anchor->type, 0);
+
+                        const float b =
+                                kv_probe_read_scalar(raw_child, v_child->type, 0);
+
+                        diff[i] = b - a;
+                        max_abs = std::max(max_abs, std::fabs(diff[i]));
+                    }
+
+                    const float scale = max_abs > 0.0f ? max_abs / 127.0f : 1.0f;
+                    delta_v.scales[token_idx] = scale;
+
+                    for (uint32_t i = 0; i < n_embd_v_gqa; i++) {
+                        delta_v.q8[(size_t) token_idx * n_embd_v_gqa + i] =
+                                kv_delta_quant_q8(diff[i], scale);
+                    }
+                }
+            } else {
+                const size_t v_size_row =
+                        ggml_row_size(v_anchor->type, n_embd_v_gqa);
+
+                for (llama_pos pos = p0; pos < p1; pos++) {
+                    uint32_t cell_anchor = 0;
+                    uint32_t cell_child = 0;
+
+                    if (!find_cell(cells_anchor, seq_anchor, pos, cell_anchor) ||
+                            !find_cell(cells_child, seq_child_full, pos, cell_child)) {
+                        return false;
+                    }
+
+                    std::vector<uint8_t> raw_anchor(v_size_row);
+                    std::vector<uint8_t> raw_child(v_size_row);
+
+                    ggml_backend_tensor_get(
+                            v_anchor,
+                            raw_anchor.data(),
+                            cell_anchor * v_size_row,
+                            v_size_row);
+
+                    ggml_backend_tensor_get(
+                            v_child,
+                            raw_child.data(),
+                            cell_child * v_size_row,
+                            v_size_row);
+
+                    const int token_idx = (int) (pos - p0);
+
+                    float max_abs = 0.0f;
+
+                    for (uint32_t i = 0; i < n_embd_v_gqa; i++) {
+                        const float a =
+                                kv_probe_read_scalar(raw_anchor, v_anchor->type, i);
+
+                        const float b =
+                                kv_probe_read_scalar(raw_child, v_child->type, i);
+
+                        const float d = b - a;
+
+                        max_abs = std::max(max_abs, std::fabs(d));
+                    }
+
+                    const float scale = max_abs > 0.0f ? max_abs / 127.0f : 1.0f;
+                    delta_v.scales[token_idx] = scale;
+
+                    for (uint32_t i = 0; i < n_embd_v_gqa; i++) {
+                        const float a =
+                                kv_probe_read_scalar(raw_anchor, v_anchor->type, i);
+
+                        const float b =
+                                kv_probe_read_scalar(raw_child, v_child->type, i);
+
+                        const float d = b - a;
+
+                        delta_v.q8[(size_t) token_idx * n_embd_v_gqa + i] =
+                                kv_delta_quant_q8(d, scale);
+                    }
+                }
+            }
+
+            branch.delta_q8_bytes +=
+                    (uint64_t) delta_v.q8.size() * sizeof(int8_t);
+
+            branch.delta_scale_bytes +=
+                    (uint64_t) delta_v.scales.size() * sizeof(float);
+
+            branch.full_kv_bytes_equivalent +=
+                    (uint64_t) (p1 - p0) *
+                    (uint64_t) n_embd_v_gqa *
+                    (uint64_t) ggml_type_size(v_anchor->type);
+
+            branch.layer_deltas.push_back(std::move(delta_v));
+        }
+    }
+
+    delta_branches.push_back(std::move(branch));
+
+    LLAMA_LOG_INFO(
+            "%s: registered delta branch anchor_seq=%d child_delta_seq=%d range=[%d,%d), tensors=%zu\n",
+            __func__,
+            seq_anchor,
+            seq_child_delta,
+            (int) p0,
+            (int) p1,
+            delta_branches.back().layer_deltas.size());
+
+    return true;
+}
 
 bool llama_kv_cache::seq_delta_materialize(
         llama_seq_id seq_anchor,
@@ -2009,6 +2362,24 @@ uint32_t llama_kv_cache::get_n_kv(const slot_info & sinfo) const {
 }
 
 ggml_tensor * llama_kv_cache::get_k(ggml_context * ctx, int32_t il, uint32_t n_kv, const slot_info & sinfo) const {
+    // 量化相关
+    if (!sinfo.strm.empty()) {
+        const llama_seq_id active_seq =
+                (llama_seq_id) sinfo.strm[0];
+
+        const kv_delta_branch * branch =
+                seq_delta_find_branch(active_seq);
+
+        if (branch != nullptr) {
+            // 第一版先不在这里直接返回 compressed delta。
+            // 因为 ggml 里需要构造 dense reconstructed tensor：
+            // K_recon = K_anchor_view + dequant(delta)
+            //
+            // 这个函数当前只知道 il，不知道当前 attention mask 具体哪些 token 属于 delta。
+            // 所以这里需要后续新增 build_delta_k_view(ctx, il, n_kv, sinfo, *branch)。
+        }
+    }
+    // 分页相关
     if (physical_paged) {
         const int32_t ikv = map_layer_ids.at(il);
 

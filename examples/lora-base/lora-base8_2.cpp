@@ -73,10 +73,6 @@ struct lora_group_runtime {
 struct request_item {
     int leaf_lora_id = 0;
     std::string prompt;
-
-    // 用来区分 200 / 500 / 1000 token 长上下文实验
-    std::string context_tag = "short";
-    int repeat_id = 0;
 };
 
 struct request_tokens {
@@ -130,10 +126,6 @@ struct sample_result {
     std::string mode;
     std::string group_name;
     std::string lora_name;
-
-    int repeat_id = 0;
-    std::string context_tag = "short";
-    int materialize_timed = 0;
 
     int routed_group_id = -1;
     std::string reuse_decision = "unknown";
@@ -492,78 +484,59 @@ static void save_kv_delta_probe_results(
     fprintf(stderr, "saved kv delta probe results to %s\n", path.c_str());
 }
 
-static std::string make_common_article_body(int repeat_blocks);
-
-static std::string make_mobile_like_prompt(
-        const std::string & article,
-        const std::string & task);
-
 static std::vector<kv_delta_probe_case> make_kv_delta_probe_cases() {
-    const std::string article_50 =
-            make_common_article_body(1);
-
-    const std::string article_100 =
-            make_common_article_body(2);
-
-    // const std::string article_200 =
-    //         make_common_article_body(4);
-
-    // const std::string article_500 =
-    //         make_common_article_body(10);
-
-    std::vector<kv_delta_probe_case> cases;
-
-    auto add_probe_case = [&](
-        const std::string & tag,
-        const std::string & article,
-        int seq_base,
-        int anchor_request_index,
-        int optimize_request_index,
-        int explain_request_index) {
-        const std::string prompt_a =
-                make_mobile_like_prompt(
-                        article,
-                        "Write a simple Python implementation based on this article.");
-
-        const std::string prompt_b =
-                make_mobile_like_prompt(
-                        article,
-                        "Optimize the Python implementation based on this article.");
-
-        const std::string prompt_c =
-                make_mobile_like_prompt(
-                        article,
-                        "Explain the Python implementation based on this article.");
-
-        cases.push_back({
+    return {
+        {
+            "sanity",
+            "same_prompt_code",
+            "You are a helpful coding assistant. Please write a Python function to sort a list.",
+            "You are a helpful coding assistant. Please write a Python function to sort a list.",
+            0,
+            1,
+            -1,
+            -1,
+        },
+        {
             "code",
-            tag + "_write_vs_optimize",
-            prompt_a,
-            prompt_b,
-            (llama_seq_id) seq_base,
-            (llama_seq_id) (seq_base + 1),
-            anchor_request_index,
-            optimize_request_index,
-        });
-
-        cases.push_back({
+            "code_write_vs_optimize",
+            "You are a helpful coding assistant. Please write a Python function to sort a list.",
+            "You are a helpful coding assistant. Please optimize this Python function to sort a list.",
+            2,
+            3,
+            0,
+            1,
+        },
+        {
             "code",
-            tag + "_write_vs_explain",
-            prompt_a,
-            prompt_c,
-            (llama_seq_id) (seq_base + 2),
-            (llama_seq_id) (seq_base + 3),
-            anchor_request_index,
-            explain_request_index,
-        });
+            "code_write_vs_explain",
+            "You are a helpful coding assistant. Please write a Python function to sort a list.",
+            "You are a helpful coding assistant. Please explain this Python function to sort a list.",
+            4,
+            5,
+            0,
+            2,
+        },
+        {
+            "mobile_like",
+            "same_article_summary_vs_rewrite",
+            "You are a document assistant. Article: Python is a popular programming language. It supports lists, dictionaries, functions, and classes. Python is widely used in data analysis, web development, automation, and machine learning. Please summarize this article.",
+            "You are a document assistant. Article: Python is a popular programming language. It supports lists, dictionaries, functions, and classes. Python is widely used in data analysis, web development, automation, and machine learning. Please rewrite this article.",
+            6,
+            7,
+            -1,
+            -1,
+        },
+        {
+            "cross_task",
+            "code_vs_correction",
+            "You are a helpful coding assistant. Please write a Python function to sort a list.",
+            "You are a Chinese text correction assistant. Please correct this sentence: I has a apple.",
+            8,
+            9,
+            0,
+            3,
+        },
     };
-
-    add_probe_case("ctx_50", article_50, 10, 0, 1, 2);
-    add_probe_case("ctx_100", article_100, 20, 3, 4, 5);
-    // add_probe_case("ctx_200", article_200, 30);
-    // add_probe_case("ctx_500", article_500, 40);
-
-    return cases;
 }
 
 static std::vector<kv_delta_probe_result> run_kv_delta_probe_suite(
@@ -579,7 +552,7 @@ static std::vector<kv_delta_probe_result> run_kv_delta_probe_suite(
     ctx_params.n_ctx = n_ctx;
     ctx_params.n_batch = 256;
     ctx_params.n_ubatch = 64;
-    ctx_params.n_seq_max = 64;
+    ctx_params.n_seq_max = 1024;
     ctx_params.no_perf = true;
     ctx_params.kv_unified = true;
 
@@ -606,12 +579,6 @@ static std::vector<kv_delta_probe_result> run_kv_delta_probe_suite(
 
     clear_lora(ctx);
     llama_free(ctx);
-
-    fprintf(stderr,
-        "kv delta probe suite: cases=%zu n_ctx=%d n_seq_max=%u\n",
-        cases.size(),
-        n_ctx,
-        ctx_params.n_seq_max);
 
     return results;
 }
@@ -1300,8 +1267,6 @@ static sample_result run_baseline_request(
         int request_index,
         int n_predict) {
     sample_result r;
-    r.repeat_id = req.repeat_id;
-    r.context_tag = req.context_tag;    
 
     const lora_group_runtime * group =
             find_group(groups, toks.routed_group_id);
@@ -1385,8 +1350,6 @@ static sample_result run_online_build_prefix_request(
         int node_id,
         int n_predict) {
     sample_result r;
-    r.repeat_id = req.repeat_id;
-    r.context_tag = req.context_tag;
 
     const lora_group_runtime * group =
             find_group(groups, toks.routed_group_id);
@@ -1482,8 +1445,6 @@ static sample_result run_online_prefix_reuse_request(
         int n_predict,
         double kv_mb_per_token) {
     sample_result r;
-    r.repeat_id = req.repeat_id;
-    r.context_tag = req.context_tag;
 
     const lora_group_runtime * group =
             find_group(groups, toks.routed_group_id);
@@ -1595,9 +1556,6 @@ static sample_result run_online_suffix_delta_materialize_request(
         int n_predict,
         double kv_mb_per_token) {
     sample_result r;
-    r.repeat_id = req.repeat_id;
-    r.context_tag = req.context_tag;
-    r.materialize_timed = 0;
 
     const lora_group_runtime * group =
             find_group(groups, toks.routed_group_id);
@@ -1667,7 +1625,6 @@ static sample_result run_online_suffix_delta_materialize_request(
 
     r.delta_materialize_ms = delta1 - delta0;
     r.suffix_delta_materialized = ok ? 1 : 0;
-    r.materialize_timed = 0;
     r.delta_fp32_mb =
             (double) delta_stats.delta_fp32_bytes / 1024.0 / 1024.0;
     r.materialized_kv_mb =
@@ -1706,7 +1663,6 @@ static sample_result run_online_suffix_delta_materialize_request(
     r.decode_ms = decode1 - decode0;
     r.total_ms = decode1 - t0;
     r.tps = n_predict / std::max(0.001, r.decode_ms / 1000.0);
-    r.materialize_timed = 1;
     r.gpu_start_mb = gpu_start;
     r.gpu_peak_mb = gpu_peak;
     r.gpu_peak_delta_mb = gpu_peak - gpu_start;
@@ -1725,8 +1681,6 @@ static sample_result run_group_kv_reuse_request(
         int request_seq_id,
         int n_predict) {
     sample_result r;
-    r.repeat_id = req.repeat_id;
-    r.context_tag = req.context_tag;
 
     const lora_group_runtime * group =
             find_group(groups, toks.routed_group_id);
@@ -1838,8 +1792,7 @@ static void save_results(
 
     std::ofstream fout(path);
 
-    fout << "repeat_id,context_tag,materialize_timed,"
-        << "suffix_delta_materialized,delta_materialize_ms,delta_fp32_mb,materialized_kv_mb,"
+    fout << "suffix_delta_materialized,delta_materialize_ms,delta_fp32_mb,materialized_kv_mb,"
         << "mode,group_name,lora_name,leaf_lora_id,"
         << "routed_group_id,reuse_decision,"
         << "online_node_id,exact_prefix_hit,"
@@ -1851,10 +1804,7 @@ static void save_results(
         << "estimated_saved_kv_mb\n";
 
     for (const auto & r : results) {
-        fout << r.repeat_id << ","
-            << r.context_tag << ","
-            << r.materialize_timed << ","
-            << r.suffix_delta_materialized << ","
+        fout << r.suffix_delta_materialized << ","
             << r.delta_materialize_ms << ","
             << r.delta_fp32_mb << ","
             << r.materialized_kv_mb << ","
@@ -1889,109 +1839,6 @@ static void save_results(
     fprintf(stderr, "saved results to %s\n", path.c_str());
 }
 
-static std::string make_common_article_body(int repeat_blocks) {
-    const std::string block =
-            "Large language models are increasingly deployed on mobile and edge devices. "
-            "In these scenarios, users often send several requests that share the same long context "
-            "but differ only in the final task instruction. For example, the same document may be "
-            "summarized, rewritten, translated, or optimized by different LoRA adapters. "
-            "A context-aware KV cache reuse system can keep the shared prefix as an anchor and only "
-            "process the task-specific suffix for each branch. This reduces repeated prefill work "
-            "and may lower time to first token when the shared context is long enough. ";
-
-    std::string text;
-
-    for (int i = 0; i < repeat_blocks; ++i) {
-        text += block;
-    }
-
-    return text;
-}
-
-static std::string make_mobile_like_prompt(
-        const std::string & article,
-        const std::string & task) {
-    return
-            "You are a helpful coding assistant. "
-            "Please read the following technical article carefully.\n\n"
-            "Article:\n" +
-            article +
-            "\n\nTask:\n" +
-            task;
-}
-
-static std::vector<request_item> make_long_context_requests() {
-    const std::string article_50 =
-            make_common_article_body(1);
-
-    const std::string article_100 =
-            make_common_article_body(2);
-
-    const std::string article_200 =
-            make_common_article_body(4);
-
-    const std::string article_500 =
-            make_common_article_body(10);
-
-    const std::string article_1000 =
-            make_common_article_body(20);
-
-    std::vector<request_item> requests;
-
-    auto add_case = [&](const std::string & tag, const std::string & article) {
-        // anchor LoRA：先建立 prefix node
-        requests.push_back({
-            0,
-            make_mobile_like_prompt(
-                    article,
-                    "Write a simple Python implementation based on this article."),
-            tag,
-        });
-
-        // similar LoRA 1：同一长正文，不同任务
-        requests.push_back({
-            1,
-            make_mobile_like_prompt(
-                    article,
-                    "Optimize the Python implementation based on this article."),
-            tag,
-        });
-
-        // similar LoRA 2：同一长正文，不同任务
-        requests.push_back({
-            2,
-            make_mobile_like_prompt(
-                    article,
-                    "Explain the Python implementation based on this article."),
-            tag,
-        });
-    };
-
-    add_case("ctx_50", article_50);
-    add_case("ctx_100", article_100);
-    // add_case("ctx_200", article_200);
-    // add_case("ctx_500", article_500);
-    // add_case("ctx_1000", article_1000);
-
-    return requests;
-}
-
-static std::vector<request_item> make_repeated_long_context_requests(int n_repeats) {
-    std::vector<request_item> base_requests =
-            make_long_context_requests();
-
-    std::vector<request_item> requests;
-
-    for (int repeat_id = 0; repeat_id < n_repeats; ++repeat_id) {
-        for (auto req : base_requests) {
-            req.repeat_id = repeat_id;
-            requests.push_back(req);
-        }
-    }
-
-    return requests;
-}
-
 int main() {
     std::setlocale(LC_NUMERIC, "C");
 
@@ -1999,7 +1846,7 @@ int main() {
     const std::string model_path = "D:/ecnu_experiment/Model/Qwen2.5-1.5B-gguf/Qwen2.5-1.5B-Instruct-f16.gguf";
 
     const int ngl = 99;
-    const int n_ctx = 16384;
+    const int n_ctx = 4096;
     const int n_predict = 32;
 
     ggml_backend_load_all();
@@ -2093,7 +1940,6 @@ int main() {
                         6,
                         7));
 
-            
         save_kv_delta_probe_results(probe_results);
 
         clear_lora(ctx);
@@ -2131,10 +1977,28 @@ int main() {
     std::vector<lora_group_runtime> groups =
             make_runtime_groups(vocab);
 
-    const int n_repeats = 3;
-
-    std::vector<request_item> requests =
-            make_repeated_long_context_requests(n_repeats);
+    std::vector<request_item> requests = {
+        {
+            0,
+            "You are a helpful coding assistant. Please write a Python function to sort a list.",
+        },
+        {
+            1,
+            "You are a helpful coding assistant. Please optimize this Python function to sort a list.",
+        },
+        {
+            2,
+            "You are a helpful coding assistant. Please explain this Python function to sort a list.",
+        },
+        {
+            3,
+            "You are a Chinese text correction assistant. Please correct this sentence: I has a apple.",
+        },
+        {
+            4,
+            "You are a song lyrics writing assistant. Please write a short lyric about summer.",
+        },
+    };
 
     std::vector<request_tokens> tokenized;
 
@@ -2278,11 +2142,7 @@ int main() {
             const llama_seq_id request_seq_id =
                     (llama_seq_id) (request_seq_base + i);
 
-            const bool is_anchor_request =
-                    group != nullptr && req.leaf_lora_id == group->anchor_lora_id;
-
-            if (!is_anchor_request &&
-                    route.exact_prefix_hit &&
+            if (route.exact_prefix_hit &&
                     route.exact_prefix_len >= min_reuse_prefix_tokens) {
                 const online_prefix_node * hit =
                         find_online_node(online_nodes, route.node_id);
@@ -2346,14 +2206,11 @@ int main() {
                 }
 
 
-                const int base_request_count = 6;
-                const int normalized_request_index = i % base_request_count;
-
                 const kv_delta_probe_result * probe =
                         find_probe_for_child_request(
                                 probe_results,
                                 probe_cases,
-                                normalized_request_index);
+                                i);
 
                 for (auto & node : online_nodes) {
                     if (node.node_id == route.node_id) {

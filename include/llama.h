@@ -846,6 +846,37 @@ extern "C" {
             uint32_t page_size,
             struct llama_kv_memory_stats * stats);
 
+
+    // 量化相关
+    struct llama_kv_delta_branch_stats {
+        int32_t status;
+        int32_t anchor_seq_id;
+        int32_t child_seq_id;
+
+        int32_t p0;
+        int32_t p1;
+
+        uint64_t full_kv_bytes_equivalent;
+        uint64_t delta_q8_bytes;
+        uint64_t delta_scale_bytes;
+        uint64_t logical_saved_bytes;
+
+        double logical_saved_rate;
+
+        char message[128];
+    };
+
+    LLAMA_API bool llama_kv_seq_delta_build_branch(
+            struct llama_context * ctx,
+            llama_seq_id seq_anchor,
+            llama_seq_id seq_child_full,
+            llama_seq_id seq_child_delta,
+            llama_pos p0,
+            llama_pos p1,
+            int32_t parent_node_id,
+            int32_t child_node_id,
+            struct llama_kv_delta_branch_stats * stats);
+
     // Removes all tokens that belong to the specified sequence and have positions in [p0, p1)
     // Returns false if a partial sequence cannot be removed. Removing a whole sequence never fails
     // seq_id < 0 : match any sequence
