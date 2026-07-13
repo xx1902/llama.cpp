@@ -313,65 +313,6 @@ def stable_app_lora(app_name: str, group_name: str) -> LogicalLora:
     return loras[index]
 
 
-def expand_long_duration_events(
-    events: pd.DataFrame,
-    time_step_min: int,
-    max_duration_min: int,
-) -> pd.DataFrame:
-    """Expand long App residency intervals into periodic GRU observations.
-
-    The extra rows describe that the same App/LoRA remains active. They are
-    useful for sequence prediction, but they are not real LLM requests and
-    therefore are not inserted into the online inference workload.
-    """
-    events = events.copy()
-    events["open_time"] = pd.to_datetime(events["open_time"], errors="coerce")
-    events["close_time"] = pd.to_datetime(events["close_time"], errors="coerce")
-
-    expanded: list[pd.Series] = []
-    for _, row in events.iterrows():
-        start_time = row["open_time"]
-        end_time = row["close_time"]
-        if pd.isna(start_time) or pd.isna(end_time) or time_step_min <= 0:
-            new_row = row.copy()
-            new_row["slice_index"] = 0
-            new_row["is_duration_slice"] = False
-            expanded.append(new_row)
-            continue
-
-        duration_min = (end_time - start_time).total_seconds() / 60.0
-        if duration_min <= time_step_min:
-            new_row = row.copy()
-            new_row["slice_index"] = 0
-            new_row["is_duration_slice"] = False
-            expanded.append(new_row)
-            continue
-
-        capped_duration = min(duration_min, float(max_duration_min))
-        end_limit = start_time + pd.Timedelta(minutes=capped_duration)
-        current_start = start_time
-        slice_index = 0
-
-        while current_start < end_limit:
-            current_end = min(
-                current_start + pd.Timedelta(minutes=time_step_min),
-                end_limit,
-            )
-            new_row = row.copy()
-            new_row["timestamp"] = current_start
-            new_row["open_time"] = current_start
-            new_row["close_time"] = current_end
-            new_row["slice_index"] = slice_index
-            new_row["is_duration_slice"] = slice_index > 0
-            expanded.append(new_row)
-            current_start = current_end
-            slice_index += 1
-
-    if not expanded:
-        return events.iloc[0:0].copy()
-    return pd.DataFrame(expanded).sort_values("timestamp")
-
-
 def context_pool_for_group(
     group_name: str,
     writing_contexts: list[dict],
@@ -531,8 +472,6 @@ def build_gru_workload(
     events_per_user: int,
     history_length: int,
     min_history: int,
-    duration_slice_min: int,
-    max_duration_min: int,
 ) -> dict[str, int]:
     """Create real App sequences and synthesized LoRA prediction samples.
 
@@ -565,11 +504,6 @@ def build_gru_workload(
         user_events = events[events["user_id"] == user_id].sort_values("timestamp")
         if events_per_user > 0:
             user_events = user_events.head(events_per_user)
-        user_events = expand_long_duration_events(
-            user_events,
-            duration_slice_min,
-            max_duration_min,
-        )
 
         for session_id, session_frame in user_events.groupby("session_id", sort=False):
             session_rows: list[dict] = []
@@ -594,16 +528,7 @@ def build_gru_workload(
                     "session_index": session_index,
                     "timestamp": timestamp.isoformat(),
                     "delta_ms": delta_ms,
-                    "event_type": (
-                        "Duration Slice"
-                        if bool(event.get("is_duration_slice", False))
-                        else clean_text(event["event_type"])
-                    ),
-                    "source_event_type": clean_text(event["event_type"]),
-                    "slice_index": int(event.get("slice_index", 0)),
-                    "is_duration_slice": bool(
-                        event.get("is_duration_slice", False)
-                    ),
+                    "event_type": clean_text(event["event_type"]),
                     "app_name": app_name,
                     "app_id": app_to_id[app_name],
                     "group_name": group_name,
@@ -641,9 +566,6 @@ def build_gru_workload(
                         "history_group_ids": [item["group_id"] for item in history],
                         "history_lora_ids": [item["lora_id"] for item in history],
                         "history_delta_ms": [item["delta_ms"] for item in history],
-                        "history_is_duration_slice": [
-                            item["is_duration_slice"] for item in history
-                        ],
                         "target_event_id": target["event_id"],
                         "target_app_id": target["app_id"],
                         "target_app_name": target["app_name"],
@@ -651,7 +573,6 @@ def build_gru_workload(
                         "target_group_name": target["group_name"],
                         "target_lora_id": target["lora_id"],
                         "target_lora_name": target["lora_name"],
-                        "target_is_duration_slice": target["is_duration_slice"],
                     }
                 )
                 sample_id += 1
@@ -680,7 +601,6 @@ def build_gru_workload(
         "gru_users": len(selected_users),
         "gru_events": event_count,
         "gru_samples": sample_count,
-        "gru_duration_slice_min": duration_slice_min,
     }
 
 
@@ -728,8 +648,6 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gru-events-per-user", type=int, default=1000)
     parser.add_argument("--gru-history-length", type=int, default=10)
     parser.add_argument("--gru-min-history", type=int, default=3)
-    parser.add_argument("--gru-duration-slice-min", type=int, default=10)
-    parser.add_argument("--gru-max-duration-min", type=int, default=200)
     return parser.parse_args()
 
 
@@ -779,8 +697,6 @@ def main() -> None:
         args.gru_events_per_user,
         args.gru_history_length,
         args.gru_min_history,
-        args.gru_duration_slice_min,
-        args.gru_max_duration_min,
     )
     save_group_config(args.output_dir)
 
