@@ -1,295 +1,456 @@
-// 多 LoRA 在线 Prefix KV 复用 + Suffix Delta Probe 实验代码。
-// 数据结构 - 基础工具函数 - LoRA 和 prompt 构造 - KV delta - 在线 prefix tree - 实验运行函数 - 保存实验结果 - main 主流程
+// MobiLoRA-style dataset experiment for llama.cpp.
+//
+// The program contains two independent experiments:
+// 1. Delta probe: compare KV produced by different LoRAs for exactly the same
+//    token prefix, then build a Q8 anchor + delta branch and record its size.
+//    Delta 探测：比较不同 LoRA 在完全相同的 token prefix 上产生的 KV，
+//    然后构建 Q8 anchor + delta 分支并记录其大小。
+// 2. Online prefix cache: replay grouped_requests.jsonl in arrival order and
+//    only reuse a cached prefix when both the prefix tokens and LoRA are exact.
+//    在线 prefix 缓存：按到达顺序重放 grouped_requests.jsonl，
+//    只有当 prefix token 和 LoRA 都完全匹配时才复用缓存。
+//
+// Important boundary:
+// - Same text prefix + different LoRA cannot directly share dense KV.
+//   相同文本 prefix + 不同 LoRA 不能直接共享稠密 KV。
+// - Different suffix text is always evaluated normally.
+//   不同的 suffix 文本总是正常计算。
+// - No semantic-similarity or "similar word" KV reuse is performed here.
+//   这里不进行语义相似性或"相似词"的 KV 复用。
 
 #ifndef NOMINMAX
 #define NOMINMAX
 #endif
 
 #include "llama.h"
-#include "generated_lora_tree_qwen2.5.hpp"
-
-#include <windows.h>
-#include <psapi.h>
-
-#ifdef min
-#undef min
-#endif
-
-#ifdef max
-#undef max
-#endif
+#include <nlohmann/json.hpp>
 
 #include <algorithm>
 #include <clocale>
 #include <cstdio>
-#include <cstdlib>
 #include <filesystem>
 #include <fstream>
-#include <numeric>
+#include <limits>
 #include <string>
+#include <unordered_map>
+#include <utility>
 #include <vector>
 
-#pragma comment(lib, "Psapi.lib")
+using json = nlohmann::json;
 
-// ===============================
-// 1.全局输出目录
-// ===============================
-// 所有 CSV 结果统一写到这个 output 目录。
-static const std::string output_dir = "D:/ecnu_experiment/LLama.cpp/llama.cpp/examples/lora-base-test/output";
+// =============================================================================
+// 1. Runtime options  实验配置参数
+// =============================================================================
 
+struct experiment_options {
+    std::string model_path = "D:/ecnu_experiment/Model/Qwen2.5-1.5B-gguf/Qwen2.5-1.5B-Instruct-f16.gguf";
+    std::string workload_dir = "D:/ecnu_experiment/datasets/mobilora_workloads_original";
+    std::string lora_config_path;  // LoRA 配置文件路径（默认从 workload_dir 推断）
+    std::string output_dir = "D:/ecnu_experiment/LLama.cpp/llama.cpp/examples/lora-base-test/output";
 
-// ===============================
-// 2.数据结构
-// ===============================
-// ======================== 离线参数转换结构 ========================
-// 运行时 LoRA 节点
-// generated_lora_tree_qwen2.5.hpp 里通常保存静态树信息，这里把它转换成运行时结构，并额外保存 llama_adapter_lora 指针。
-struct lora_node_runtime {
-    int id = 0;                            // 当前 LoRA 节点 id
-    int parent_id = -1;                    // 父 LoRA 节点 id，用于表示 LoRA tree
-    std::string name;                      // 完整名称
-    std::string short_name;                // 短名称，写 CSV / 图表时更方便
-    std::string path;                      // LoRA 文件路径
-    std::string group_name;                // 所属 group，例如 code / correction。
-    bool is_anchor = false;                // 是否是该 group 的 anchor LoRA
-    llama_adapter_lora * adapter = nullptr;// llama.cpp 加载后的 LoRA adapter 指针
+    int n_gpu_layers = 99;
+    int n_ctx = 16384;
+    int n_batch = 256;
+    int n_ubatch = 64;
+    int n_predict = 16;
+
+    // Delta 实验参数
+    int max_delta_pairs = 50;
+    int delta_context_chunk = 16;
+    int max_online_requests = 300;
+
+    // These are physical full-KV limits used by the online exact-prefix test.
+    int max_cache_nodes = 8;
+    int max_cache_variants = 24;
+    int max_cache_tokens = 8192;
 };
 
-// prompt 模板运行时结构
-// 每个 group 可以有几个代表性 prompt，用于把请求路由到相似 group。
-struct prompt_pattern_runtime {
-    std::string text;                      // 模板原文
-    std::vector<llama_token> tokens;       // 模板 token 序列
+// 打印使用说明
+static void print_usage(const char * program) {
+    fprintf(stderr,
+            "Usage: %s [options]\n"
+            "  --model PATH\n"
+            "  --workload-dir DIR\n"
+            "  --lora-config PATH\n"
+            "  --output-dir DIR\n"
+            "  --max-delta-pairs N\n"
+            "  --max-online-requests N\n"
+            "  --n-predict N\n"
+            "  --n-ctx N\n"
+            "  --max-cache-nodes N\n"
+            "  --max-cache-variants N\n"
+            "  --max-cache-tokens N\n",
+            program);
+}
+
+// 字符串转整数
+static bool parse_int(const char * text, int & value) {
+    try {
+        value = std::stoi(text);
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+// 解析命令行参数
+static bool parse_options(
+        int argc,
+        char ** argv,
+        experiment_options & options) {
+    auto require_value = [&](int & index) -> const char * {
+        if (index + 1 >= argc) {
+            return nullptr;
+        }
+        return argv[++index];
+    };
+
+    for (int i = 1; i < argc; ++i) {
+        const std::string arg = argv[i];
+        const char * value = nullptr;
+
+        if (arg == "--help" || arg == "-h") {
+            print_usage(argv[0]);
+            return false;
+        } else if (arg == "--model") {
+            value = require_value(i);
+            if (!value) return false;
+            options.model_path = value;
+        } else if (arg == "--workload-dir") {
+            value = require_value(i);
+            if (!value) return false;
+            options.workload_dir = value;
+        } else if (arg == "--lora-config") {
+            value = require_value(i);
+            if (!value) return false;
+            options.lora_config_path = value;
+        } else if (arg == "--output-dir") {
+            value = require_value(i);
+            if (!value) return false;
+            options.output_dir = value;
+        } else if (arg == "--max-delta-pairs") {
+            value = require_value(i);
+            if (!value || !parse_int(value, options.max_delta_pairs)) return false;
+        } else if (arg == "--max-online-requests") {
+            value = require_value(i);
+            if (!value || !parse_int(value, options.max_online_requests)) return false;
+        } else if (arg == "--n-predict") {
+            value = require_value(i);
+            if (!value || !parse_int(value, options.n_predict)) return false;
+        } else if (arg == "--n-ctx") {
+            value = require_value(i);
+            if (!value || !parse_int(value, options.n_ctx)) return false;
+        } else if (arg == "--max-cache-nodes") {
+            value = require_value(i);
+            if (!value || !parse_int(value, options.max_cache_nodes)) return false;
+        } else if (arg == "--max-cache-variants") {
+            value = require_value(i);
+            if (!value || !parse_int(value, options.max_cache_variants)) return false;
+        } else if (arg == "--max-cache-tokens") {
+            value = require_value(i);
+            if (!value || !parse_int(value, options.max_cache_tokens)) return false;
+        } else {
+            fprintf(stderr, "unknown option: %s\n", arg.c_str());
+            return false;
+        }
+    }
+
+    if (options.lora_config_path.empty()) {
+        options.lora_config_path =
+                options.workload_dir + "/lora_groups.json";
+    }
+    return true;
+}
+
+// =============================================================================
+// 2. Dataset and runtime structures  数据结构定义
+// =============================================================================
+
+// LoRA 运行时信息
+struct lora_runtime {
+    int lora_id = -1;                    // LoRA ID
+    std::string logical_name;            // 逻辑名称
+    std::string group_name;              // 所属 group
+    std::string adapter_path;            // 适配器文件路径
+    bool is_anchor = false;              // 是否是 anchor LoRA
+    llama_adapter_lora * adapter = nullptr;  // llama.cpp 适配器指针
 };
 
-// LoRA group 运行时结构
-// 一个 group 里有一个 anchor LoRA 和多个相似 LoRA。
-struct lora_group_runtime {
-    int group_id = 0;                                      // group id
-    std::string group_name;                                // group 名称
-    int anchor_lora_id = 0;                                // anchor LoRA 的 id
-    std::vector<int> lora_ids;                             // group 下所有 LoRA id
-    std::vector<prompt_pattern_runtime> prompt_patterns;   // 该 group 的路由模板
+// 数据集请求
+struct dataset_request {
+    int request_id = -1;                 // 请求 ID
+    std::string experiment;              // 实验类型
+    std::string group_name;              // 所属 group
+    std::string context_id;              // 上下文 ID
+    std::string source_dataset;          // 源数据集
+    int lora_id = -1;                    // 使用的 LoRA ID
+    std::string lora_name;               // LoRA 名称
+    std::string common_prefix_text;      // 公共 prefix 文本
+    std::string common_prefix_hash;      // prefix 哈希（用于快速匹配）
+    std::string prompt;                  // 完整 prompt
+    long long arrival_ms = 0;            // 到达时间戳
+    int user_id = -1;                    // 用户 ID
+    int session_id = -1;                 // 会话 ID
+    std::string app_name;                // 应用名称
 };
 
-
-
-// ======================== 请求 ========================
-// 单个实验请求
-// 一个请求 = 使用哪个 LoRA + 输入 prompt + 上下文标签 + 第几次重复实验。
-struct request_item {
-    int leaf_lora_id = 0;                  // 当前请求使用的 LoRA id。
-    std::string prompt;                    // 当前请求的完整 prompt。
-    std::string context_tag = "short";     // 例如 ctx_50 / ctx_100 / ctx_200。
-    int repeat_id = 0;                     // 第几轮重复实验，用于统计均值/方差。
+// Delta pair 项（用于实验1）
+struct delta_pair_item {
+    std::string pair_name;               // pair 名称
+    std::string group_name;              // group
+    std::string context_id;              // 上下文
+    std::string common_prefix_hash;      // prefix 哈希
+    int anchor_request_id = -1;          // anchor 请求 ID
+    int child_request_id = -1;           // child 请求 ID
+    int anchor_lora_id = -1;             // anchor LoRA ID
+    int child_lora_id = -1;              // child LoRA ID
 };
 
-// tokenized 后的请求
-// prompt 在主流程里会先 tokenize，避免每次实验重复 tokenize。
-struct request_tokens {
-    std::vector<llama_token> full;         // 完整 prompt token。
-    int routed_group_id = -1;              // 该 prompt 被路由到哪个 group。
+// Tokenize 后的请求
+struct tokenized_request {
+    std::vector<llama_token> prefix;     // prefix tokens
+    std::vector<llama_token> full;       // 完整 prompt tokens
+    std::vector<llama_token> suffix;     // suffix tokens
+    bool exact_prefix_layout = false;    // prefix 是否精确匹配
 };
 
-// ======================== 前缀树节点 ========================
-// 在线 prefix tree 节点
-// 每个节点保存一个已经 materialize 的 prefix KV，后续请求命中后可以 seq_cp 复用。
-// materialize：原来只是一个“可以计算出来的东西”，现在把它真正算出来并写进 KV cache。
-// 比如：执行 KV_B = KV_A + delta
-// seq：KV cache 里的“请求编号”
-// llama.cpp 的 KV cache 可以同时保存多个请求的 KV，为了区分不同请求，会给每个请求一个：llama_seq_id
-struct online_prefix_node {
-    int node_id = -1;                      // 当前在线节点 id
-    int group_id = -1;                     // 节点所属 group
-
-    int parent_node_id = -1;               // prefix tree 父节点；当前简化版多数为 -1
-    int delta_parent_node_id = -1;         // 如果 suffix delta 可用，指向 delta anchor 节点
-
-    llama_seq_id cache_seq_id = -1;        // 当前 prefix KV 存放在哪个 seq 里
-
-    int prefix_len = 0;                    // 当前节点保存的 prefix token 长度
-    int hit_count = 0;                     // 后续请求命中该节点的次数
-
-    int prefix_can_reuse = 0;              // probe 判断 prefix 是否可复用
-    int suffix_can_delta = 0;              // probe 判断 suffix 是否可做 delta
-    int should_open_new_branch = 1;        // 是否应该单独开新分支
-
-    double suffix_kv_cos = 0.0;            // suffix KV cosine
-    double suffix_kv_l2 = 0.0;             // suffix KV L2
-
-    std::string reuse_decision = "new_branch";  // 系统决策
-    std::string group_name;                     // group 名称
-    std::vector<llama_token> prefix_tokens;     // 当前节点保存的 token 序列
+// Delta 实验结果
+struct delta_result {
+    std::string pair_name;
+    std::string group_name;
+    std::string context_id;
+    int anchor_request_id = -1;
+    int child_request_id = -1;
+    int anchor_lora_id = -1;
+    int child_lora_id = -1;
+    std::string anchor_lora_name;
+    std::string child_lora_name;
+    int prefix_tokens = 0;
+    std::string status = "failed";
+    std::string memory_kind = "unknown";
+    int probed_layers = 0;
+    int skipped_recurrent_layers = 0;
+    int can_encode_delta = 0;
+    double kv_cos = 0.0;
+    double kv_l2 = 0.0;
+    double anchor_eval_ms = 0.0;
+    double child_eval_ms = 0.0;
+    double probe_ms = 0.0;
+    double delta_build_ms = 0.0;
+    int delta_build_ok = 0;
+    unsigned long long full_kv_bytes = 0;
+    unsigned long long delta_q8_bytes = 0;
+    unsigned long long delta_scale_bytes = 0;
+    unsigned long long logical_saved_bytes = 0;
+    double logical_saved_rate = 0.0;
 };
 
-// 在线路由结果
-// route_online_prefix_node() 会返回当前请求是否命中已有 prefix node
-struct online_route_result {
-    int node_id = -1;                      // 命中的在线节点 id
-    int group_id = -1;                     // 命中的 group id
-    int exact_prefix_len = 0;              // 命中的公共 prefix 长度
-    int suffix_len = 0;                    // 剩余 suffix 长度
-    bool exact_prefix_hit = false;         // 是否命中已有 prefix
+// 每层 delta 结果
+struct delta_layer_result {
+    std::string pair_name;
+    int layer_id = -1;
+    double k_cos = 0.0;
+    double v_cos = 0.0;
+    double kv_cos = 0.0;
+    double k_l2 = 0.0;
+    double v_l2 = 0.0;
+    double kv_l2 = 0.0;
 };
 
-// ======================== 实验结果 ========================
-// 单个请求的一条实验结果
-// baseline、online prefix reuse、suffix delta materialize 都写成这个结构。
-struct sample_result {
-    std::string mode;                      // 实验模式，例如 baseline_no_group_kv_reuse
-    std::string group_name;                // group 名称
-    std::string lora_name;                 // LoRA 短名称
-
-    int repeat_id = 0;                     // 第几轮重复实验
-    std::string context_tag = "short";     // ctx_50 / ctx_100 / ctx_200 等
-    int materialize_timed = 0;             // suffix delta materialize 是否完成真实计时
-
-    int routed_group_id = -1;              // prompt 路由到的 group id
-    std::string reuse_decision = "unknown";// 当前请求的复用决策
-
-    int leaf_lora_id = 0;                  // 当前请求使用的 LoRA id
-    int n_prompt_tokens = 0;               // prompt token 数
-    int n_prefix_tokens = 0;               // 复用 prefix token 数
-    int n_suffix_tokens = 0;               // 需要处理的 suffix token 数
-    int n_predict = 0;                     // decode 生成 token 数
-
-    int online_node_id = -1;               // 命中的 online prefix node id
-    int exact_prefix_hit = 0;              // 是否命中 exact prefix
-
-    int suffix_delta_materialized = 0;     // suffix delta 是否 materialize 成功
-    double delta_materialize_ms = 0.0;     // delta materialize 耗时
-    double delta_fp32_mb = 0.0;            // delta 原始 FP32 估算大小
-    double materialized_kv_mb = 0.0;       // materialize 写回 KV 的大小
-
-    double estimated_saved_kv_mb = 0.0;    // 根据 prefix token 估算节省的 KV 内存
-
-    double route_ms = 0.0;                 // prompt 路由耗时
-    double prefix_ms = 0.0;                // prefix copy / build 耗时
-    double lora_bind_ms = 0.0;             // LoRA 绑定耗时
-    double suffix_ms = 0.0;                // suffix eval 耗时
-    double ttft_ms = 0.0;                  // time to first token
-    double decode_ms = 0.0;                // decode 阶段耗时
-    double total_ms = 0.0;                 // 总耗时
-    double tps = 0.0;                      // decode tokens/s
-
-    double gpu_start_mb = 0.0;             // 请求开始前 GPU 显存
-    double gpu_peak_mb = 0.0;              // 请求期间 GPU 显存峰值
-    double gpu_peak_delta_mb = 0.0;        // GPU 显存增加量
-
-    double prefix_reuse_rate = 0.0;        // prefix token 占比
-    double suffix_delta_rate = 0.0;        // suffix token 占比
+// 在线实验结果
+struct online_result {
+    std::string benchmark;
+    int request_id = -1;
+    long long arrival_ms = 0;
+    int user_id = -1;
+    int session_id = -1;
+    std::string app_name;
+    std::string group_name;
+    std::string context_id;
+    int lora_id = -1;
+    std::string lora_name;
+    std::string mode;
+    int node_id = -1;
+    int exact_prefix_hit = 0;
+    int same_lora_variant_hit = 0;
+    int cross_lora_prefix_match = 0;
+    int prefix_tokens = 0;
+    int suffix_tokens = 0;
+    int prompt_tokens = 0;
+    int delta_candidate = 0;
+    double prefix_kv_cos = 0.0;
+    double prefix_kv_l2 = 0.0;
+    double lora_bind_ms = 0.0;
+    double prefix_ms = 0.0;
+    double suffix_ms = 0.0;
+    double ttft_ms = 0.0;
+    double decode_ms = 0.0;
+    double total_ms = 0.0;
+    double tps = 0.0;
+    int cache_nodes = 0;
+    int cache_variants = 0;
+    int physical_cache_tokens = 0;
 };
 
-// ======================== KV相似 ========================
-// 描述某一个具体范围内的 KV 差异结果
-struct kv_delta_range_result {
-    // 当前比较的是哪类 memory，通常是 llama_kv_cache
-    // 混合结构模型可能有 recurrent memory这种不一定能逐 token 比较
-    std::string memory_kind = "unknown"; 
-    std::string probe_status = "failed";    // ok-成功 failed-失败 empty_range-没token
-    int probed_kv_modules = 0;              // 实际参与比较的 KV module 数量
-    int probed_layers = 0;              // 实际参与比较的 attention KV 层数
-    int skipped_recurrent_layers = 0;   // 被跳过的 recurrent 层数
-
-    double kv_l2_avg = 0.0;             // 当前范围内 KV 的平均 L2 距离
-    double kv_cos_avg = 0.0;            // 当前范围内 KV 的平均余弦相似度
-
-    int reusable = 0;                   // 当前范围是否被底层 probe 判断为可复用
+struct prefix_variant {
+    int lora_id = -1;
+    llama_seq_id cache_seq_id = -1;
+    int hit_count = 0;
 };
 
-// 一个 probe case
-// A 通常表示 anchor prompt，B 表示 child prompt
-struct kv_delta_probe_case {
-    std::string group_name;                // group 名称
-    std::string pair_name;                 // pair 名称
-    std::string prompt_a;                  // anchor prompt
-    std::string prompt_b;                  // child prompt
-    llama_seq_id seq_a = -1;               // A 的 seq id
-    llama_seq_id seq_b = -1;               // B 的 seq id
-
-    int anchor_request_index = -1;         // A 在 requests 里的 index
-    int child_request_index = -1;          // B 在 requests 里的 index
+struct prefix_node {
+    int node_id = -1;
+    std::string group_name;
+    std::string context_id;
+    std::string prefix_hash;
+    std::vector<llama_token> prefix_tokens;
+    int anchor_lora_id = -1;
+    llama_seq_id anchor_seq_id = -1;
+    int hit_count = 0;
+    int last_access_index = -1;
+    std::vector<prefix_variant> variants;
 };
 
-// 一个 pair 的 KV 差异 probe 结果 -- 这里是指两个相似的提示词
-struct kv_delta_probe_result {
-    std::string pair_name;                 // pair 名称，例如 ctx_50_write_vs_optimize
-    std::string group_name;                // group 名称，例如 code
+// =============================================================================
+// 3. JSON and CSV helpers JSON 和 CSV 辅助函数
+// =============================================================================
 
-    std::string memory_kind;               // KV memory 类型，例如 llama_kv_cache 如果是 Qwen3.5 可能是llama_memory_recurrent
-    std::string probe_status;              // probe 状态，ok / failed / empty_range 等
+static std::string csv_escape(const std::string & value) {
+    if (value.find_first_of(",\"\n\r") == std::string::npos) {
+        return value;
+    }
+    std::string result = "\"";
+    for (char ch : value) {
+        if (ch == '"') result += '"';
+        result += ch;
+    }
+    result += '"';
+    return result;
+}
 
-    int seq_a = -1;                        // A 分支 seq id
-    int seq_b = -1;                        // B 分支 seq id
+static bool read_json_file(const std::string & path, json & value) {
+    std::ifstream input(path);
+    if (!input) {
+        fprintf(stderr, "failed to open JSON file: %s\n", path.c_str());
+        return false;
+    }
+    try {
+        input >> value;
+        return true;
+    } catch (const std::exception & error) {
+        fprintf(stderr, "failed to parse JSON file %s: %s\n", path.c_str(), error.what());
+        return false;
+    }
+}
 
-    int tokens_a = 0;                      // prompt A token 数
-    int tokens_b = 0;                      // prompt B token 数
-    int common_prefix_tokens = 0;          // A/B 公共 prefix token 数
-    int compared_tokens = 0;               // 实际比较 token 数，一般是 min(A, B)
+static std::vector<json> read_jsonl(const std::string & path) {
+    std::vector<json> rows;
+    std::ifstream input(path);
+    if (!input) {
+        fprintf(stderr, "failed to open JSONL file: %s\n", path.c_str());
+        return rows;
+    }
 
-    int probed_kv_modules = 0;             // probe 到的 KV module 数
-    int probed_layers = 0;                 // probe 到的 attention KV 层数
-    int skipped_recurrent_layers = 0;      // 跳过的 recurrent 层数
+    std::string line;
+    int line_number = 0;
+    while (std::getline(input, line)) {
+        ++line_number;
+        if (line.empty()) continue;
+        try {
+            rows.push_back(json::parse(line));
+        } catch (const std::exception & error) {
+            fprintf(stderr,
+                    "skip invalid JSONL row: file=%s line=%d error=%s\n",
+                    path.c_str(),
+                    line_number,
+                    error.what());
+        }
+    }
+    return rows;
+}
 
-    double full_kv_l2_avg = 0.0;           // full 范围 KV L2
-    double full_kv_cos_avg = 0.0;          // full 范围 KV cosine
+static std::vector<lora_runtime> load_lora_config(const std::string & path) {
+    json root;
+    std::vector<lora_runtime> loras;
+    if (!read_json_file(path, root) || !root.is_object()) {
+        return loras;
+    }
 
-    double prefix_kv_l2_avg = 0.0;         // prefix 范围 KV L2
-    double prefix_kv_cos_avg = 0.0;        // prefix 范围 KV cosine
+    for (auto group_it = root.begin(); group_it != root.end(); ++group_it) {
+        if (!group_it.value().is_array()) continue;
+        for (const auto & item : group_it.value()) {
+            lora_runtime lora;
+            lora.group_name = group_it.key();
+            lora.lora_id = item.value("lora_id", -1);
+            lora.logical_name = item.value("logical_name", "unknown");
+            lora.is_anchor = item.value("is_anchor", false);
+            if (item.contains("actual_adapter_path") &&
+                    item["actual_adapter_path"].is_string()) {
+                lora.adapter_path = item["actual_adapter_path"].get<std::string>();
+            }
+            loras.push_back(std::move(lora));
+        }
+    }
+    return loras;
+}
 
-    double suffix_kv_l2_avg = 0.0;         // suffix 范围 KV L2
-    double suffix_kv_cos_avg = 0.0;        // suffix 范围 KV cosine
+static dataset_request parse_request(const json & item) {
+    dataset_request request;
+    request.request_id = item.value("request_id", -1);
+    request.experiment = item.value("experiment", "unknown");
+    request.group_name = item.value("group_name", "unknown");
+    request.context_id = item.value("context_id", "unknown");
+    request.source_dataset = item.value("source_dataset", "unknown");
+    request.lora_id = item.value("lora_id", -1);
+    request.lora_name = item.value("lora_name", "unknown");
+    request.common_prefix_text = item.value("common_prefix_text", "");
+    request.common_prefix_hash = item.value("common_prefix_hash", "");
+    request.prompt = item.value("prompt", "");
+    request.arrival_ms = item.value("arrival_ms", 0LL);
+    request.user_id = item.value("user_id", -1);
+    request.session_id = item.value("session_id", -1);
+    request.app_name = item.value("app_name", "");
+    return request;
+}
 
-    int prefix_can_reuse = 0;              // prefix 是否满足复用阈值
-    int suffix_can_delta = 0;              // suffix 是否满足 delta 阈值
-    int should_open_new_branch = 0;        // 是否应该单独开分支
+static std::vector<dataset_request> load_requests(const std::string & path) {
+    std::vector<dataset_request> requests;
+    for (const auto & item : read_jsonl(path)) {
+        requests.push_back(parse_request(item));
+    }
+    return requests;
+}
 
-    int delta_parent_node_id = -1;         // delta 父节点，当前简化为 0 / -1
-    std::string reuse_decision = "unknown";// 复用决策
-    std::string tree_action = "unknown";   // 映射到 tree 的动作
-};
+static std::vector<delta_pair_item> load_delta_pairs(const std::string & path) {
+    std::vector<delta_pair_item> pairs;
+    for (const auto & item : read_jsonl(path)) {
+        delta_pair_item pair;
+        pair.pair_name = item.value("pair_name", "unknown");
+        pair.group_name = item.value("group_name", "unknown");
+        pair.context_id = item.value("context_id", "unknown");
+        pair.common_prefix_hash = item.value("common_prefix_hash", "");
+        pair.anchor_request_id = item.value("anchor_request_id", -1);
+        pair.child_request_id = item.value("child_request_id", -1);
+        pair.anchor_lora_id = item.value("anchor_lora_id", -1);
+        pair.child_lora_id = item.value("child_lora_id", -1);
+        pairs.push_back(std::move(pair));
+    }
+    return pairs;
+}
 
+// =============================================================================
+// 4. llama.cpp inference helpers 推理辅助函数
+// =============================================================================
 
-// ===============================
-// 3.基础工具函数
-// ===============================
-// ======================== 基础功能 ========================
-// 返回当前时间，单位 ms。
 static double now_ms() {
     return ggml_time_us() / 1000.0;
 }
 
-// 通过 nvidia-smi 查询当前 GPU 已用显存，单位 MB。
-// 注意：这个函数比较慢，只适合实验统计，不适合高频生产路径。
-static double get_gpu_used_mb() {
-    FILE * pipe = _popen(
-            "nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits",
-            "r");
-
-    if (pipe == nullptr) {
-        return 0.0;
-    }
-
-    char buffer[128] = {};
-    double used_mb = 0.0;
-
-    if (fgets(buffer, sizeof(buffer), pipe) != nullptr) {
-        used_mb = atof(buffer);
-    }
-
-    _pclose(pipe);
-
-    return used_mb;
-}
-
-// ======================== 推理 ========================
-// 把字符串 tokenize 成 llama token
-// add_special=true 表示包含模型需要的特殊 token。
 static bool tokenize_text(
         const llama_vocab * vocab,
         const std::string & text,
         std::vector<llama_token> & tokens) {
-    const int n = -llama_tokenize(
+    const int count = -llama_tokenize(
             vocab,
             text.c_str(),
             (int) text.size(),
@@ -297,3017 +458,1069 @@ static bool tokenize_text(
             0,
             true,
             true);
+    if (count <= 0) return false;
 
-    if (n <= 0) {
-        return false;
-    }
-
-    tokens.resize(n);
-
-    const int ret = llama_tokenize(
+    tokens.resize(count);
+    const int result = llama_tokenize(
             vocab,
             text.c_str(),
             (int) text.size(),
             tokens.data(),
-            (int) tokens.size(),
+            count,
             true,
             true);
-
-    return ret >= 0;
+    return result >= 0;
 }
 
-// 往 llama_batch 里添加一个 token。
-// llama_batch 是 llama.cpp 一次送进模型的一小批 token
-// 这里每调用一次 batch_add，就往 batch 里塞入一个 token 及其位置信息
-static void batch_add(
-        llama_batch & batch,       // 要写入的 batch
-        llama_token token,         // 当前要送进模型的 token id
-        llama_pos pos,             // 当前 token 在该 seq 中的位置
-        llama_seq_id seq_id,       // 当前 token 属于哪个 seq / 请求分支
-        bool logits) {             // 是否需要模型输出这个位置的 logits
-    const int i = batch.n_tokens;  // 当前 batch 已有 token 数，也是新 token 写入的位置
-
-    batch.token[i] = token;        // 写入 token id
-    batch.pos[i] = pos;            // 写入 token 的 position
-    batch.n_seq_id[i] = 1;         // 当前 token 只属于 1 个 seq
-    batch.seq_id[i][0] = seq_id;   // 记录这个 token 属于哪个 seq
-    batch.logits[i] = logits ? 1 : 0; // 是否为这个 token 计算输出 logits
-
-    batch.n_tokens++;              // batch token 数加 1
-}
-
-// 对一段 token 做 prefill/eval
-// 作用：把 prompt token 送进模型前向计算，让模型生成并写入 KV cache
-// 例如 prompt 有 100 个 token，这个函数会把它们分 chunk 喂给 llama_decode
-static bool eval_tokens(
-        llama_context * ctx,                       // llama.cpp 上下文，里面有模型状态和 KV cache
-        const std::vector<llama_token> & tokens,   // 要送进模型的一段 token
-        llama_seq_id seq_id,                       // 这些 token 属于哪个 seq
-        int start_pos,                             // 这些 token 在 seq 中从哪个 position 开始
-        bool logits_last) {                        // 是否只在最后一个 token 位置输出 logits
-    if (tokens.empty()) {                          // 如果没有 token，就不需要计算
-        return true;
-    }
-
-    const int max_chunk = 64;                      // 每次最多送 64 个 token，避免 batch 太大
-    int offset = 0;                                // 当前已经处理到 tokens 的哪个位置
-
-    while (offset < (int) tokens.size()) {         // 循环直到所有 token 都处理完
-        const int chunk =
-                std::min(max_chunk, (int) tokens.size() - offset); // 本轮处理 token 数
-
-        llama_batch batch = llama_batch_init(chunk, 0, 1); // 创建一个 batch
-
-        for (int i = 0; i < chunk; i++) {          // 把本轮 chunk 的 token 填入 batch
-            const int token_index = offset + i;    // 当前 token 在 tokens 中的全局下标
-
-            const bool need_logits =
-                    logits_last &&
-                    token_index == (int) tokens.size() - 1; // 只有最后 token 需要 logits
-
-            batch_add(
-                    batch,                         // 当前 batch
-                    tokens[token_index],           // 当前 token id
-                    start_pos + token_index,       // token 在 seq 里的 position
-                    seq_id,                        // 当前 seq id
-                    need_logits);                  // 是否输出 logits
-        }
-
-        const int ret = llama_decode(ctx, batch);  // 真正执行模型前向，写入 KV cache
-        llama_batch_free(batch);                   // 释放 batch 内存
-
-        if (ret != 0) {                            // ret 非 0 表示 llama_decode 失败
-            fprintf(stderr,
-                    "eval_tokens failed: seq=%d start=%d offset=%d chunk=%d\n",
-                    seq_id,
-                    start_pos,
-                    offset,
-                    chunk);
-            return false;
-        }
-
-        offset += chunk;                           // 进入下一段 chunk
-    }
-
-    return true;                                   // 所有 token 都成功 eval
-}
-
-
-// decode 一个 token。
-// 作用：在已有 KV cache 的基础上，继续生成下一个 token。
-// 这里为了做实验，通常重复喂一个 token，不做真实采样。
-static bool decode_one(
-        llama_context * ctx,       // llama.cpp 上下文
-        llama_token token,         // 要送入模型的 token
-        llama_seq_id seq_id,       // 这个 token 属于哪个 seq
-        int pos) {                 // 这个 token 在 seq 中的位置
-    llama_batch batch = llama_batch_init(1, 0, 1); // 创建只包含 1 个 token 的 batch
-
-    batch_add(
-            batch,                 // batch
-            token,                 // 当前 token
-            pos,                   // token position
-            seq_id,                // seq id
-            true);                 // decode 阶段需要 logits
-
-    const int ret = llama_decode(ctx, batch);      // 执行一次前向，得到 logits 并写 KV
-    llama_batch_free(batch);                       // 释放 batch
-
-    return ret == 0;                               // ret==0 表示成功
-}
-
-// ======================== LoRA相关功能 ========================
-// 清空当前上下文里绑定的 LoRA adapter
-static void clear_lora(llama_context * ctx) {
-    llama_set_adapters_lora(ctx, nullptr, 0, nullptr);
-}
-
-// 计算两个 token 序列的公共前缀长度
-static int common_prefix_len(
+static int common_prefix_length(
         const std::vector<llama_token> & a,
         const std::vector<llama_token> & b) {
-    const int n = std::min((int) a.size(), (int) b.size());
+    const int limit = std::min((int) a.size(), (int) b.size());
+    int index = 0;
+    while (index < limit && a[index] == b[index]) ++index;
+    return index;
+}
 
-    int i = 0;
-
-    while (i < n && a[i] == b[i]) {
-        i++;
+static bool tokenize_request(
+        const llama_vocab * vocab,
+        const dataset_request & request,
+        tokenized_request & tokens) {
+    if (!tokenize_text(vocab, request.common_prefix_text, tokens.prefix) ||
+            !tokenize_text(vocab, request.prompt, tokens.full)) {
+        return false;
     }
 
-    return i;
-}
-
-// ======================== KV 内存估算 ========================
-// 根据 ggml type 粗略返回每个元素占多少字节。
-// 这里用于估算 KV cache 每 token 大概占多少 MB。
-// 注意：量化类型真实大小可能更复杂，这里只是实验可视化估算。
-static size_t ggml_type_size_simple(enum ggml_type type) {
-    switch (type) {
-        case GGML_TYPE_F32:
-            return 4;                      // float32：4 字节。
-
-        case GGML_TYPE_F16:
-        case GGML_TYPE_BF16:
-            return 2;                      // float16 / bfloat16：2 字节。
-
-        case GGML_TYPE_Q8_0:
-            return 1;                      // q8 粗略按 1 字节估算。
-
-        default:
-            return 2;                      // 默认按 f16 估算。
-    }
-}
-
-// 估算当前模型每个 token 的 KV cache 大小，单位 MB
-// 用途：画图时估算 Prefix KV 复用大概节省多少 KV 内存
-static double estimate_kv_mb_per_token(
-        const llama_model * model,         // 当前加载的模型
-        enum ggml_type type_k,             // K cache 的数据类型
-        enum ggml_type type_v) {           // V cache 的数据类型
-    const int n_layer = llama_model_n_layer(model); // 模型层数
-    const int n_embd = llama_model_n_embd(model);   // hidden size
-    const int n_head = llama_model_n_head(model);   // attention head 数
-    const int n_head_kv = llama_model_n_head_kv(model); // KV head 数，GQA/MQA 时小于 n_head
-
-    const int n_embd_kv =
-            n_embd * n_head_kv / std::max(1, n_head);
-    // 计算每层 K/V 的实际 KV hidden 维度
-    // 普通 MHA 时 n_head_kv == n_head，所以 n_embd_kv == n_embd
-    // GQA/MQA 时 n_head_kv 更小，所以 KV cache 更省
-
-    const size_t bytes_per_token =
-            (size_t) n_layer *
-            ((size_t) n_embd_kv * ggml_type_size_simple(type_k) +
-             (size_t) n_embd_kv * ggml_type_size_simple(type_v));
-    // 每个 token 在每层都要保存 K 和 V
-    // 所以大小 = 层数 * (K 大小 + V 大小)
-
-    return (double) bytes_per_token / 1024.0 / 1024.0;
-    // 转成 MB
-}
-
-
-// ===============================
-// 4. LoRA 和 prompt 构造
-// ===============================
-// ======================== 获取 LoRA 配置 ========================
-
-
-// 从 generated_lora_tree_qwen2.5.hpp 读取静态 LoRA 配置，转成运行时 lora_node_runtime
-// 运行时结构比静态配置多一个 adapter 指针，后面加载 LoRA 后会填进去
-
-// LoRA 静态配置 -> 运行时结构
-// 从 generated_lora_tree_qwen2.5.hpp 读取静态 LoRA 配置，
-// 转成运行时 lora_node_runtime。
-// 运行时结构比静态配置多一个 adapter 指针，后面加载 LoRA 后会填进去。
-static std::vector<lora_node_runtime> make_runtime_lora_nodes() {
-    std::vector<lora_node_runtime> nodes;  // 保存所有运行时 LoRA 节点。
-
-    const std::vector<generated_lora_spec> specs =
-            make_generated_lora_specs();
-    // 读取自动生成的静态 LoRA 列表。
-    // generated_lora_spec 里通常包含 id、parent_id、path、group_name 等。
-
-    for (const auto & spec : specs) {      // 遍历每个静态 LoRA 配置。
-        lora_node_runtime node;            // 创建一个运行时 LoRA 节点。
-
-        node.id = spec.id;                 // 复制 LoRA id。
-        node.parent_id = spec.parent_id;   // 复制父节点 id，用于 LoRA tree。
-        node.name = spec.name;             // 复制完整名称。
-        node.short_name = spec.short_name; // 复制短名称。
-        node.path = spec.path;             // 复制 LoRA 文件路径。
-        node.group_name = spec.group_name; // 复制所属 group 名称。
-        node.is_anchor = spec.is_anchor;   // 复制是否是 anchor LoRA。
-
-        nodes.push_back(node);             // 加入运行时节点列表。
+    const int matched = common_prefix_length(tokens.prefix, tokens.full);
+    tokens.exact_prefix_layout = matched == (int) tokens.prefix.size();
+    if (!tokens.exact_prefix_layout) {
+        return false;
     }
 
-    return nodes;                          // 返回所有 LoRA runtime 节点。
+    tokens.suffix.assign(
+            tokens.full.begin() + tokens.prefix.size(),
+            tokens.full.end());
+    return true;
 }
 
-// 从 generated_lora_tree_qwen2.5.hpp 读取 group 配置，并把 group prompt pattern tokenize 成 token 序列。
-// 后续 route_prompt_to_group() 会用这些 token 做 prefix 匹配。
-static std::vector<lora_group_runtime> make_runtime_groups(
-        const llama_vocab * vocab) {       // vocab 用于 tokenize group prompt pattern。
-    std::vector<lora_group_runtime> groups;// 保存所有运行时 group。
+static void batch_add(
+        llama_batch & batch,
+        llama_token token,
+        llama_pos position,
+        llama_seq_id sequence,
+        bool logits) {
+    const int index = batch.n_tokens;
+    batch.token[index] = token;
+    batch.pos[index] = position;
+    batch.n_seq_id[index] = 1;
+    batch.seq_id[index][0] = sequence;
+    batch.logits[index] = logits ? 1 : 0;
+    ++batch.n_tokens;
+}
 
-    const std::vector<generated_lora_group> generated_groups =
-            make_generated_lora_groups();
-    // 读取自动生成的 group 配置。
-
-    for (const auto & src : generated_groups) { // 遍历每个静态 group。
-        lora_group_runtime group;          // 创建运行时 group。
-
-        group.group_id = src.group_id;     // 复制 group id。
-        group.group_name = src.group_name; // 复制 group 名称。
-        group.anchor_lora_id = src.anchor_lora_id; // 复制 anchor LoRA id。
-        group.lora_ids = src.lora_ids;     // 复制该 group 下所有 LoRA id。
-
-        for (const auto & pattern : src.prompt_patterns) {
-            prompt_pattern_runtime item;   // 创建运行时 prompt pattern。
-
-            item.text = pattern.text;      // 保存 pattern 原文。
-            tokenize_text(vocab, item.text, item.tokens);
-            // 把 pattern 转成 token。
-            // 后面实际请求也会 tokenize，然后比较 token 级公共前缀。
-
-            group.prompt_patterns.push_back(item);
-            // 把这个 pattern 加入 group。
+static bool eval_tokens(
+        llama_context * context,
+        const std::vector<llama_token> & tokens,
+        llama_seq_id sequence,
+        int start_position,
+        int chunk_size) {
+    int offset = 0;
+    while (offset < (int) tokens.size()) {
+        const int count = std::min(chunk_size, (int) tokens.size() - offset);
+        llama_batch batch = llama_batch_init(count, 0, 1);
+        for (int i = 0; i < count; ++i) {
+            batch_add(
+                    batch,
+                    tokens[offset + i],
+                    start_position + offset + i,
+                    sequence,
+                    false);
         }
-
-        groups.push_back(group);           // 把 group 加入 groups。
+        const int result = llama_decode(context, batch);
+        llama_batch_free(batch);
+        if (result != 0) {
+            fprintf(stderr,
+                    "eval failed: seq=%d start=%d offset=%d count=%d\n",
+                    sequence,
+                    start_position,
+                    offset,
+                    count);
+            return false;
+        }
+        offset += count;
     }
-
-    return groups;                         // 返回所有 runtime groups。
+    return true;
 }
 
+static bool decode_one(
+        llama_context * context,
+        llama_token token,
+        llama_seq_id sequence,
+        int position) {
+    llama_batch batch = llama_batch_init(1, 0, 1);
+    batch_add(batch, token, position, sequence, true);
+    const int result = llama_decode(context, batch);
+    llama_batch_free(batch);
+    return result == 0;
+}
 
-// ======================== 生成提示词 ========================
+static void clear_lora(llama_context * context) {
+    llama_set_adapters_lora(context, nullptr, 0, nullptr);
+}
 
-// 构造一段公共文章正文。
-// repeat_blocks 越大，文章越长，公共 prefix 越长。
-// 当前实验用它模拟 MobileLoRA 里“同一篇文章，不同任务指令”的场景。
-static std::string make_common_article_body(int repeat_blocks) {
-    const std::string block =
-            "Large language models are increasingly deployed on mobile and edge devices. "
-            "In these scenarios, users often send several requests that share the same long context "
-            "but differ only in the final task instruction. For example, the same document may be "
-            "summarized, rewritten, translated, or optimized by different LoRA adapters. "
-            "A context-aware KV cache reuse system can keep the shared prefix as an anchor and only "
-            "process the task-specific suffix for each branch. This reduces repeated prefill work "
-            "and may lower time to first token when the shared context is long enough. ";
-    // 一个 block 是一段技术文章。
-    // 重复多次后得到更长上下文。
-
-    std::string text;                                  // 保存最终文章。
-
-    for (int i = 0; i < repeat_blocks; ++i) {          // 重复拼接 block。
-        text += block;
+static double bind_lora(
+        llama_context * context,
+        const lora_runtime & lora) {
+    llama_adapter_lora * adapters[] = { lora.adapter };
+    float scales[] = { 1.0f };
+    const double start = now_ms();
+    const int result = llama_set_adapters_lora(context, adapters, 1, scales);
+    const double end = now_ms();
+    if (result != 0) {
+        fprintf(stderr, "failed to bind LoRA %d (%s)\n",
+                lora.lora_id,
+                lora.logical_name.c_str());
     }
-
-    return text;                                       // 返回公共文章正文。
+    return end - start;
 }
 
-// 根据公共文章正文和任务指令构造完整 prompt。
-// article 是大段公共 prefix。
-// task 是最后不同的 suffix。
-static std::string make_mobile_like_prompt(
-        const std::string & article,                   // 公共文章正文。
-        const std::string & task) {                    // 不同任务指令。
-    return
-            "You are a helpful coding assistant. "
-            "Please read the following technical article carefully.\n\n"
-            "Article:\n" +
-            article +
-            "\n\nTask:\n" +
-            task;
-    // 最终结构：
-    // 公共部分：system-like instruction + Article + article
-    // 差异部分：Task + task
+static llama_context * create_context(
+        llama_model * model,
+        const experiment_options & options,
+        int sequence_count) {
+    llama_context_params params = llama_context_default_params();
+    params.n_ctx = options.n_ctx;
+    params.n_batch = options.n_batch;
+    params.n_ubatch = options.n_ubatch;
+    params.n_seq_max = (uint32_t) std::max(1, sequence_count);
+    params.no_perf = true;
+    params.kv_unified = true;
+    return llama_init_from_model(model, params);
 }
 
-
-// ======================== 实验请求 ========================
-// 构造当前实验的基础 requests。
-// 每个 context_tag 下有 3 个请求：
-// 1. write：anchor LoRA 请求，用来建立 prefix node。
-// 2. optimize：相似 LoRA 请求，用来测试 prefix reuse。
-// 3. explain：相似 LoRA 请求，用来测试 prefix reuse。
-static std::vector<request_item> make_long_context_requests() {
-    const std::string article_50 =
-            make_common_article_body(1);               // ctx_50：较短文章。
-
-    const std::string article_100 =
-            make_common_article_body(2);               // ctx_100：更长文章。
-
-    const std::string article_200 =
-            make_common_article_body(4);               // ctx_200：备用。
-
-    const std::string article_500 =
-            make_common_article_body(10);              // ctx_500：备用。
-
-    const std::string article_1000 =
-            make_common_article_body(20);              // ctx_1000：备用。
-
-    std::vector<request_item> requests;                // 保存所有请求。
-
-    auto add_case = [&](const std::string & tag,       // context tag，例如 ctx_50。
-                        const std::string & article) { // 当前 context 的文章正文。
-        requests.push_back({
-            0,                                         // leaf_lora_id=0，anchor LoRA。
-            make_mobile_like_prompt(
-                    article,
-                    "Write a simple Python implementation based on this article."),
-            tag,                                       // context_tag。
-        });
-
-        requests.push_back({
-            1,                                         // leaf_lora_id=1，相似 LoRA。
-            make_mobile_like_prompt(
-                    article,
-                    "Optimize the Python implementation based on this article."),
-            tag,                                       // context_tag。
-        });
-
-        requests.push_back({
-            2,                                         // leaf_lora_id=2，相似 LoRA。
-            make_mobile_like_prompt(
-                    article,
-                    "Explain the Python implementation based on this article."),
-            tag,                                       // context_tag。
-        });
-    };
-
-    add_case("ctx_50", article_50);                    // 添加 ctx_50 的 3 个请求。
-    add_case("ctx_100", article_100);                  // 添加 ctx_100 的 3 个请求。
-
-    // 如果要跑更长上下文，可以打开下面这些。
-    // add_case("ctx_200", article_200);
-    // add_case("ctx_500", article_500);
-    // add_case("ctx_1000", article_1000);
-
-    return requests;                                   // 返回基础请求列表。
-}
-
-// 把基础 requests 重复 n_repeats 次。
-// 这样可以做多次实验，后续 Python 取均值和标准差。
-static std::vector<request_item> make_repeated_long_context_requests(int n_repeats) {
-    std::vector<request_item> base_requests =
-            make_long_context_requests();
-    // 先构造一轮基础请求。
-    // 例如 ctx_50 write / optimize / explain + ctx_100 write / optimize / explain。
-
-    std::vector<request_item> requests;                // 保存重复后的请求。
-
-    for (int repeat_id = 0; repeat_id < n_repeats; ++repeat_id) {
-        // 外层循环：第几轮重复实验。
-
-        for (auto req : base_requests) {
-            // 拷贝基础请求。
-            // 注意这里用 auto req 是值拷贝，不会修改 base_requests。
-
-            req.repeat_id = repeat_id;
-            // 标记当前请求属于第几轮 repeat。
-
-            requests.push_back(req);
-            // 加入最终请求列表。
+static bool run_decode(
+        llama_context * context,
+        llama_seq_id sequence,
+        llama_token repeated_token,
+        int prompt_tokens,
+        int n_predict,
+        double request_start_ms,
+        online_result & result) {
+    const double decode_start = now_ms();
+    for (int i = 0; i < n_predict; ++i) {
+        if (!decode_one(context, repeated_token, sequence, prompt_tokens + i)) {
+            return false;
+        }
+        if (i == 0) {
+            result.ttft_ms = now_ms() - request_start_ms;
         }
     }
-
-    return requests;                                   // 返回重复后的请求列表。
+    const double decode_end = now_ms();
+    result.decode_ms = decode_end - decode_start;
+    result.total_ms = decode_end - request_start_ms;
+    result.tps = n_predict > 0
+            ? n_predict / std::max(0.001, result.decode_ms / 1000.0)
+            : 0.0;
+    return true;
 }
 
-
-// ======================== LoRA 绑定 ========================
-
-// 根据 leaf LoRA id 构建从 root/anchor 到 leaf 的 LoRA path。
-// 例如 LoRA tree 是：anchor -> code_r16v2，
-// 那 path 可能是 [anchor_id, code_r16v2_id]。
-static std::vector<int> build_lora_path(
-        const std::vector<lora_node_runtime> & nodes, // 所有 LoRA runtime 节点。
-        int leaf_id) {                                // 目标 leaf LoRA id。
-    std::vector<int> path;                            // 保存路径。
-    int cur = leaf_id;                                // 从 leaf 开始向父节点回溯。
-
-    while (cur >= 0 && cur < (int) nodes.size()) {    // 只要 cur 是合法 id。
-        path.push_back(cur);                          // 把当前节点加入路径。
-        cur = nodes[cur].parent_id;                   // 移动到父节点。
-    }
-
-    std::reverse(path.begin(), path.end());
-    // 回溯得到的是 leaf -> root，所以需要反转成 root -> leaf。
-
-    return path;                                      // 返回 LoRA 路径。
-}
-
-// 把一条 LoRA path 绑定到当前 llama_context。
-// llama.cpp 允许同时绑定多个 LoRA adapter，并为每个 adapter 设置 scale。
-// 当前实验里 scale 都设成 1.0。
-static double bind_lora_path(
-        llama_context * ctx,                          // 当前 llama context。
-        const std::vector<lora_node_runtime> & nodes, // 所有 LoRA runtime 节点。
-        int leaf_id) {                                // 目标 leaf LoRA id。
-    const std::vector<int> path =
-            build_lora_path(nodes, leaf_id);
-    // 先构建 root/anchor -> leaf 的路径。
-
-    std::vector<llama_adapter_lora *> adapters;       // 要绑定的 adapter 指针列表。
-    std::vector<float> scales;                        // 每个 adapter 的 scale。
-
-    for (int id : path) {                             // 遍历路径上的 LoRA id。
-        if (id >= 0 && id < (int) nodes.size() &&
-                nodes[id].adapter != nullptr) {       // 确保 id 合法且 adapter 已加载。
-            adapters.push_back(nodes[id].adapter);    // 加入 adapter。
-            scales.push_back(1.0f);                   // 当前 adapter scale 设为 1。
-        }
-    }
-
-    const double t0 = now_ms();                       // 记录绑定开始时间。
-
-    const int ret = llama_set_adapters_lora(
-            ctx,                                      // 当前 context。
-            adapters.data(),                          // adapter 数组。
-            adapters.size(),                          // adapter 数量。
-            scales.data());                           // scale 数组。
-
-    const double t1 = now_ms();                       // 记录绑定结束时间。
-
-    if (ret != 0) {                                   // ret 非 0 表示绑定失败。
-        fprintf(stderr, "failed to bind LoRA path for leaf %d\n", leaf_id);
-    }
-
-    return t1 - t0;                                   // 返回绑定耗时 ms。
-}
-
-
-
-// ===============================
-// 5. KV delta
-// ===============================
-// ======================== kv决策 ========================
-// 根据 probe 的三个布尔量生成可读的复用决策 - 算法层面判断
-static std::string make_reuse_decision(
-        int prefix_can_reuse,
-        int suffix_can_delta,
-        int should_open_new_branch) {
-    if (should_open_new_branch) {
-        return "new_branch";
-    }
-
-    if (prefix_can_reuse && suffix_can_delta) {
-        return "prefix_reuse_suffix_delta";
-    }
-
-    if (prefix_can_reuse && !suffix_can_delta) {
-        return "prefix_reuse_suffix_recompute";
-    }
-
-    if (!prefix_can_reuse && suffix_can_delta) {
-        return "suffix_delta_only";
-    }
-
-    return "unknown";
-}
-
-// 把复用决策进一步映射成 prefix tree 的动作 - 系统结构层面
-static std::string make_tree_action(const std::string & reuse_decision) {
-    if (reuse_decision == "new_branch") {
-        return "create_independent_branch";
-    }
-
-    if (reuse_decision == "prefix_reuse_suffix_delta") {
-        return "attach_delta_branch";
-    }
-
-    if (reuse_decision == "prefix_reuse_suffix_recompute") {
-        return "reuse_prefix_recompute_suffix";
-    }
-
-    if (reuse_decision == "suffix_delta_only") {
-        return "attach_suffix_delta_without_prefix";
-    }
-
-    return "unknown";
-}
-
-
-// ========================  kv比较 ========================
-
-// 生成当前实验使用的 KV delta probe case
-// 每个 case 表示一组要比较的 prompt pair
-// A 通常是 anchor 请求，例如 write
-// B 通常是 child 请求，例如 optimize / explain
-static std::vector<kv_delta_probe_case> make_kv_delta_probe_cases() {
-    const std::string article_50 =
-            make_common_article_body(1);  // 构造 ctx_50 的公共文章正文
-
-    const std::string article_100 =
-            make_common_article_body(2);  // 构造 ctx_100 的公共文章正文
-
-    std::vector<kv_delta_probe_case> cases; // 保存所有 probe case
-
-    auto add_probe_case = [&](
-            const std::string & tag,      // 上下文标签，例如 ctx_50
-            const std::string & article,  // 当前 case 共享的文章正文
-            int seq_base,                 // 给这个 case 分配的 seq 起始 id
-            int anchor_request_index,     // anchor 请求在 requests 里的位置
-            int optimize_request_index,   // optimize 请求在 requests 里的位置
-            int explain_request_index) {  // explain 请求在 requests 里的位置
-        const std::string prompt_a =
-                make_mobile_like_prompt(
-                        article,
-                        "Write a simple Python implementation based on this article.");
-        // prompt_a 是 anchor prompt：根据文章写代码
-
-        const std::string prompt_b =
-                make_mobile_like_prompt(
-                        article,
-                        "Optimize the Python implementation based on this article.");
-        // prompt_b 是 child prompt：根据文章优化代码
-
-        const std::string prompt_c =
-                make_mobile_like_prompt(
-                        article,
-                        "Explain the Python implementation based on this article.");
-        // prompt_c 是 child prompt：根据文章解释代码
-
-        cases.push_back({
-            "code",                       // group_name
-            tag + "_write_vs_optimize",   // pair_name
-            prompt_a,                     // A prompt
-            prompt_b,                     // B prompt
-            (llama_seq_id) seq_base,      // A 使用的 seq id
-            (llama_seq_id) (seq_base + 1),// B 使用的 seq id
-            anchor_request_index,         // A 在 requests 里的 index
-            optimize_request_index,       // B 在 requests 里的 index
-        });
-
-        cases.push_back({
-            "code",                       // group_name
-            tag + "_write_vs_explain",    // pair_name
-            prompt_a,                     // A prompt
-            prompt_c,                     // B prompt
-            (llama_seq_id) (seq_base + 2),// A 使用另一个 seq id，避免和上一个 case 冲突
-            (llama_seq_id) (seq_base + 3),// B 使用另一个 seq id
-            anchor_request_index,         // A 在 requests 里的 index
-            explain_request_index,        // B 在 requests 里的 index
-        });
-    };
-
-    add_probe_case(
-            "ctx_50",                     // 当前上下文标签
-            article_50,                   // 当前上下文文章
-            10,                           // seq id 从 10 开始
-            0,                            // requests[0] = ctx_50 write
-            1,                            // requests[1] = ctx_50 optimize
-            2);                           // requests[2] = ctx_50 explain
-
-    add_probe_case(
-            "ctx_100",                    // 当前上下文标签
-            article_100,                  // 当前上下文文章
-            20,                           // seq id 从 20 开始
-            3,                            // requests[3] = ctx_100 write
-            4,                            // requests[4] = ctx_100 optimize
-            5);                           // requests[5] = ctx_100 explain
-
-    return cases;                         // 返回所有 probe case
-}
-
-
-// 调用 llama.cpp 内部 API，比较 seq_a 和 seq_b 在 [p0, p1) 的 KV 差异。
-// 返回 cosine / L2 / probed layers 等统计。
-static kv_delta_range_result run_kv_delta_probe_range(
-        llama_context * ctx,
-        llama_seq_id seq_a,
-        llama_seq_id seq_b,
-        llama_pos p0,
-        llama_pos p1) {
-    kv_delta_range_result r;
-
-    if (p1 <= p0) {
-        r.probe_status = "empty_range";
-        return r;
-    }
-
-    llama_kv_delta_probe_stats stats = {};
-
-    const bool ok =
-            llama_kv_seq_delta_probe(
-                    ctx,
-                    seq_a,
-                    seq_b,
-                    p0,
-                    p1,
-                    &stats);
-
-    r.memory_kind = stats.memory_kind;
-    r.probe_status = stats.probe_status;
-
-    if (r.memory_kind.empty()) {
-        r.memory_kind = "unknown";
-    }
-
-    if (r.probe_status.empty()) {
-        r.probe_status = ok ? "ok" : "failed";
-    }
-
-    r.probed_kv_modules = stats.probed_kv_modules;
-    r.probed_layers = stats.probed_layers;
-    r.skipped_recurrent_layers = stats.skipped_recurrent_layers;
-
-    r.kv_l2_avg = stats.kv_l2_avg;
-    r.kv_cos_avg = stats.kv_cos_avg;
-    r.reusable = stats.can_reuse_as_delta;
-
-    return r;
-}
-
-// 对两个 prompt 做完整 KV delta probe
-// 过程：
-// 1. tokenize prompt A/B。
-// 2. eval A，做 self-check。
-// 3. seq_cp A -> B，验证 KV copy 路径是否正确。
-// 4. 清空 memory，重新 eval A/B。
-// 5. 分别比较 full / prefix / suffix。
-// 6. 根据阈值生成系统决策。
-static kv_delta_probe_result run_kv_delta_probe_pair(
-        llama_context * ctx,              // 推理上下文
-        const llama_vocab * vocab,        // 词表
-        const std::string & group_name,   // 分类标签，如 "sanity", "same_prefix"
-        const std::string & pair_name,    // case 名称，如 "same_prefix_monkey_tiger"
-        const std::string & prompt_a,     // 第一个 prompt
-        const std::string & prompt_b,     // 第二个 prompt
-        llama_seq_id seq_a,               // prompt_a 使用的 seq ID
-        llama_seq_id seq_b) {             // prompt_b 使用的 seq ID
-            
-    kv_delta_probe_result r;              // 结果结构体
-
-    r.group_name = group_name;            // "sanity"
-    r.pair_name = pair_name;              // "same_prompt_monkey"
-    r.seq_a = seq_a;                      // 0
-    r.seq_b = seq_b;                      // 1
-    r.should_open_new_branch = 1;         // 默认: 需要开新分支（保守策略）
-
-    std::vector<llama_token> tokens_a;    // prompt_a 的 token ID 列表
-    std::vector<llama_token> tokens_b;    // prompt_b 的 token ID 列表
-
-    // 将文本转为 token。如果任一失败，返回错误
-    if (!tokenize_text(vocab, prompt_a, tokens_a) || !tokenize_text(vocab, prompt_b, tokens_b)) {
-        r.probe_status = "tokenize_failed";
-        fprintf(stderr, "kv delta probe tokenize failed: pair=%s\n", pair_name.c_str());
-        return r;
-    }
-
-    r.tokens_a = (int) tokens_a.size();           // a的长度
-    r.tokens_b = (int) tokens_b.size();           // b的长度
-    r.common_prefix_tokens = common_prefix_len(tokens_a, tokens_b);  // 两个的前缀和的长度
-    r.compared_tokens = std::min(r.tokens_a, r.tokens_b);            // a,b最短的长度域
-    if (r.compared_tokens <= 0) {                 // 有一个提示词为空
-        r.probe_status = "empty_tokens";
-        fprintf(stderr, "kv delta probe empty tokens: pair=%s\n", pair_name.c_str());
-        return r;
-    }
-
-    clear_lora(ctx);                             // 清除当前绑定的 LoRA
-    llama_memory_t mem = llama_get_memory(ctx);  // 获取 KV memory 管理器
-
-    // -----------------------------
-    // 1. Copy-check 阶段：只验证跨 seq 读取是否可靠
-    // -----------------------------
-    llama_memory_clear(mem, true);               // 清空所有 KV Cache
-    // 在 seq_a 上完整 eval prompt_a
-    const bool ok_a_for_copy = eval_tokens(ctx, tokens_a, seq_a, 0, false);
-    if (!ok_a_for_copy) {   // eval 失败则返回
-        r.probe_status = "eval_a_for_copy_check_failed";
-        fprintf(stderr,
-                "kv delta probe eval A for copy-check failed: pair=%s seq_a=%d\n",
-                pair_name.c_str(),
-                seq_a);
-        return r;
-    }
-
-    // 比较 seq_a 和 seq_a（自己和自己比）
-    const kv_delta_range_result self_before_copy = run_kv_delta_probe_range(ctx, seq_a, seq_a, 0, r.compared_tokens);
-    fprintf(stderr,
-            "kv delta self-check-before-copy: pair=%s seq=%d status=%s kv_cos=%.6f kv_l2=%.6f\n",
-            pair_name.c_str(),
-            seq_a,
-            self_before_copy.probe_status.c_str(),
-            self_before_copy.kv_cos_avg,
-            self_before_copy.kv_l2_avg);
-
-    if (self_before_copy.probe_status != "ok" ||
-            self_before_copy.kv_cos_avg < 0.999 ||
-            self_before_copy.kv_l2_avg > 1e-2) {
-        r.memory_kind = self_before_copy.memory_kind;
-        r.probe_status = "self_check_before_copy_failed";
-        return r;
-    }
-
-    llama_memory_seq_cp(mem, seq_a, seq_b, 0, r.compared_tokens);
-
-    const kv_delta_range_result copy_check =
-            run_kv_delta_probe_range(ctx, seq_a, seq_b, 0, r.compared_tokens);
-
-    fprintf(stderr,
-            "kv delta copy-check: pair=%s seq_a=%d seq_b=%d status=%s kv_cos=%.6f kv_l2=%.6f\n",
-            pair_name.c_str(),
-            seq_a,
-            seq_b,
-            copy_check.probe_status.c_str(),
-            copy_check.kv_cos_avg,
-            copy_check.kv_l2_avg);
-
-    if (copy_check.probe_status != "ok" ||
-            copy_check.kv_cos_avg < 0.998 ||
-            copy_check.kv_l2_avg > 1e-3) {
-        r.memory_kind = copy_check.memory_kind;
-        r.probe_status = "copy_check_failed";
-
-        fprintf(stderr,
-                "kv delta probe stopped by copy-check: pair=%s\n",
-                pair_name.c_str());
-
-        return r;
-    }
-
-    // -----------------------------
-    // 2. 正式 probe 阶段：必须重新清空并重新 eval A/B
-    // -----------------------------
-    llama_memory_clear(mem, true);
-
-    const bool ok_a =
-            eval_tokens(ctx, tokens_a, seq_a, 0, false);
-
-    if (!ok_a) {
-        r.probe_status = "eval_a_failed";
-        fprintf(stderr,
-                "kv delta probe eval A failed: pair=%s seq_a=%d tokens_a=%d\n",
-                pair_name.c_str(),
-                seq_a,
-                r.tokens_a);
-        return r;
-    }
-
-    const bool ok_b =
-            eval_tokens(ctx, tokens_b, seq_b, 0, false);
-
-    if (!ok_b) {
-        r.probe_status = "eval_b_failed";
-        fprintf(stderr,
-                "kv delta probe eval B failed: pair=%s seq_b=%d tokens_b=%d\n",
-                pair_name.c_str(),
-                seq_b,
-                r.tokens_b);
-        return r;
-    }
-
-    // 正式 eval 后再检查一次，防止 memory 被清空后没有重新写入 KV。
-    const kv_delta_range_result self_a =
-            run_kv_delta_probe_range(ctx, seq_a, seq_a, 0, r.compared_tokens);
-
-    fprintf(stderr,
-            "kv delta self-check-A: pair=%s seq=%d status=%s kv_cos=%.6f kv_l2=%.6f\n",
-            pair_name.c_str(),
-            seq_a,
-            self_a.probe_status.c_str(),
-            self_a.kv_cos_avg,
-            self_a.kv_l2_avg);
-
-    if (self_a.probe_status != "ok" ||
-            self_a.kv_cos_avg < 0.999 ||
-            self_a.kv_l2_avg > 1e-2) {
-        r.memory_kind = self_a.memory_kind;
-        r.probe_status = "self_check_a_failed";
-        return r;
-    }
-
-    const kv_delta_range_result self_b =
-            run_kv_delta_probe_range(ctx, seq_b, seq_b, 0, r.compared_tokens);
-
-    fprintf(stderr,
-            "kv delta self-check-B: pair=%s seq=%d status=%s kv_cos=%.6f kv_l2=%.6f\n",
-            pair_name.c_str(),
-            seq_b,
-            self_b.probe_status.c_str(),
-            self_b.kv_cos_avg,
-            self_b.kv_l2_avg);
-
-    if (self_b.probe_status != "ok" ||
-            self_b.kv_cos_avg < 0.999 ||
-            self_b.kv_l2_avg > 1e-2) {
-        r.memory_kind = self_b.memory_kind;
-        r.probe_status = "self_check_b_failed";
-        return r;
-    }
-
-    // -----------------------------
-    // 3. 正式计算 full / prefix / suffix
-    // -----------------------------
-    const kv_delta_range_result full =
-            run_kv_delta_probe_range(
-                    ctx,
-                    seq_a,
-                    seq_b,
-                    0,
-                    r.compared_tokens);
-
-    kv_delta_range_result prefix;
-
-    if (r.common_prefix_tokens == r.compared_tokens) {
-        prefix = full;
-    } else {
-        prefix =
-                run_kv_delta_probe_range(
-                        ctx,
-                        seq_a,
-                        seq_b,
-                        0,
-                        r.common_prefix_tokens);
-    }
-
-    kv_delta_range_result suffix;
-
-    if (r.common_prefix_tokens >= r.compared_tokens) {
-        suffix.memory_kind = full.memory_kind;
-        suffix.probe_status = "empty_range";
-        suffix.probed_kv_modules = full.probed_kv_modules;
-        suffix.probed_layers = full.probed_layers;
-        suffix.skipped_recurrent_layers = full.skipped_recurrent_layers;
-        suffix.kv_l2_avg = 0.0;
-        suffix.kv_cos_avg = 1.0;
-        suffix.reusable = 1;
-    } else {
-        suffix =
-                run_kv_delta_probe_range(
-                        ctx,
-                        seq_a,
-                        seq_b,
-                        r.common_prefix_tokens,
-                        r.compared_tokens);
-    }
-
-    r.memory_kind = full.memory_kind;
-    r.probe_status = full.probe_status;
-
-    r.probed_kv_modules = full.probed_kv_modules;
-    r.probed_layers = full.probed_layers;
-    r.skipped_recurrent_layers = full.skipped_recurrent_layers;
-
-    r.full_kv_l2_avg = full.kv_l2_avg;
-    r.full_kv_cos_avg = full.kv_cos_avg;
-
-    r.prefix_kv_l2_avg = prefix.kv_l2_avg;
-    r.prefix_kv_cos_avg = prefix.kv_cos_avg;
-
-    r.suffix_kv_l2_avg = suffix.kv_l2_avg;
-    r.suffix_kv_cos_avg = suffix.kv_cos_avg;
-
-    if (full.probe_status != "ok") {
-        r.probe_status = full.probe_status;
-        r.should_open_new_branch = 1;
-        return r;
-    }
-
-    r.prefix_can_reuse =
-            r.common_prefix_tokens > 0 &&
-            prefix.probe_status == "ok" &&
-            prefix.kv_cos_avg > 0.80;
-
-    const bool suffix_empty =
-            r.common_prefix_tokens >= r.compared_tokens;
-
-    r.suffix_can_delta =
-            suffix_empty ||
-            (suffix.probe_status == "ok" &&
-             (suffix.kv_cos_avg > 0.80 || suffix.kv_l2_avg < 0.05));
-
-    r.should_open_new_branch =
-            (r.prefix_can_reuse || r.suffix_can_delta) ? 0 : 1;
-
-    r.reuse_decision =
-            make_reuse_decision(
-                    r.prefix_can_reuse,
-                    r.suffix_can_delta,
-                    r.should_open_new_branch);
-
-    r.tree_action =
-            make_tree_action(r.reuse_decision);
-
-    r.delta_parent_node_id =
-            r.suffix_can_delta ? 0 : -1;
-
-    fprintf(stderr,
-            "kv delta probe pair=%s memory=%s status=%s "
-            "tokens_a=%d tokens_b=%d common_prefix=%d compared=%d "
-            "full_cos=%.6f prefix_cos=%.6f suffix_cos=%.6f "
-            "full_l2=%.6f prefix_l2=%.6f suffix_l2=%.6f "
-            "prefix_reuse=%d suffix_delta=%d new_branch=%d decision=%s tree_action=%s\n",
-            pair_name.c_str(),
-            r.memory_kind.c_str(),
-            r.probe_status.c_str(),
-            r.tokens_a,
-            r.tokens_b,
-            r.common_prefix_tokens,
-            r.compared_tokens,
-            r.full_kv_cos_avg,
-            r.prefix_kv_cos_avg,
-            r.suffix_kv_cos_avg,
-            r.full_kv_l2_avg,
-            r.prefix_kv_l2_avg,
-            r.suffix_kv_l2_avg,
-            r.prefix_can_reuse,
-            r.suffix_can_delta,
-            r.should_open_new_branch,
-            r.reuse_decision.c_str(),
-            r.tree_action.c_str());
-
-    fprintf(stderr,
-            "probe ranges: pair=%s full=[0,%d), prefix=[0,%d), suffix=[%d,%d)\n",
-            pair_name.c_str(),
-            r.compared_tokens,
-            r.common_prefix_tokens,
-            r.common_prefix_tokens,
-            r.compared_tokens);
-
-    return r;
-}
-
-
-
-// ======================== KV delta ========================
-
-// 创建一个独立 context，专门跑 KV delta probe。
-// 注意：n_seq_max 不要太大，否则 n_ctx 较大时可能创建 context 失败。
-static std::vector<kv_delta_probe_result> run_kv_delta_probe_suite(
+// =============================================================================
+// 5. Exact-prefix cross-LoRA delta experiment  Delta 实验（实验1）
+// =============================================================================
+
+static void run_delta_experiment(
         llama_model * model,
         const llama_vocab * vocab,
-        int n_ctx,
-        const std::vector<kv_delta_probe_case> & cases) {
-    std::vector<kv_delta_probe_result> results;
+        const experiment_options & options,
+        const std::unordered_map<int, dataset_request> & requests,
+        const std::vector<delta_pair_item> & pairs,
+        const std::unordered_map<int, lora_runtime *> & loras,
+        std::vector<delta_result> & results,
+        std::vector<delta_layer_result> & layer_results) {
+    const int pair_limit = std::min(options.max_delta_pairs, (int) pairs.size());
 
-    llama_context_params ctx_params =
-            llama_context_default_params();
+    for (int chunk_begin = 0; chunk_begin < pair_limit;
+            chunk_begin += options.delta_context_chunk) {
+        const int chunk_end = std::min(
+                pair_limit,
+                chunk_begin + options.delta_context_chunk);
+        llama_context * context = create_context(
+                model,
+                options,
+                2 + (chunk_end - chunk_begin));
+        if (!context) {
+            fprintf(stderr, "failed to create delta context\n");
+            return;
+        }
 
-    ctx_params.n_ctx = n_ctx;
-    ctx_params.n_batch = 256;
-    ctx_params.n_ubatch = 64;
-    ctx_params.n_seq_max = 64;
-    ctx_params.no_perf = true;
-    ctx_params.kv_unified = true;
+        llama_memory_t memory = llama_get_memory(context);
 
-    llama_context * ctx =
-            llama_init_from_model(model, ctx_params);
+        for (int pair_index = chunk_begin; pair_index < chunk_end; ++pair_index) {
+            const delta_pair_item & pair = pairs[pair_index];
+            delta_result result;
+            result.pair_name = pair.pair_name;
+            result.group_name = pair.group_name;
+            result.context_id = pair.context_id;
+            result.anchor_request_id = pair.anchor_request_id;
+            result.child_request_id = pair.child_request_id;
+            result.anchor_lora_id = pair.anchor_lora_id;
+            result.child_lora_id = pair.child_lora_id;
 
-    if (ctx == nullptr) {
-        fprintf(stderr, "failed to create kv-delta-probe context\n");
-        return results;
+            const auto anchor_request_it = requests.find(pair.anchor_request_id);
+            const auto child_request_it = requests.find(pair.child_request_id);
+            const auto anchor_lora_it = loras.find(pair.anchor_lora_id);
+            const auto child_lora_it = loras.find(pair.child_lora_id);
+
+            if (anchor_request_it == requests.end() ||
+                    child_request_it == requests.end()) {
+                result.status = "missing_request";
+                results.push_back(result);
+                continue;
+            }
+            if (anchor_lora_it == loras.end() || child_lora_it == loras.end()) {
+                result.status = "missing_adapter";
+                results.push_back(result);
+                continue;
+            }
+
+            const dataset_request & anchor_request = anchor_request_it->second;
+            const dataset_request & child_request = child_request_it->second;
+            lora_runtime & anchor_lora = *anchor_lora_it->second;
+            lora_runtime & child_lora = *child_lora_it->second;
+            result.anchor_lora_name = anchor_lora.logical_name;
+            result.child_lora_name = child_lora.logical_name;
+
+            if (anchor_lora.group_name != pair.group_name ||
+                    child_lora.group_name != pair.group_name) {
+                result.status = "adapter_group_mismatch";
+                results.push_back(result);
+                continue;
+            }
+
+            // Delta is legal only when the compared text prefix is identical.
+            if (anchor_request.common_prefix_hash != child_request.common_prefix_hash ||
+                    anchor_request.common_prefix_text != child_request.common_prefix_text ||
+                    pair.common_prefix_hash != anchor_request.common_prefix_hash) {
+                result.status = "non_identical_prefix_rejected";
+                results.push_back(result);
+                continue;
+            }
+
+            std::vector<llama_token> prefix_tokens;
+            if (!tokenize_text(vocab, anchor_request.common_prefix_text, prefix_tokens) ||
+                    prefix_tokens.empty()) {
+                result.status = "tokenize_failed";
+                results.push_back(result);
+                continue;
+            }
+            result.prefix_tokens = (int) prefix_tokens.size();
+
+            llama_memory_clear(memory, true);
+            clear_lora(context);
+
+            const llama_seq_id anchor_seq = 0;
+            const llama_seq_id child_seq = 1;
+            const llama_seq_id delta_seq = 2 + (pair_index - chunk_begin);
+
+            bind_lora(context, anchor_lora);
+            double start = now_ms();
+            const bool anchor_ok = eval_tokens(
+                    context,
+                    prefix_tokens,
+                    anchor_seq,
+                    0,
+                    options.n_ubatch);
+            result.anchor_eval_ms = now_ms() - start;
+            if (!anchor_ok) {
+                result.status = "anchor_eval_failed";
+                results.push_back(result);
+                continue;
+            }
+
+            bind_lora(context, child_lora);
+            start = now_ms();
+            const bool child_ok = eval_tokens(
+                    context,
+                    prefix_tokens,
+                    child_seq,
+                    0,
+                    options.n_ubatch);
+            result.child_eval_ms = now_ms() - start;
+            if (!child_ok) {
+                result.status = "child_eval_failed";
+                results.push_back(result);
+                continue;
+            }
+
+            llama_kv_delta_probe_stats probe = {};
+            start = now_ms();
+            const bool probe_ok = llama_kv_seq_delta_probe(
+                    context,
+                    anchor_seq,
+                    child_seq,
+                    0,
+                    result.prefix_tokens,
+                    &probe);
+            result.probe_ms = now_ms() - start;
+            result.status = probe.probe_status;
+            result.memory_kind = probe.memory_kind;
+            result.probed_layers = probe.probed_layers;
+            result.skipped_recurrent_layers = probe.skipped_recurrent_layers;
+            result.can_encode_delta = probe.can_reuse_as_delta;
+            result.kv_cos = probe.kv_cos_avg;
+            result.kv_l2 = probe.kv_l2_avg;
+
+            if (probe_ok) {
+                for (int layer_index = 0; layer_index < probe.n_layers; ++layer_index) {
+                    const auto & source = probe.layers[layer_index];
+                    delta_layer_result layer;
+                    layer.pair_name = pair.pair_name;
+                    layer.layer_id = source.layer_id;
+                    layer.k_cos = source.k_cos_avg;
+                    layer.v_cos = source.v_cos_avg;
+                    layer.kv_cos = source.kv_cos_avg;
+                    layer.k_l2 = source.k_l2_avg;
+                    layer.v_l2 = source.v_l2_avg;
+                    layer.kv_l2 = source.kv_l2_avg;
+                    layer_results.push_back(layer);
+                }
+            }
+
+            llama_kv_delta_branch_stats branch = {};
+            start = now_ms();
+            const bool branch_ok = llama_kv_seq_delta_build_branch(
+                    context,
+                    anchor_seq,
+                    child_seq,
+                    delta_seq,
+                    0,
+                    result.prefix_tokens,
+                    pair.anchor_request_id,
+                    pair.child_request_id,
+                    &branch);
+            result.delta_build_ms = now_ms() - start;
+            result.delta_build_ok = branch_ok ? 1 : 0;
+            result.full_kv_bytes = branch.full_kv_bytes_equivalent;
+            result.delta_q8_bytes = branch.delta_q8_bytes;
+            result.delta_scale_bytes = branch.delta_scale_bytes;
+            result.logical_saved_bytes = branch.logical_saved_bytes;
+            result.logical_saved_rate = branch.logical_saved_rate;
+
+            if (!probe_ok && result.status.empty()) result.status = "probe_failed";
+            results.push_back(result);
+
+            fprintf(stderr,
+                    "delta pair %d/%d: %s prefix=%d cos=%.6f l2=%.6f "
+                    "q8_saved=%.2f%% status=%s\n",
+                    pair_index + 1,
+                    pair_limit,
+                    pair.pair_name.c_str(),
+                    result.prefix_tokens,
+                    result.kv_cos,
+                    result.kv_l2,
+                    result.logical_saved_rate * 100.0,
+                    result.status.c_str());
+        }
+
+        clear_lora(context);
+        llama_free(context);
     }
-
-    for (const auto & c : cases) {
-        results.push_back(
-                run_kv_delta_probe_pair(
-                        ctx,
-                        vocab,
-                        c.group_name,
-                        c.pair_name,
-                        c.prompt_a,
-                        c.prompt_b,
-                        c.seq_a,
-                        c.seq_b));
-    }
-
-    clear_lora(ctx);
-    llama_free(ctx);
-
-    fprintf(stderr,
-        "kv delta probe suite: cases=%zu n_ctx=%d n_seq_max=%u\n",
-        cases.size(),
-        n_ctx,
-        ctx_params.n_seq_max);
-
-    return results;
 }
 
+// =============================================================================
+// 6. Baseline and online exact-prefix experiment  在线实验（实验2）
+// =============================================================================
 
-// Probe 结果映射到 Online Node
-// 根据 child_request_index 找到对应的 probe 结果。
-// repeat 实验时，外面会把 i 归一化成 base_request_index 后再传进来。
-static const kv_delta_probe_result * find_probe_for_child_request(
-        const std::vector<kv_delta_probe_result> & probe_results,
-        const std::vector<kv_delta_probe_case> & probe_cases,
-        int child_request_index) {
-    for (const auto & c : probe_cases) {
-        if (c.child_request_index != child_request_index) {
-            continue;
-        }
+static int count_variants(const std::vector<prefix_node> & nodes) {
+    int count = 0;
+    for (const auto & node : nodes) count += (int) node.variants.size();
+    return count;
+}
 
-        for (const auto & r : probe_results) {
-            if (r.pair_name == c.pair_name) {
-                return &r;
-            }
+static int count_cache_tokens(const std::vector<prefix_node> & nodes) {
+    int count = 0;
+    for (const auto & node : nodes) {
+        count += (int) node.prefix_tokens.size() * (int) node.variants.size();
+    }
+    return count;
+}
+
+static int find_node_index(
+        const std::vector<prefix_node> & nodes,
+        const dataset_request & request,
+        const std::vector<llama_token> & prefix_tokens) {
+    for (int index = 0; index < (int) nodes.size(); ++index) {
+        const auto & node = nodes[index];
+        if (node.group_name == request.group_name &&
+                node.prefix_hash == request.common_prefix_hash &&
+                node.prefix_tokens == prefix_tokens) {
+            return index;
         }
     }
+    return -1;
+}
 
+static prefix_variant * find_variant(prefix_node & node, int lora_id) {
+    for (auto & variant : node.variants) {
+        if (variant.lora_id == lora_id) return &variant;
+    }
     return nullptr;
 }
 
-
-// 把 probe 结果写入 online prefix node。
-// 这样后续可视化可以看到每个 node 的 suffix cosine / L2 / 决策。
-static void apply_probe_to_online_node(
-        online_prefix_node & node,
-        const kv_delta_probe_result & probe,
-        int anchor_node_id) {
-    node.parent_node_id = anchor_node_id;
-    node.delta_parent_node_id =
-            probe.suffix_can_delta ? anchor_node_id : -1;
-
-    node.prefix_can_reuse = probe.prefix_can_reuse;
-    node.suffix_can_delta = probe.suffix_can_delta;
-    node.should_open_new_branch = probe.should_open_new_branch;
-
-    node.suffix_kv_cos = probe.suffix_kv_cos_avg;
-    node.suffix_kv_l2 = probe.suffix_kv_l2_avg;
-    node.reuse_decision = probe.reuse_decision;
-}
-
-
-// 保存 KV delta probe 结果到 CSV
-// 后续 Python 可视化脚本会读取这个文件
-static void save_kv_delta_probe_results(
-        const std::vector<kv_delta_probe_result> & results) { // 所有 pair 的 probe 结果
-    std::filesystem::create_directories(output_dir);          // 如果 output 目录不存在，就创建
-
-    const std::string path =
-            output_dir + "/kv_delta_probe_summary.csv";       // CSV 文件路径
-
-    std::ofstream fout(path);                                 // 打开输出文件
-
-    fout << "pair_name,group_name,memory_kind,probe_status,seq_a,seq_b,"
-         << "tokens_a,tokens_b,common_prefix_tokens,compared_tokens,"
-         << "probed_kv_modules,probed_layers,skipped_recurrent_layers,"
-         << "full_kv_l2_avg,full_kv_cos_avg,"
-         << "prefix_kv_l2_avg,prefix_kv_cos_avg,"
-         << "suffix_kv_l2_avg,suffix_kv_cos_avg,"
-         << "prefix_can_reuse,suffix_can_delta,should_open_new_branch,"
-         << "delta_parent_node_id,reuse_decision,tree_action\n"; // 写 CSV 表头
-
-    for (const auto & r : results) {                          // 遍历每一个 pair 的结果
-        fout << r.pair_name << ","                            // pair 名称
-             << r.group_name << ","                           // group 名称
-             << r.memory_kind << ","                          // KV memory 类型
-             << r.probe_status << ","                         // probe 是否成功
-             << r.seq_a << ","                                // A seq id
-             << r.seq_b << ","                                // B seq id
-             << r.tokens_a << ","                             // A token 数
-             << r.tokens_b << ","                             // B token 数
-             << r.common_prefix_tokens << ","                 // 公共 prefix token 数
-             << r.compared_tokens << ","                      // 实际比较 token 数
-             << r.probed_kv_modules << ","                    // probe 的 KV module 数
-             << r.probed_layers << ","                        // probe 的层数
-             << r.skipped_recurrent_layers << ","             // 跳过 recurrent 层数
-             << r.full_kv_l2_avg << ","                       // full KV L2
-             << r.full_kv_cos_avg << ","                      // full KV cosine
-             << r.prefix_kv_l2_avg << ","                     // prefix KV L2
-             << r.prefix_kv_cos_avg << ","                    // prefix KV cosine
-             << r.suffix_kv_l2_avg << ","                     // suffix KV L2
-             << r.suffix_kv_cos_avg << ","                    // suffix KV cosine
-             << r.prefix_can_reuse << ","                     // prefix 是否可复用
-             << r.suffix_can_delta << ","                     // suffix 是否可做 delta
-             << r.should_open_new_branch << ","               // 是否新建分支
-             << r.delta_parent_node_id << ","                 // delta 父节点
-             << r.reuse_decision << ","                       // 复用决策
-             << r.tree_action << "\n";                        // tree 操作
+static void release_node(
+        llama_memory_t memory,
+        const prefix_node & node,
+        std::vector<llama_seq_id> & free_sequences) {
+    for (const auto & variant : node.variants) {
+        llama_memory_seq_rm(memory, variant.cache_seq_id, -1, -1);
+        free_sequences.push_back(variant.cache_seq_id);
     }
-
-    fprintf(stderr,
-            "saved kv delta probe results to %s, rows=%zu\n",
-            path.c_str(),
-            results.size());                                  // 打印保存位置和行数
 }
 
-
-
-
-
-
-
-
-
-
-// ===============================
-// 6. 在线 prefix tree
-// ===============================
-// ======================== group定位 ========================
-// 根据 prompt token 和每个 group 的 prompt pattern 做公共前缀匹配，
-// 选择公共前缀最长的 group。
-static int route_prompt_to_group(
-        const std::vector<lora_group_runtime> & groups,      // 所有 LoRA group
-        const std::vector<llama_token> & prompt_tokens) {    // 当前请求的 prompt token
-    int best_group = groups.empty() ? -1 : groups[0].group_id;
-    // 默认 group：如果 groups 为空则 -1，否则先用第一个 group
-
-    int best_score = -1;
-    // best_score 表示当前找到的最长公共 prefix 长度
-
-    for (const auto & group : groups) {     // 遍历每个 group
-        for (const auto & pattern : group.prompt_patterns) {
-            // 遍历该 group 下的每个 prompt pattern
-
-            const int score =
-                    common_prefix_len(prompt_tokens, pattern.tokens);
-            // 计算当前请求 prompt 和该 pattern 的公共 token 前缀长度
-
-            if (score > best_score) {       // 如果这个 group/pattern 更匹配
-                best_score = score;         // 更新最长匹配长度
-                best_group = group.group_id;// 更新最佳 group
+static bool ensure_cache_capacity(
+        llama_memory_t memory,
+        std::vector<prefix_node> & nodes,
+        std::vector<llama_seq_id> & free_sequences,
+        const experiment_options & options,
+        int additional_tokens,
+        int protected_node_id) {
+    while (free_sequences.empty() ||
+            count_variants(nodes) >= options.max_cache_variants ||
+            count_cache_tokens(nodes) + additional_tokens > options.max_cache_tokens ||
+            ((int) nodes.size() >= options.max_cache_nodes && protected_node_id < 0)) {
+        int victim_index = -1;
+        int oldest_access = std::numeric_limits<int>::max();
+        for (int index = 0; index < (int) nodes.size(); ++index) {
+            if (nodes[index].node_id == protected_node_id) continue;
+            if (nodes[index].last_access_index < oldest_access) {
+                oldest_access = nodes[index].last_access_index;
+                victim_index = index;
             }
         }
-    }
+        if (victim_index < 0) return false;
 
-    return best_group;                      // 返回路由到的 group id
+        fprintf(stderr,
+                "evict prefix node=%d context=%s variants=%zu\n",
+                nodes[victim_index].node_id,
+                nodes[victim_index].context_id.c_str(),
+                nodes[victim_index].variants.size());
+        release_node(memory, nodes[victim_index], free_sequences);
+        nodes.erase(nodes.begin() + victim_index);
+    }
+    return true;
 }
 
-// 根据 group_id 找到对应 group。
-// 找不到时返回 nullptr。
-static const lora_group_runtime * find_group(
-        const std::vector<lora_group_runtime> & groups, // 所有 group。
-        int group_id) {                                 // 要找的 group id。
-    for (const auto & group : groups) {                 // 遍历 group。
-        if (group.group_id == group_id) {               // id 匹配。
-            return &group;                              // 返回该 group 地址。
+static online_result run_uncached_request(
+        llama_context * context,
+        llama_memory_t memory,
+        const experiment_options & options,
+        const dataset_request & request,
+        const tokenized_request & tokens,
+        lora_runtime & lora,
+        llama_seq_id request_seq,
+        const std::string & benchmark,
+        const std::string & mode) {
+    online_result result;
+    result.benchmark = benchmark;
+    result.request_id = request.request_id;
+    result.arrival_ms = request.arrival_ms;
+    result.user_id = request.user_id;
+    result.session_id = request.session_id;
+    result.app_name = request.app_name;
+    result.group_name = request.group_name;
+    result.context_id = request.context_id;
+    result.lora_id = request.lora_id;
+    result.lora_name = lora.logical_name;
+    result.mode = mode;
+    result.prefix_tokens = (int) tokens.prefix.size();
+    result.suffix_tokens = (int) tokens.suffix.size();
+    result.prompt_tokens = (int) tokens.full.size();
+
+    llama_memory_seq_rm(memory, request_seq, -1, -1);
+    const double request_start = now_ms();
+    result.lora_bind_ms = bind_lora(context, lora);
+
+    const double eval_start = now_ms();
+    if (!eval_tokens(context, tokens.full, request_seq, 0, options.n_ubatch)) {
+        result.mode += "_eval_failed";
+        return result;
+    }
+    result.suffix_ms = now_ms() - eval_start;
+
+    const llama_token repeated = tokens.full.back();
+    run_decode(
+            context,
+            request_seq,
+            repeated,
+            (int) tokens.full.size(),
+            options.n_predict,
+            request_start,
+            result);
+    llama_memory_seq_rm(memory, request_seq, -1, -1);
+    return result;
+}
+
+static std::vector<online_result> run_baseline_experiment(
+        llama_model * model,
+        const llama_vocab * vocab,
+        const experiment_options & options,
+        const std::vector<dataset_request> & requests,
+        const std::unordered_map<int, lora_runtime *> & loras) {
+    std::vector<online_result> results;
+    llama_context * context = create_context(model, options, 1);
+    if (!context) return results;
+    llama_memory_t memory = llama_get_memory(context);
+
+    const int limit = std::min(options.max_online_requests, (int) requests.size());
+    for (int index = 0; index < limit; ++index) {
+        const dataset_request & request = requests[index];
+        const auto lora_it = loras.find(request.lora_id);
+        if (lora_it == loras.end()) continue;
+        if (lora_it->second->group_name != request.group_name) continue;
+
+        tokenized_request tokens;
+        if (!tokenize_request(vocab, request, tokens)) {
+            fprintf(stderr, "baseline skip invalid prefix layout: request=%d\n", request.request_id);
+            continue;
         }
+        online_result result = run_uncached_request(
+                context,
+                memory,
+                options,
+                request,
+                tokens,
+                *lora_it->second,
+                0,
+                "baseline",
+                "full_prompt_eval");
+        result.cache_nodes = 0;
+        result.cache_variants = 0;
+        result.physical_cache_tokens = 0;
+        results.push_back(result);
     }
 
-    return nullptr;                                     // 没找到。
+    clear_lora(context);
+    llama_free(context);
+    return results;
 }
 
-// ======================== prefix命中 ========================
-// 在已有 online prefix nodes 中查找当前 prompt 是否能命中某个 prefix。
-// 命中规则：
-// 1. 必须在同一个 routed_group_id 下。
-// 2. 选择和当前 prompt 公共前缀最长的 node。
-static online_route_result route_online_prefix_node(
-        const std::vector<online_prefix_node> & nodes,  // 当前已经建立的 online prefix nodes。
-        int routed_group_id,                            // 当前请求路由到的 group id。
-        const std::vector<llama_token> & prompt_tokens) {// 当前请求的 prompt token。
-    online_route_result result;                         // 返回结果。
+static std::vector<online_result> run_online_experiment(
+        llama_model * model,
+        const llama_vocab * vocab,
+        const experiment_options & options,
+        const std::vector<dataset_request> & requests,
+        const std::unordered_map<int, lora_runtime *> & loras,
+        std::vector<prefix_node> & final_nodes) {
+    std::vector<online_result> results;
+    const int cache_sequence_count = std::max(1, options.max_cache_variants);
+    const llama_seq_id request_seq = cache_sequence_count;
+    llama_context * context = create_context(
+            model,
+            options,
+            cache_sequence_count + 1);
+    if (!context) return results;
+    llama_memory_t memory = llama_get_memory(context);
 
-    result.group_id = routed_group_id;                  // 记录当前 group。
-    result.suffix_len = (int) prompt_tokens.size();     // 默认 suffix 是完整 prompt。
+    std::vector<llama_seq_id> free_sequences;
+    for (int sequence = cache_sequence_count - 1; sequence >= 0; --sequence) {
+        free_sequences.push_back((llama_seq_id) sequence);
+    }
 
-    int best_node_id = -1;                              // 当前最佳命中 node id。
-    int best_prefix_len = 0;                            // 当前最长公共 prefix 长度。
+    std::vector<prefix_node> nodes;
+    int next_node_id = 0;
+    const int limit = std::min(options.max_online_requests, (int) requests.size());
 
-    for (const auto & node : nodes) {                   // 遍历已有 prefix node。
-        if (node.group_id != routed_group_id) {         // 只在同 group 内查找。
+    for (int request_index = 0; request_index < limit; ++request_index) {
+        const dataset_request & request = requests[request_index];
+        const auto lora_it = loras.find(request.lora_id);
+        if (lora_it == loras.end()) continue;
+        lora_runtime & lora = *lora_it->second;
+        if (lora.group_name != request.group_name) continue;
+
+        tokenized_request tokens;
+        if (!tokenize_request(vocab, request, tokens) || tokens.full.empty()) {
+            fprintf(stderr, "online skip invalid prefix layout: request=%d\n", request.request_id);
+            continue;
+        }
+        const double request_start = now_ms();
+
+        int node_index = find_node_index(nodes, request, tokens.prefix);
+        if (node_index < 0) {
+            if ((int) tokens.prefix.size() > options.max_cache_tokens ||
+                    !ensure_cache_capacity(
+                            memory,
+                            nodes,
+                            free_sequences,
+                            options,
+                            (int) tokens.prefix.size(),
+                            -1)) {
+                online_result result = run_uncached_request(
+                        context,
+                        memory,
+                        options,
+                        request,
+                        tokens,
+                        lora,
+                        request_seq,
+                        "online",
+                        "uncached_prefix_capacity_limit");
+                result.cache_nodes = (int) nodes.size();
+                result.cache_variants = count_variants(nodes);
+                result.physical_cache_tokens = count_cache_tokens(nodes);
+                results.push_back(result);
+                continue;
+            }
+
+            prefix_node node;
+            node.node_id = next_node_id++;
+            node.group_name = request.group_name;
+            node.context_id = request.context_id;
+            node.prefix_hash = request.common_prefix_hash;
+            node.prefix_tokens = tokens.prefix;
+            node.anchor_lora_id = request.lora_id;
+            node.last_access_index = request_index;
+
+            const llama_seq_id cache_seq = free_sequences.back();
+            free_sequences.pop_back();
+            const double build_bind_ms = bind_lora(context, lora);
+            const double prefix_start = now_ms();
+            if (!eval_tokens(context, tokens.prefix, cache_seq, 0, options.n_ubatch)) {
+                free_sequences.push_back(cache_seq);
+                online_result result = run_uncached_request(
+                        context,
+                        memory,
+                        options,
+                        request,
+                        tokens,
+                        lora,
+                        request_seq,
+                        "online",
+                        "anchor_build_failed_full_eval");
+                results.push_back(result);
+                continue;
+            }
+            const double prefix_ms = now_ms() - prefix_start;
+            node.anchor_seq_id = cache_seq;
+            node.variants.push_back({ request.lora_id, cache_seq, 0 });
+            nodes.push_back(std::move(node));
+            node_index = (int) nodes.size() - 1;
+
+            online_result result;
+            result.benchmark = "online";
+            result.request_id = request.request_id;
+            result.arrival_ms = request.arrival_ms;
+            result.user_id = request.user_id;
+            result.session_id = request.session_id;
+            result.app_name = request.app_name;
+            result.group_name = request.group_name;
+            result.context_id = request.context_id;
+            result.lora_id = request.lora_id;
+            result.lora_name = lora.logical_name;
+            result.mode = "build_exact_prefix_anchor";
+            result.node_id = nodes[node_index].node_id;
+            result.prefix_tokens = (int) tokens.prefix.size();
+            result.suffix_tokens = (int) tokens.suffix.size();
+            result.prompt_tokens = (int) tokens.full.size();
+            result.prefix_ms = prefix_ms;
+            result.lora_bind_ms = build_bind_ms;
+
+            llama_memory_seq_rm(memory, request_seq, -1, -1);
+            const double copy_start = now_ms();
+            llama_memory_seq_cp(
+                    memory,
+                    cache_seq,
+                    request_seq,
+                    0,
+                    (int) tokens.prefix.size());
+            result.prefix_ms += now_ms() - copy_start;
+            const double suffix_start = now_ms();
+            if (eval_tokens(
+                    context,
+                    tokens.suffix,
+                    request_seq,
+                    (int) tokens.prefix.size(),
+                    options.n_ubatch)) {
+                result.suffix_ms = now_ms() - suffix_start;
+                run_decode(
+                        context,
+                        request_seq,
+                        tokens.full.back(),
+                        (int) tokens.full.size(),
+                        options.n_predict,
+                        request_start,
+                        result);
+            }
+            llama_memory_seq_rm(memory, request_seq, -1, -1);
+            result.cache_nodes = (int) nodes.size();
+            result.cache_variants = count_variants(nodes);
+            result.physical_cache_tokens = count_cache_tokens(nodes);
+            results.push_back(result);
             continue;
         }
 
-        const int prefix_len =
-                common_prefix_len(prompt_tokens, node.prefix_tokens);
-        // 计算当前 prompt 和该 node 保存的 prefix_tokens 的公共前缀长度。
+        const int node_id = nodes[node_index].node_id;
+        nodes[node_index].last_access_index = request_index;
+        nodes[node_index].hit_count++;
+        prefix_variant * variant = find_variant(nodes[node_index], request.lora_id);
 
-        if (prefix_len > best_prefix_len) {             // 如果这个 node 匹配更长。
-            best_prefix_len = prefix_len;               // 更新最佳 prefix 长度。
-            best_node_id = node.node_id;                // 更新最佳 node id。
+        online_result result;
+        result.benchmark = "online";
+        result.request_id = request.request_id;
+        result.arrival_ms = request.arrival_ms;
+        result.user_id = request.user_id;
+        result.session_id = request.session_id;
+        result.app_name = request.app_name;
+        result.group_name = request.group_name;
+        result.context_id = request.context_id;
+        result.lora_id = request.lora_id;
+        result.lora_name = lora.logical_name;
+        result.node_id = node_id;
+        result.exact_prefix_hit = 1;
+        result.prefix_tokens = (int) tokens.prefix.size();
+        result.suffix_tokens = (int) tokens.suffix.size();
+        result.prompt_tokens = (int) tokens.full.size();
+
+        if (!variant) {
+            result.cross_lora_prefix_match = 1;
+            if (!ensure_cache_capacity(
+                        memory,
+                        nodes,
+                        free_sequences,
+                        options,
+                        (int) tokens.prefix.size(),
+                        node_id)) {
+                result = run_uncached_request(
+                        context,
+                        memory,
+                        options,
+                        request,
+                        tokens,
+                        lora,
+                        request_seq,
+                        "online",
+                        "cross_lora_prefix_match_no_variant_capacity");
+                result.node_id = node_id;
+                result.exact_prefix_hit = 1;
+                result.cross_lora_prefix_match = 1;
+                result.cache_nodes = (int) nodes.size();
+                result.cache_variants = count_variants(nodes);
+                result.physical_cache_tokens = count_cache_tokens(nodes);
+                results.push_back(result);
+                continue;
+            }
+
+            node_index = -1;
+            for (int index = 0; index < (int) nodes.size(); ++index) {
+                if (nodes[index].node_id == node_id) {
+                    node_index = index;
+                    break;
+                }
+            }
+            if (node_index < 0) continue;
+
+            const llama_seq_id child_cache_seq = free_sequences.back();
+            free_sequences.pop_back();
+            result.lora_bind_ms = bind_lora(context, lora);
+            const double prefix_start = now_ms();
+            if (!eval_tokens(
+                        context,
+                        tokens.prefix,
+                        child_cache_seq,
+                        0,
+                        options.n_ubatch)) {
+                free_sequences.push_back(child_cache_seq);
+                continue;
+            }
+            result.prefix_ms = now_ms() - prefix_start;
+
+            llama_kv_delta_probe_stats probe = {};
+            const bool probe_ok = llama_kv_seq_delta_probe(
+                    context,
+                    nodes[node_index].anchor_seq_id,
+                    child_cache_seq,
+                    0,
+                    (int) tokens.prefix.size(),
+                    &probe);
+            result.delta_candidate = probe_ok && probe.can_reuse_as_delta ? 1 : 0;
+            result.prefix_kv_cos = probe.kv_cos_avg;
+            result.prefix_kv_l2 = probe.kv_l2_avg;
+            result.mode = "build_cross_lora_full_prefix_variant";
+
+            nodes[node_index].variants.push_back({ request.lora_id, child_cache_seq, 0 });
+            variant = &nodes[node_index].variants.back();
+        } else {
+            result.same_lora_variant_hit = 1;
+            result.mode = "reuse_exact_prefix_same_lora";
+            variant->hit_count++;
+            result.lora_bind_ms = bind_lora(context, lora);
         }
+
+        llama_memory_seq_rm(memory, request_seq, -1, -1);
+        const double copy_start = now_ms();
+        llama_memory_seq_cp(
+                memory,
+                variant->cache_seq_id,
+                request_seq,
+                0,
+                (int) tokens.prefix.size());
+        result.prefix_ms += now_ms() - copy_start;
+
+        const double suffix_start = now_ms();
+        if (eval_tokens(
+                    context,
+                    tokens.suffix,
+                    request_seq,
+                    (int) tokens.prefix.size(),
+                    options.n_ubatch)) {
+            result.suffix_ms = now_ms() - suffix_start;
+            run_decode(
+                    context,
+                    request_seq,
+                    tokens.full.back(),
+                    (int) tokens.full.size(),
+                    options.n_predict,
+                    request_start,
+                    result);
+        }
+        llama_memory_seq_rm(memory, request_seq, -1, -1);
+        result.cache_nodes = (int) nodes.size();
+        result.cache_variants = count_variants(nodes);
+        result.physical_cache_tokens = count_cache_tokens(nodes);
+        results.push_back(result);
     }
 
-    result.node_id = best_node_id;                      // 记录命中的 node。
-    result.exact_prefix_len = best_prefix_len;          // 记录复用 prefix 长度。
-    result.suffix_len = (int) prompt_tokens.size() - best_prefix_len;
-    // 当前请求剩下需要单独处理的 suffix 长度。
-
-    result.exact_prefix_hit = best_node_id >= 0 && best_prefix_len > 0;
-    // 只要找到 node 且公共 prefix > 0，就认为命中。
-
-    return result;                                      // 返回路由结果。
+    final_nodes = nodes;
+    clear_lora(context);
+    llama_free(context);
+    return results;
 }
 
-// 根据 node_id 找到 online prefix node。
-// 找不到返回 nullptr。
-static const online_prefix_node * find_online_node(
-        const std::vector<online_prefix_node> & nodes, // 所有 online prefix node。
-        int node_id) {                                 // 要找的 node id。
-    for (const auto & node : nodes) {                  // 遍历 nodes。
-        if (node.node_id == node_id) {                 // id 匹配。
-            return &node;                              // 返回 node 地址。
-        }
-    }
+// =============================================================================
+// 7. Save results 保存结果
+// =============================================================================
 
-    return nullptr;                                    // 没找到。
-}
-
-// ========================  结果 ========================
-// 保存 online prefix tree 的状态。
-// 这个 CSV 用来画在线节点、命中次数、suffix 决策。
-static void save_online_prefix_delta_tree(
-        const std::vector<online_prefix_node> & nodes) {
+static void save_delta_results(
+        const std::string & output_dir,
+        const std::vector<delta_result> & results,
+        const std::vector<delta_layer_result> & layers) {
     std::filesystem::create_directories(output_dir);
 
-    const std::string path =
-            output_dir + "/online_prefix_delta_tree_summary.csv";
+    std::ofstream summary(output_dir + "/delta_prefix_probe.csv");
+    summary << "pair_name,group_name,context_id,anchor_request_id,child_request_id,"
+            << "anchor_lora_id,child_lora_id,anchor_lora_name,child_lora_name,"
+            << "prefix_tokens,status,memory_kind,probed_layers,skipped_recurrent_layers,"
+            << "can_encode_delta,kv_cos,kv_l2,anchor_eval_ms,child_eval_ms,probe_ms,"
+            << "delta_build_ms,delta_build_ok,full_kv_bytes,delta_q8_bytes,"
+            << "delta_scale_bytes,logical_saved_bytes,logical_saved_rate\n";
+    for (const auto & row : results) {
+        summary << csv_escape(row.pair_name) << ','
+                << csv_escape(row.group_name) << ','
+                << csv_escape(row.context_id) << ','
+                << row.anchor_request_id << ',' << row.child_request_id << ','
+                << row.anchor_lora_id << ',' << row.child_lora_id << ','
+                << csv_escape(row.anchor_lora_name) << ','
+                << csv_escape(row.child_lora_name) << ','
+                << row.prefix_tokens << ',' << csv_escape(row.status) << ','
+                << csv_escape(row.memory_kind) << ',' << row.probed_layers << ','
+                << row.skipped_recurrent_layers << ',' << row.can_encode_delta << ','
+                << row.kv_cos << ',' << row.kv_l2 << ','
+                << row.anchor_eval_ms << ',' << row.child_eval_ms << ','
+                << row.probe_ms << ',' << row.delta_build_ms << ','
+                << row.delta_build_ok << ',' << row.full_kv_bytes << ','
+                << row.delta_q8_bytes << ',' << row.delta_scale_bytes << ','
+                << row.logical_saved_bytes << ',' << row.logical_saved_rate << '\n';
+    }
 
-    std::ofstream fout(path);
+    std::ofstream layer_file(output_dir + "/delta_prefix_layers.csv");
+    layer_file << "pair_name,layer_id,k_cos,v_cos,kv_cos,k_l2,v_l2,kv_l2\n";
+    for (const auto & row : layers) {
+        layer_file << csv_escape(row.pair_name) << ',' << row.layer_id << ','
+                   << row.k_cos << ',' << row.v_cos << ',' << row.kv_cos << ','
+                   << row.k_l2 << ',' << row.v_l2 << ',' << row.kv_l2 << '\n';
+    }
+}
 
-    fout << "node_id,group_id,group_name,parent_node_id,delta_parent_node_id,"
-         << "cache_seq_id,prefix_len,hit_count,"
-         << "prefix_can_reuse,suffix_can_delta,should_open_new_branch,"
-         << "suffix_kv_cos,suffix_kv_l2,reuse_decision\n";
+static void save_online_results(
+        const std::string & output_dir,
+        const std::vector<online_result> & results) {
+    std::filesystem::create_directories(output_dir);
+    std::ofstream output(output_dir + "/online_request_results.csv");
+    output << "benchmark,request_id,arrival_ms,user_id,session_id,app_name,group_name,"
+           << "context_id,lora_id,lora_name,mode,node_id,exact_prefix_hit,"
+           << "same_lora_variant_hit,cross_lora_prefix_match,prefix_tokens,suffix_tokens,"
+           << "prompt_tokens,delta_candidate,prefix_kv_cos,prefix_kv_l2,lora_bind_ms,"
+           << "prefix_ms,suffix_ms,ttft_ms,decode_ms,total_ms,tps,cache_nodes,"
+           << "cache_variants,physical_cache_tokens\n";
+    for (const auto & row : results) {
+        output << csv_escape(row.benchmark) << ',' << row.request_id << ','
+               << row.arrival_ms << ',' << row.user_id << ',' << row.session_id << ','
+               << csv_escape(row.app_name) << ',' << csv_escape(row.group_name) << ','
+               << csv_escape(row.context_id) << ',' << row.lora_id << ','
+               << csv_escape(row.lora_name) << ',' << csv_escape(row.mode) << ','
+               << row.node_id << ',' << row.exact_prefix_hit << ','
+               << row.same_lora_variant_hit << ',' << row.cross_lora_prefix_match << ','
+               << row.prefix_tokens << ',' << row.suffix_tokens << ','
+               << row.prompt_tokens << ',' << row.delta_candidate << ','
+               << row.prefix_kv_cos << ',' << row.prefix_kv_l2 << ','
+               << row.lora_bind_ms << ',' << row.prefix_ms << ',' << row.suffix_ms << ','
+               << row.ttft_ms << ',' << row.decode_ms << ',' << row.total_ms << ','
+               << row.tps << ',' << row.cache_nodes << ',' << row.cache_variants << ','
+               << row.physical_cache_tokens << '\n';
+    }
+}
 
+static void save_tree_summary(
+        const std::string & output_dir,
+        const std::vector<prefix_node> & nodes) {
+    std::filesystem::create_directories(output_dir);
+    std::ofstream output(output_dir + "/online_prefix_tree.csv");
+    output << "node_id,group_name,context_id,prefix_hash,prefix_tokens,"
+           << "anchor_lora_id,node_hit_count,last_access_index,variant_lora_id,"
+           << "variant_seq_id,variant_hit_count\n";
     for (const auto & node : nodes) {
-        fout << node.node_id << ","
-             << node.group_id << ","
-             << node.group_name << ","
-             << node.parent_node_id << ","
-             << node.delta_parent_node_id << ","
-             << node.cache_seq_id << ","
-             << node.prefix_len << ","
-             << node.hit_count << ","
-             << node.prefix_can_reuse << ","
-             << node.suffix_can_delta << ","
-             << node.should_open_new_branch << ","
-             << node.suffix_kv_cos << ","
-             << node.suffix_kv_l2 << ","
-             << node.reuse_decision << "\n";
-    }
-
-    fprintf(stderr, "saved online prefix delta tree to %s\n", path.c_str());
-}
-
-// ===============================
-// 7. 实验运行函数
-// ===============================
-// ======================== baseline ========================
-// baseline 路径：不复用任何 Prefix KV。
-// 每个请求都绑定对应 LoRA，然后把完整 prompt 从头到尾 eval 一遍。
-// 这条路径用于和 online prefix reuse 对比 TTFT / total / TPS。
-static sample_result run_baseline_request(
-        llama_context * ctx,                          // llama.cpp context，包含模型状态和 KV cache。
-        const std::vector<lora_node_runtime> & lora_nodes, // 所有 LoRA runtime 节点。
-        const std::vector<lora_group_runtime> & groups,    // 所有 LoRA group。
-        const request_item & req,                    // 当前请求信息。
-        const request_tokens & toks,                 // 当前请求 tokenize 后的 token。
-        int request_index,                           // 当前请求编号，用作 seq id。
-        int n_predict) {                             // decode 生成 token 数。
-    sample_result r;                                 // 保存本次实验结果。
-
-    r.repeat_id = req.repeat_id;                     // 记录第几轮重复实验。
-    r.context_tag = req.context_tag;                 // 记录 ctx_50 / ctx_100 等上下文标签。
-
-    const lora_group_runtime * group =
-            find_group(groups, toks.routed_group_id);
-    // 根据 token 路由结果找到当前请求所属 group。
-
-    r.mode = "baseline_no_group_kv_reuse";           // 记录实验模式：不复用 KV。
-    r.group_name = group ? group->group_name : "unknown"; // 记录 group 名称。
-    r.leaf_lora_id = req.leaf_lora_id;               // 记录当前请求使用的 LoRA id。
-    r.lora_name = lora_nodes[req.leaf_lora_id].short_name; // 记录 LoRA 短名称。
-    r.n_prompt_tokens = (int) toks.full.size();      // 记录 prompt token 数。
-    r.n_prefix_tokens = 0;                           // baseline 不复用 prefix，所以为 0。
-    r.n_suffix_tokens = (int) toks.full.size();      // baseline 中整段 prompt 都算作 suffix。
-    r.n_predict = n_predict;                         // 记录 decode token 数。
-
-    if (r.n_prompt_tokens > 0) {                     // 避免除以 0。
-        r.prefix_reuse_rate =
-                (double) r.n_prefix_tokens / (double) r.n_prompt_tokens;
-        // baseline prefix 复用比例 = 0。
-
-        r.suffix_delta_rate =
-                (double) r.n_suffix_tokens / (double) r.n_prompt_tokens;
-        // baseline suffix 比例 = 1。
-    }
-
-    const llama_seq_id seq_id = request_index;       // baseline 中每个 request 用自己的 seq。
-    const double gpu_start = get_gpu_used_mb();      // 记录请求开始前 GPU 显存。
-    double gpu_peak = gpu_start;                     // 初始化显存峰值。
-
-    const double t0 = now_ms();                      // 记录整个请求开始时间。
-
-    r.lora_bind_ms =
-            bind_lora_path(ctx, lora_nodes, req.leaf_lora_id);
-    // 绑定当前请求对应 LoRA，并记录耗时。
-
-    const double suffix0 = now_ms();                 // 记录完整 prompt eval 开始时间。
-
-    eval_tokens(
-            ctx,                                     // 当前 context。
-            toks.full,                               // 完整 prompt token。
-            seq_id,                                  // 写入当前 seq。
-            0,                                       // 从 position 0 开始。
-            true);                                   // 最后一个 token 输出 logits。
-
-    const double suffix1 = now_ms();                 // 记录完整 prompt eval 结束时间。
-
-    r.suffix_ms = suffix1 - suffix0;                 // baseline 中 suffix_ms 实际等于完整 prefill 时间。
-
-    const llama_token repeated = toks.full.back();   // 为了做固定 decode，用 prompt 最后一个 token 反复 decode。
-
-    const double decode0 = now_ms();                 // decode 阶段开始时间。
-
-    for (int i = 0; i < n_predict; i++) {            // 循环生成 n_predict 个 token。
-        const int pos = (int) toks.full.size() + i;  // 当前 decode token 的 position。
-
-        decode_one(ctx, repeated, seq_id, pos);      // 执行一个 token 的 decode。
-
-        if (i == 0) {                                // 第一个 decode 完成时就是 TTFT。
-            r.ttft_ms = now_ms() - t0;               // TTFT = 从请求开始到第一个 token 完成。
+        for (const auto & variant : node.variants) {
+            output << node.node_id << ',' << csv_escape(node.group_name) << ','
+                   << csv_escape(node.context_id) << ',' << node.prefix_hash << ','
+                   << node.prefix_tokens.size() << ',' << node.anchor_lora_id << ','
+                   << node.hit_count << ',' << node.last_access_index << ','
+                   << variant.lora_id << ',' << variant.cache_seq_id << ','
+                   << variant.hit_count << '\n';
         }
-
-        gpu_peak = std::max(gpu_peak, get_gpu_used_mb()); // 更新 GPU 显存峰值。
     }
-
-    const double decode1 = now_ms();                 // decode 阶段结束时间。
-
-    r.decode_ms = decode1 - decode0;                 // decode 总耗时。
-    r.total_ms = decode1 - t0;                       // 请求总耗时。
-    r.tps = n_predict / std::max(0.001, r.decode_ms / 1000.0);
-    // TPS = 生成 token 数 / decode 秒数。
-
-    r.gpu_start_mb = gpu_start;                      // 保存开始显存。
-    r.gpu_peak_mb = gpu_peak;                        // 保存峰值显存。
-    r.gpu_peak_delta_mb = gpu_peak - gpu_start;      // 保存显存增量。
-
-    return r;                                        // 返回实验结果。
 }
 
+// =============================================================================
+// 8. Main 主函数
+// =============================================================================
 
-// online build 路径：当前请求没有命中已有 prefix node，
-// 所以需要把完整 prompt eval 一遍，并把它作为新的 prefix node 存进 cache_seq_id。
-// 后续相似请求命中这个 node 后，就可以复制它的 Prefix KV。
-static sample_result run_online_build_prefix_request(
-        llama_context * ctx,                          // llama.cpp context。
-        llama_memory_t mem,                           // llama.cpp memory/KV 管理对象。
-        const std::vector<lora_node_runtime> & lora_nodes, // LoRA runtime 节点。
-        const std::vector<lora_group_runtime> & groups,    // LoRA group。
-        const request_item & req,                     // 当前请求。
-        const request_tokens & toks,                  // 当前请求 token。
-        llama_seq_id cache_seq_id,                    // 用来保存 prefix KV 的 seq。
-        llama_seq_id request_seq_id,                  // 当前请求实际 decode 使用的 seq。
-        int node_id,                                  // 新建 online prefix node id。
-        int n_predict) {                              // decode token 数。
-    sample_result r;                                  // 保存实验结果。
+int main(int argc, char ** argv) {
+    std::setlocale(LC_NUMERIC, "C");
 
-    r.repeat_id = req.repeat_id;                      // 记录 repeat id。
-    r.context_tag = req.context_tag;                  // 记录上下文标签。
-
-    const lora_group_runtime * group =
-            find_group(groups, toks.routed_group_id); // 找到当前请求所属 group。
-
-    r.mode = "online_prefix_build";                   // 记录模式：在线建 prefix node。
-    r.group_name = group ? group->group_name : "unknown"; // group 名称。
-    r.lora_name = lora_nodes[req.leaf_lora_id].short_name; // LoRA 名称。
-    r.leaf_lora_id = req.leaf_lora_id;                // LoRA id。
-    r.online_node_id = node_id;                       // 当前新建 node id。
-    r.exact_prefix_hit = 0;                           // 建节点时不算命中已有 prefix。
-
-    r.routed_group_id = toks.routed_group_id;         // 记录路由 group。
-    r.reuse_decision = "create_prefix_node";          // 决策：创建 prefix node。
-
-    r.n_prompt_tokens = (int) toks.full.size();       // prompt token 数。
-    r.n_prefix_tokens = 0;                            // 建节点时没有复用 prefix。
-    r.n_suffix_tokens = (int) toks.full.size();       // 整段 prompt 都需要 eval。
-    r.n_predict = n_predict;                          // decode token 数。
-
-    if (r.n_prompt_tokens > 0) {                      // 避免除 0。
-        r.prefix_reuse_rate = 0.0;                    // 没有复用 prefix。
-        r.suffix_delta_rate = 1.0;                    // 整段都算作需要计算。
+    experiment_options options;
+    if (!parse_options(argc, argv, options)) {
+        return argc > 1 ? 1 : 0;
     }
 
-    const double gpu_start = get_gpu_used_mb();       // 记录开始显存。
-    double gpu_peak = gpu_start;                      // 初始化峰值显存。
-
-    const double t0 = now_ms();                       // 请求开始时间。
-
-    clear_lora(ctx);                                  // 建 prefix anchor 时先清空 LoRA。
-    // 这里设计含义：prefix anchor 先按 base model 写入 cache_seq_id。
-    // 后面请求命中后，再绑定对应 LoRA 处理 suffix / decode。
-
-    const double prefix0 = now_ms();                  // prefix build 开始时间。
-
-    eval_tokens(
-            ctx,                                      // 当前 context。
-            toks.full,                                // 完整 prompt token。
-            cache_seq_id,                             // 写入 prefix cache seq。
-            0,                                        // 从 position 0 开始。
-            false);                                   // 建 prefix 时不需要 logits。
-
-    const double prefix1 = now_ms();                  // prefix build 结束时间。
-
-    r.prefix_ms = prefix1 - prefix0;                  // 记录建 prefix KV 耗时。
-
-    llama_memory_seq_cp(
-            mem,                                      // memory/KV 管理对象。
-            cache_seq_id,                             // 源 seq：prefix cache。
-            request_seq_id,                           // 目标 seq：当前请求。
-            0,                                        // 从 position 0 开始复制。
-            (int) toks.full.size());                  // 复制完整 prompt 长度。
-    // 建节点请求本身也要 decode，所以把 cache_seq_id 的 KV 复制到 request_seq_id。
-
-    r.lora_bind_ms =
-            bind_lora_path(ctx, lora_nodes, req.leaf_lora_id);
-    // 绑定当前请求 LoRA。
-
-    const llama_token repeated = toks.full.back();    // 固定 decode token。
-
-    const double decode0 = now_ms();                  // decode 开始时间。
-
-    for (int i = 0; i < n_predict; i++) {             // decode n_predict 个 token。
-        const int pos = (int) toks.full.size() + i;   // 当前 decode position。
-
-        decode_one(ctx, repeated, request_seq_id, pos);// decode 一个 token。
-
-        if (i == 0) {                                 // 第一个 token 完成。
-            r.ttft_ms = now_ms() - t0;                // 记录 TTFT。
-        }
-
-        gpu_peak = std::max(gpu_peak, get_gpu_used_mb()); // 更新显存峰值。
-    }
-
-    const double decode1 = now_ms();                  // decode 结束时间。
-
-    r.decode_ms = decode1 - decode0;                  // decode 耗时。
-    r.total_ms = decode1 - t0;                        // 总耗时。
-    r.tps = n_predict / std::max(0.001, r.decode_ms / 1000.0); // decode TPS。
-    r.gpu_start_mb = gpu_start;                       // 开始显存。
-    r.gpu_peak_mb = gpu_peak;                         // 峰值显存。
-    r.gpu_peak_delta_mb = gpu_peak - gpu_start;       // 显存增量。
-
-    return r;                                         // 返回结果。
-}
-
-
-
-// online prefix reuse 路径：
-// 1. 从已有 online prefix node 复制 Prefix KV 到当前 request seq。
-// 2. 绑定当前 LoRA。
-// 3. 对不同的 suffix token 重新 eval，写入 suffix KV。
-// 4. decode n_predict 个 token。
-//
-// 当前实验主要收益来自这条路径。
-static sample_result run_online_prefix_reuse_request(
-        llama_context * ctx,                          // llama.cpp context。
-        llama_memory_t mem,                           // memory/KV 管理对象。
-        const std::vector<lora_node_runtime> & lora_nodes, // LoRA runtime 节点。
-        const std::vector<lora_group_runtime> & groups,    // LoRA group。
-        const online_prefix_node & node,              // 命中的 online prefix node。
-        const request_item & req,                     // 当前请求。
-        const request_tokens & toks,                  // 当前请求 token。
-        llama_seq_id request_seq_id,                  // 当前请求 seq。
-        int matched_prefix_len,                       // 命中的 prefix token 长度。
-        int n_predict,                                // decode token 数。
-        double kv_mb_per_token) {                     // 每 token KV 估算大小。
-    sample_result r;                                  // 保存实验结果。
-
-    r.repeat_id = req.repeat_id;                      // repeat id。
-    r.context_tag = req.context_tag;                  // 上下文标签。
-
-    const lora_group_runtime * group =
-            find_group(groups, toks.routed_group_id); // 找到所属 group。
-
-    r.mode = "online_prefix_reuse";                   // 记录模式：在线 prefix 复用。
-    r.group_name = group ? group->group_name : "unknown"; // group 名称。
-    r.lora_name = lora_nodes[req.leaf_lora_id].short_name; // LoRA 名称。
-    r.leaf_lora_id = req.leaf_lora_id;                // LoRA id。
-
-    r.routed_group_id = toks.routed_group_id;         // 路由 group id。
-    r.reuse_decision = "exact_prefix_reuse_suffix_recompute";
-    // 当前路径含义：prefix 直接复用，suffix 重新计算。
-
-    r.online_node_id = node.node_id;                  // 命中的 node id。
-    r.exact_prefix_hit = 1;                           // 表示命中 prefix。
-
-    r.n_prompt_tokens = (int) toks.full.size();       // prompt token 数。
-    r.n_prefix_tokens = matched_prefix_len;           // 复用 prefix token 数。
-    r.n_suffix_tokens = (int) toks.full.size() - matched_prefix_len;
-    // suffix token 数 = 总长度 - prefix 长度。
-    r.n_predict = n_predict;                          // decode token 数。
-
-    if (r.n_prompt_tokens > 0) {                      // 避免除 0。
-        r.prefix_reuse_rate =
-                (double) r.n_prefix_tokens / (double) r.n_prompt_tokens;
-        // prefix 复用比例。
-
-        r.suffix_delta_rate =
-                (double) r.n_suffix_tokens / (double) r.n_prompt_tokens;
-        // suffix 占比。
-    }
-
-    r.estimated_saved_kv_mb =
-            (double) matched_prefix_len * kv_mb_per_token;
-    // 估算节省的 KV = 复用 prefix token 数 * 每 token KV 大小。
-
-    const double gpu_start = get_gpu_used_mb();       // 开始显存。
-    double gpu_peak = gpu_start;                      // 峰值显存。
-
-    const double t0 = now_ms();                       // 请求开始时间。
-
-    const double prefix0 = now_ms();                  // prefix copy 开始。
-
-    llama_memory_seq_cp(
-            mem,                                      // memory/KV 管理对象。
-            node.cache_seq_id,                        // 源 seq：prefix node 的 cache seq。
-            request_seq_id,                           // 目标 seq：当前请求 seq。
-            0,                                        // 从 position 0 开始。
-            matched_prefix_len);                      // 复制 matched_prefix_len 个 token 的 KV。
-
-    const double prefix1 = now_ms();                  // prefix copy 结束。
-
-    r.prefix_ms = prefix1 - prefix0;                  // prefix copy 耗时。
-
-    r.lora_bind_ms =
-            bind_lora_path(ctx, lora_nodes, req.leaf_lora_id);
-    // 绑定当前请求的 LoRA。
-
-    std::vector<llama_token> suffix(
-            toks.full.begin() + matched_prefix_len,
-            toks.full.end());
-    // 取出不同的 suffix token。
-    // 这些 token 没有被 prefix KV 覆盖，需要重新 eval。
-
-    const double suffix0 = now_ms();                  // suffix eval 开始。
-
-    eval_tokens(
-            ctx,                                      // 当前 context。
-            suffix,                                   // suffix token。
-            request_seq_id,                           // 写入当前请求 seq。
-            matched_prefix_len,                       // suffix 的 position 从 prefix_len 开始。
-            true);                                    // 最后一个 suffix token 输出 logits。
-
-    const double suffix1 = now_ms();                  // suffix eval 结束。
-
-    r.suffix_ms = suffix1 - suffix0;                  // suffix eval 耗时。
-
-    const llama_token repeated =
-            suffix.empty() ? toks.full.back() : suffix.back();
-    // decode 时重复使用最后一个 token。
-    // 如果 suffix 为空，就用完整 prompt 最后一个 token。
-
-    const double decode0 = now_ms();                  // decode 开始。
-
-    for (int i = 0; i < n_predict; i++) {             // decode n_predict 个 token。
-        const int pos = (int) toks.full.size() + i;   // 当前 decode position。
-
-        decode_one(ctx, repeated, request_seq_id, pos);// decode 一个 token。
-
-        if (i == 0) {                                 // 第一个 token 完成。
-            r.ttft_ms = now_ms() - t0;                // TTFT。
-        }
-
-        gpu_peak = std::max(gpu_peak, get_gpu_used_mb()); // 更新显存峰值。
-    }
-
-    const double decode1 = now_ms();                  // decode 结束。
-
-    r.decode_ms = decode1 - decode0;                  // decode 耗时。
-    r.total_ms = decode1 - t0;                        // 请求总耗时。
-    r.tps = n_predict / std::max(0.001, r.decode_ms / 1000.0); // TPS。
-    r.gpu_start_mb = gpu_start;                       // 开始显存。
-    r.gpu_peak_mb = gpu_peak;                         // 峰值显存。
-    r.gpu_peak_delta_mb = gpu_peak - gpu_start;       // 显存增量。
-
-    return r;                                         // 返回结果。
-}
-
-
-// suffix delta materialize 路径：
-// 目标是尝试跳过 suffix eval，改用 anchor KV + delta 恢复 suffix KV。
-// 当前这条路径仍是实验性路径。
-// 如果 llama_kv_seq_delta_materialize() 失败，则提前返回，materialize_timed=0。
-// 只有 materialize 成功并且后续 decode 完成，materialize_timed 才会置为 1。
-static sample_result run_online_suffix_delta_materialize_request(
-        llama_context * ctx,                          // llama.cpp context。
-        llama_memory_t mem,                           // memory/KV 管理对象。
-        const std::vector<lora_node_runtime> & lora_nodes, // LoRA runtime 节点。
-        const std::vector<lora_group_runtime> & groups,    // LoRA group。
-        const online_prefix_node & anchor_node,       // 命中的 anchor prefix node。
-        const request_item & req,                     // 当前请求。
-        const request_tokens & toks,                  // 当前请求 token。
-        llama_seq_id child_full_seq_id,               // 已经完整算过 suffix 的 child seq。
-        llama_seq_id request_seq_id,                  // materialize 目标 seq。
-        int matched_prefix_len,                       // prefix 长度。
-        int n_predict,                                // decode token 数。
-        double kv_mb_per_token) {                     // 每 token KV 估算大小。
-    sample_result r;                                  // 保存结果。
-
-    r.repeat_id = req.repeat_id;                      // repeat id。
-    r.context_tag = req.context_tag;                  // 上下文标签。
-    r.materialize_timed = 0;                          // 默认 materialize 未完成真实计时。
-
-    const lora_group_runtime * group =
-            find_group(groups, toks.routed_group_id); // 找到所属 group。
-
-    r.mode = "online_suffix_delta_materialize";       // 记录模式。
-    r.group_name = group ? group->group_name : "unknown"; // group 名称。
-    r.lora_name = lora_nodes[req.leaf_lora_id].short_name; // LoRA 名称。
-    r.leaf_lora_id = req.leaf_lora_id;                // LoRA id。
-
-    r.routed_group_id = toks.routed_group_id;         // group id。
-    r.reuse_decision = "prefix_reuse_suffix_delta_materialize";
-    // 当前路径目标：prefix 复用 + suffix delta materialize。
-
-    r.online_node_id = anchor_node.node_id;           // anchor node id。
-    r.exact_prefix_hit = 1;                           // 命中 prefix。
-
-    r.n_prompt_tokens = (int) toks.full.size();       // prompt token 数。
-    r.n_prefix_tokens = matched_prefix_len;           // prefix token 数。
-    r.n_suffix_tokens = (int) toks.full.size() - matched_prefix_len;
-    // suffix token 数。
-    r.n_predict = n_predict;                          // decode token 数。
-
-    if (r.n_prompt_tokens > 0) {                      // 避免除 0。
-        r.prefix_reuse_rate =
-                (double) r.n_prefix_tokens / (double) r.n_prompt_tokens;
-        // prefix 复用比例。
-
-        r.suffix_delta_rate =
-                (double) r.n_suffix_tokens / (double) r.n_prompt_tokens;
-        // suffix 占比。
-    }
-
-    r.estimated_saved_kv_mb =
-            (double) matched_prefix_len * kv_mb_per_token;
-    // 估算 prefix 复用节省的 KV 大小。
-
-    const double gpu_start = get_gpu_used_mb();       // 记录开始显存。
-    double gpu_peak = gpu_start;                      // 初始化显存峰值。
-
-    const double t0 = now_ms();                       // 请求开始时间。
-
-    const double prefix0 = now_ms();                  // prefix copy 开始。
-
-    llama_memory_seq_cp(
-            mem,                                      // memory/KV 管理对象。
-            anchor_node.cache_seq_id,                 // 源 seq：anchor prefix cache。
-            request_seq_id,                           // 目标 seq：当前 materialize 请求。
-            0,                                        // 从 position 0 开始。
-            matched_prefix_len);                      // 复制 prefix 范围。
-
-    const double prefix1 = now_ms();                  // prefix copy 结束。
-
-    r.prefix_ms = prefix1 - prefix0;                  // prefix copy 耗时。
-
-    r.lora_bind_ms =
-            bind_lora_path(ctx, lora_nodes, req.leaf_lora_id);
-    // 绑定当前请求 LoRA。
-
-    llama_kv_delta_materialize_stats delta_stats = {};
-    // materialize API 返回的统计信息，包括 delta 大小、写回 KV 大小、失败状态等。
-
-    const double delta0 = now_ms();                   // delta materialize 开始。
-
-    const bool ok =
-            llama_kv_seq_delta_materialize(
-                    ctx,                              // 当前 context。
-                    anchor_node.cache_seq_id,         // anchor seq，提供 KV_A。
-                    child_full_seq_id,                // child full seq，提供已算好的 KV_B。
-                    request_seq_id,                   // 目标 seq，把恢复出的 KV 写到这里。
-                    matched_prefix_len,               // suffix 起点。
-                    (int) toks.full.size(),           // suffix 终点，也就是 prompt 总长度。
-                    &delta_stats);                    // 输出统计信息。
-
-    const double delta1 = now_ms();                   // delta materialize 结束。
-
-    r.delta_materialize_ms = delta1 - delta0;         // 记录 materialize 耗时。
-    r.suffix_delta_materialized = ok ? 1 : 0;         // 是否 materialize 成功。
-    r.materialize_timed = 0;                          // 还没 decode 完，不算完整计时成功。
-
-    r.delta_fp32_mb =
-            (double) delta_stats.delta_fp32_bytes / 1024.0 / 1024.0;
-    // 记录 delta 的 FP32 等价大小。
-
-    r.materialized_kv_mb =
-            (double) delta_stats.materialized_kv_bytes / 1024.0 / 1024.0;
-    // 记录写回目标 seq 的 KV 大小。
-
-    if (!ok) {                                       // 如果 materialize 失败。
-        fprintf(stderr,
-                "suffix delta materialize failed: request_seq=%d child_full_seq=%d status=%s\n",
-                request_seq_id,
-                child_full_seq_id,
-                delta_stats.status);
-        return r;                                    // 提前返回，materialize_timed 仍为 0。
-    }
-
-    r.suffix_ms = 0.0;
-    // 如果 materialize 成功，suffix KV 已经由 delta 恢复并写回，
-    // 所以这里不再 eval suffix，suffix_ms 记为 0。
-
-    const llama_token repeated = toks.full.back();   // 固定 decode token。
-
-    const double decode0 = now_ms();                 // decode 开始。
-
-    for (int i = 0; i < n_predict; i++) {            // decode n_predict 个 token。
-        const int pos = (int) toks.full.size() + i;  // 当前 decode position。
-
-        decode_one(ctx, repeated, request_seq_id, pos);// decode 一个 token。
-
-        if (i == 0) {                                // 第一个 token 完成。
-            r.ttft_ms = now_ms() - t0;               // TTFT。
-        }
-
-        gpu_peak = std::max(gpu_peak, get_gpu_used_mb()); // 更新显存峰值。
-    }
-
-    const double decode1 = now_ms();                 // decode 结束。
-
-    r.decode_ms = decode1 - decode0;                 // decode 耗时。
-    r.total_ms = decode1 - t0;                       // 总耗时。
-    r.tps = n_predict / std::max(0.001, r.decode_ms / 1000.0); // TPS。
-    r.materialize_timed = 1;                         // materialize + decode 完整跑通。
-    r.gpu_start_mb = gpu_start;                      // 开始显存。
-    r.gpu_peak_mb = gpu_peak;                        // 峰值显存。
-    r.gpu_peak_delta_mb = gpu_peak - gpu_start;      // 显存增量。
-
-    return r;                                        // 返回结果。
-}
-
-// ===============================
-// 8. 保存实验结果
-// ===============================
-static void save_results(
-        const std::vector<sample_result> & results) {
-    std::filesystem::create_directories(output_dir);
-
-    const std::string path =
-            output_dir + "/group_node_kv_lora_tree_summary.csv";
-
-    std::ofstream fout(path);
-
-    fout << "repeat_id,context_tag,materialize_timed,"
-        << "suffix_delta_materialized,delta_materialize_ms,delta_fp32_mb,materialized_kv_mb,"
-        << "mode,group_name,lora_name,leaf_lora_id,"
-        << "routed_group_id,reuse_decision,"
-        << "online_node_id,exact_prefix_hit,"
-        << "n_prompt_tokens,n_prefix_tokens,n_suffix_tokens,"
-        << "prefix_reuse_rate,suffix_delta_rate,n_predict,"
-        << "route_ms,prefix_ms,lora_bind_ms,suffix_ms,"
-        << "ttft_ms,decode_ms,total_ms,tps,"
-        << "gpu_start_mb,gpu_peak_mb,gpu_peak_delta_mb,"
-        << "estimated_saved_kv_mb\n";
-
-    for (const auto & r : results) {
-        fout << r.repeat_id << ","
-            << r.context_tag << ","
-            << r.materialize_timed << ","
-            << r.suffix_delta_materialized << ","
-            << r.delta_materialize_ms << ","
-            << r.delta_fp32_mb << ","
-            << r.materialized_kv_mb << ","
-             << r.mode << ","
-             << r.group_name << ","
-             << r.lora_name << ","
-             << r.leaf_lora_id << ","
-             << r.routed_group_id << ","
-             << r.reuse_decision << ","
-             << r.online_node_id << ","
-             << r.exact_prefix_hit << ","
-             << r.n_prompt_tokens << ","
-             << r.n_prefix_tokens << ","
-             << r.n_suffix_tokens << ","
-             << r.prefix_reuse_rate << ","
-             << r.suffix_delta_rate << ","
-             << r.n_predict << ","
-             << r.route_ms << ","
-             << r.prefix_ms << ","
-             << r.lora_bind_ms << ","
-             << r.suffix_ms << ","
-             << r.ttft_ms << ","
-             << r.decode_ms << ","
-             << r.total_ms << ","
-             << r.tps << ","
-             << r.gpu_start_mb << ","
-             << r.gpu_peak_mb << ","
-             << r.gpu_peak_delta_mb << ","
-             << r.estimated_saved_kv_mb << "\n";
-    }
-
-    fprintf(stderr, "saved results to %s\n", path.c_str());
-}
-
-
-
-// ==========================================
-// 第 4 部分：main 主流程
-// 作用：
-// 1. 加载 Qwen2.5 base model。
-// 2. 加载多个 LoRA adapter。
-// 3. 构造长上下文多 LoRA 请求。
-// 4. 先跑 KV delta probe，判断哪些 pair 适合 delta。
-// 5. 跑 baseline，也就是完全不复用 KV。
-// 6. 跑 online prefix tree，也就是 prefix KV 复用主线。
-// 7. 尝试 suffix delta materialize 实验路径。
-// 8. 保存 CSV，交给 Python 画图。
-// ==========================================
-
-
-int main() {
-    std::setlocale(LC_NUMERIC, "C");  // 设置数字格式区域为 C，保证小数点使用 "."
-    
-    // Qwen3.5-4B
-    // const std::string model_path = "D:/ecnu_experiment/Model/Qwen3.5-4B-gguf/Qwen3.5-4B-BF16.gguf";
-    // Qwen2.5-1.5B
-    const std::string model_path = "D:/ecnu_experiment/Model/Qwen2.5-1.5B-gguf/Qwen2.5-1.5B-Instruct-f16.gguf";
-    const int ngl = 99;          // 模型多少层放到 GPU 上
-    const int n_ctx = 16384;     // llama.cpp context 的最大上下文长度，决定 KV cache 可容纳的 token 数
-    const int n_predict = 32;    // 每条请求后续 decode 生成多少个 token，用来测 TTFT / TPS。
-
-    ggml_backend_load_all();     // 加载所有可用 ggml backend，例如 CPU / CUDA。
-    llama_model_params model_params = llama_model_default_params();  // 获取默认模型加载参数。
-    model_params.n_gpu_layers = ngl;    // 设置 GPU offload 层数。
-
-    // 从 GGUF 文件加载 base model
-    llama_model * model = llama_model_load_from_file(model_path.c_str(), model_params); 
-    if (model == nullptr) {      // 如果模型加载失败，打印错误并退出。
-        fprintf(stderr, "failed to load model\n");
+    const std::string delta_request_path =
+            options.workload_dir + "/delta/delta_requests.jsonl";
+    const std::string delta_pair_path =
+            options.workload_dir + "/delta/delta_pairs.jsonl";
+    const std::string grouped_request_path =
+            options.workload_dir + "/grouped/grouped_requests.jsonl";
+
+    std::vector<lora_runtime> lora_list = load_lora_config(options.lora_config_path);
+    if (lora_list.empty()) {
+        fprintf(stderr, "no LoRA configuration loaded\n");
         return 1;
     }
-    // 从模型中获取 vocab，后续 tokenize prompt 时需要用
+
+    ggml_backend_load_all();
+    llama_model_params model_params = llama_model_default_params();
+    model_params.n_gpu_layers = options.n_gpu_layers;
+    llama_model * model = llama_model_load_from_file(
+            options.model_path.c_str(),
+            model_params);
+    if (!model) {
+        fprintf(stderr, "failed to load model: %s\n", options.model_path.c_str());
+        return 1;
+    }
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
-    // 是否只跑纯 Transformer（不加 LoRA） true是，false不是
-    const bool pure_transformer_probe_only = false;
-    if (pure_transformer_probe_only) { // 如果只做纯模型 KV probe
-        fprintf(stderr, "\n===== pure transformer KV delta probe only =====\n");  // 打印当前模式
-        std::vector<kv_delta_probe_result> probe_results; // 保存 probe 结果
-
-        // 创建 context 参数
-        llama_context_params ctx_params = llama_context_default_params();
-        ctx_params.n_ctx = n_ctx; // 设置上下文长度。
-        ctx_params.n_batch = 256; // 设置 batch token 数。
-        ctx_params.n_ubatch = 64; // 设置 micro-batch token 数。
-        ctx_params.n_seq_max = 1024; // 设置最多同时使用的 seq 数量。
-        ctx_params.no_perf = true;// 关闭性能统计，减少额外输出。
-        ctx_params.kv_unified = true; // 使用 unified KV buffer，保证 seq_cp 等 full KV 操作可用。
-
-        // 根据模型和 context 参数创建 llama context
-        llama_context * ctx = llama_init_from_model(model, ctx_params);
-        if (ctx == nullptr) { // 如果 context 创建失败，释放 model 并退出。
-            fprintf(stderr, "failed to create pure transformer probe context\n");
-            llama_model_free(model);
-            return 1;
+    std::unordered_map<int, lora_runtime *> loaded_loras;
+    for (auto & lora : lora_list) {
+        if (lora.adapter_path.empty()) {
+            fprintf(stderr,
+                    "skip LoRA %d (%s): actual_adapter_path is empty\n",
+                    lora.lora_id,
+                    lora.logical_name.c_str());
+            continue;
         }
+        lora.adapter = llama_adapter_lora_init(model, lora.adapter_path.c_str());
+        if (!lora.adapter) {
+            fprintf(stderr,
+                    "skip LoRA %d (%s): failed to load %s\n",
+                    lora.lora_id,
+                    lora.logical_name.c_str(),
+                    lora.adapter_path.c_str());
+            continue;
+        }
+        loaded_loras[lora.lora_id] = &lora;
+    }
 
-        // sanity case：两个 prompt 完全相同，理论上 KV 应该高度一致。
-        probe_results.push_back(
-                run_kv_delta_probe_pair(
-                        ctx,
-                        vocab,
-                        "sanity",
-                        "same_prompt_monkey",
-                        "You are an animal introduction expert. Please introduce the characteristics of monkey.",
-                        "You are an animal introduction expert. Please introduce the characteristics of monkey.",
-                        0,
-                        1));
-
-        // same prefix case：prompt 前缀相同，但最后实体 monkey / tiger 不同。
-        probe_results.push_back(
-                run_kv_delta_probe_pair(
-                        ctx,
-                        vocab,
-                        "same_prefix_no_lora",
-                        "same_prefix_monkey_tiger_no_lora",
-                        "You are an animal introduction expert. Please introduce the characteristics of monkey.",
-                        "You are an animal introduction expert. Please introduce the characteristics of tiger.",
-                        2,
-                        3));
-
-        // mobile-like case：共享同一篇文章，只是最后任务 summarize / rewrite 不同。
-        probe_results.push_back(
-                run_kv_delta_probe_pair(
-                        ctx,
-                        vocab,
-                        "mobile_like",
-                        "same_article_summary_vs_rewrite",
-                        "You are a document assistant. Article: Tigers are large cats native to Asia. They have orange fur with black stripes. Tigers are solitary hunters and usually live in forests, grasslands, and wetlands. They are strong swimmers and use stealth to approach prey. Please summarize this article.",
-                        "You are a document assistant. Article: Tigers are large cats native to Asia. They have orange fur with black stripes. Tigers are solitary hunters and usually live in forests, grasslands, and wetlands. They are strong swimmers and use stealth to approach prey. Please rewrite this article.",
-                        4,
-                        5));
-
-        // product case：共享同一段商品描述，只是最后 summarize / optimize 不同。
-        probe_results.push_back(
-                run_kv_delta_probe_pair(
-                        ctx,
-                        vocab,
-                        "mobile_like",
-                        "same_product_summary_vs_optimize",
-                        "You are a product assistant. Article: The product is a portable smart camera with night vision, long battery life, local storage, and wireless connection. It is designed for home security and travel monitoring. Please summarize this article.",
-                        "You are a product assistant. Article: The product is a portable smart camera with night vision, long battery life, local storage, and wireless connection. It is designed for home security and travel monitoring. Please optimize this article.",
-                        6,
-                        7));
-
-        // 保存纯模型 probe 结果到 CSV。
-        save_kv_delta_probe_results(probe_results);
-
-        // 清空当前 context 上绑定的 LoRA，虽然此分支没有 LoRA，但保持清理习惯。
-        clear_lora(ctx);
-
-        // 释放 context。
-        llama_free(ctx);
-
-        // 释放模型。
+    if (loaded_loras.size() < 2) {
+        fprintf(stderr,
+                "need at least two valid adapters. Fill actual_adapter_path in %s\n",
+                options.lora_config_path.c_str());
+        for (auto & lora : lora_list) {
+            if (lora.adapter) llama_adapter_lora_free(lora.adapter);
+        }
         llama_model_free(model);
-
-        // 打印结束信息。
-        fprintf(stderr, "pure transformer KV delta probe finished.\n");
-
-        // 正常结束程序。
-        return 0;
+        return 1;
     }
 
-    // 从 generated_lora_tree_qwen2.5.hpp 中读取 LoRA 静态配置，转换成运行时结构。
-    std::vector<lora_node_runtime> lora_nodes =
-            make_runtime_lora_nodes();
+    const std::vector<dataset_request> delta_requests =
+            load_requests(delta_request_path);
+    const std::vector<delta_pair_item> delta_pairs =
+            load_delta_pairs(delta_pair_path);
+    const std::vector<dataset_request> grouped_requests =
+            load_requests(grouped_request_path);
 
-    // 遍历每个 LoRA 节点，加载对应 adapter。
-    for (auto & node : lora_nodes) {
-        // 从 node.path 加载 LoRA adapter。
-        node.adapter =
-                llama_adapter_lora_init(
-                        model,
-                        node.path.c_str());
-
-        // 如果某个 LoRA 加载失败，释放已经加载成功的 LoRA，并退出。
-        if (node.adapter == nullptr) {
-            fprintf(stderr, "failed to load LoRA: %s\n", node.path.c_str());
-
-            // 释放之前已经成功加载的 LoRA adapter。
-            for (auto & old : lora_nodes) {
-                if (old.adapter != nullptr) {
-                    llama_adapter_lora_free(old.adapter);
-                }
-            }
-
-            // 释放模型。
-            llama_model_free(model);
-
-            // 返回错误码。
-            return 1;
-        }
+    std::unordered_map<int, dataset_request> delta_request_map;
+    for (const auto & request : delta_requests) {
+        delta_request_map[request.request_id] = request;
     }
 
-    // 根据 generated group 配置构造运行时 group，并 tokenize 每个 group 的 prompt pattern。
-    std::vector<lora_group_runtime> groups =
-            make_runtime_groups(vocab);
+    fprintf(stderr,
+            "loaded workload: delta_requests=%zu delta_pairs=%zu grouped_requests=%zu adapters=%zu\n",
+            delta_requests.size(),
+            delta_pairs.size(),
+            grouped_requests.size(),
+            loaded_loras.size());
 
-    // 每个基础 case 重复 3 次，用于后续统计平均值。
-    const int n_repeats = 3;
+    std::vector<delta_result> delta_results;
+    std::vector<delta_layer_result> delta_layers;
+    run_delta_experiment(
+            model,
+            vocab,
+            options,
+            delta_request_map,
+            delta_pairs,
+            loaded_loras,
+            delta_results,
+            delta_layers);
+    save_delta_results(options.output_dir, delta_results, delta_layers);
 
-    // 构造长上下文请求列表，例如 ctx_50 / ctx_100 下的 write / optimize / explain。
-    std::vector<request_item> requests =
-            make_repeated_long_context_requests(n_repeats);
+    std::vector<online_result> online_results = run_baseline_experiment(
+            model,
+            vocab,
+            options,
+            grouped_requests,
+            loaded_loras);
 
-    // 保存 tokenize 后的请求。
-    std::vector<request_tokens> tokenized;
+    std::vector<prefix_node> final_nodes;
+    std::vector<online_result> exact_prefix_results = run_online_experiment(
+            model,
+            vocab,
+            options,
+            grouped_requests,
+            loaded_loras,
+            final_nodes);
+    online_results.insert(
+            online_results.end(),
+            exact_prefix_results.begin(),
+            exact_prefix_results.end());
+    save_online_results(options.output_dir, online_results);
+    save_tree_summary(options.output_dir, final_nodes);
 
-    // 遍历所有请求，逐条 tokenize 并路由到 group。
-    for (const auto & req : requests) {
-        // 创建当前请求的 token 结构。
-        request_tokens toks;
-
-        // 把 prompt 文本转成 token 序列，保存到 toks.full。
-        tokenize_text(vocab, req.prompt, toks.full);
-
-        // 记录路由开始时间。
-        const double route0 = now_ms();
-
-        // 根据 prompt token 和 group pattern，选择最匹配的 group。
-        toks.routed_group_id =
-                route_prompt_to_group(groups, toks.full);
-
-        // 记录路由结束时间。
-        const double route1 = now_ms();
-
-        // 目前 route0 / route1 没有写入结果，只是保留变量避免 warning。
-        (void) route0;
-        (void) route1;
-
-        // 保存当前 tokenize 后的请求。
-        tokenized.push_back(toks);
+    for (auto & lora : lora_list) {
+        if (lora.adapter) llama_adapter_lora_free(lora.adapter);
     }
-
-    // 打印请求路由结果。
-    fprintf(stderr, "request routing result:\n");
-
-    // 遍历所有请求，输出它被分到哪个 group。
-    for (int i = 0; i < (int) requests.size(); i++) {
-        // 根据 routed_group_id 找到 group。
-        const lora_group_runtime * group =
-                find_group(groups, tokenized[i].routed_group_id);
-
-        // 打印 request -> group 的映射。
-        fprintf(stderr,
-                "  request %d -> group %s\n",
-                i,
-                group ? group->group_name.c_str() : "unknown");
-    }
-
-    // 保存所有实验结果，包括 baseline、online prefix reuse、suffix delta materialize。
-    std::vector<sample_result> results;
-
-    // 构造 KV delta probe 的 pair cases。
-    std::vector<kv_delta_probe_case> probe_cases =
-            make_kv_delta_probe_cases();
-
-    // 独立创建 context 并执行 KV delta probe。
-    std::vector<kv_delta_probe_result> probe_results =
-            run_kv_delta_probe_suite(
-                    model,
-                    vocab,
-                    n_ctx,
-                    probe_cases);
-
-    // 保存 KV delta probe 结果。
-    save_kv_delta_probe_results(probe_results);
-
-    // baseline 实验作用域：使用独立 context，避免污染 online prefix 实验。
-    {
-        // 创建 baseline context 参数。
-        llama_context_params ctx_params =
-                llama_context_default_params();
-
-        // 设置上下文长度。
-        ctx_params.n_ctx = n_ctx;
-
-        // 设置 batch 大小。
-        ctx_params.n_batch = 256;
-
-        // 设置 micro-batch 大小。
-        ctx_params.n_ubatch = 64;
-
-        // baseline 中每个 request 使用一个 seq，所以 n_seq_max 设置成 requests.size()。
-        ctx_params.n_seq_max = (uint32_t) requests.size();
-
-        // 关闭性能统计。
-        ctx_params.no_perf = true;
-
-        // 使用 unified KV buffer。
-        ctx_params.kv_unified = true;
-
-        // 创建 baseline context。
-        llama_context * ctx =
-                llama_init_from_model(model, ctx_params);
-
-        // 如果创建失败，打印错误并退出。
-        if (ctx == nullptr) {
-            fprintf(stderr, "failed to create baseline context\n");
-            return 1;
-        }
-
-        // 遍历所有请求，逐条完整 prefill，不做 KV 复用。
-        for (int i = 0; i < (int) requests.size(); i++) {
-            // 运行 baseline 请求。
-            sample_result r =
-                    run_baseline_request(
-                            ctx,
-                            lora_nodes,
-                            groups,
-                            requests[i],
-                            tokenized[i],
-                            i,
-                            n_predict);
-
-            // 保存 baseline 结果。
-            results.push_back(r);
-        }
-
-        // 清空当前 context 的 LoRA 绑定。
-        clear_lora(ctx);
-
-        // 释放 baseline context。
-        llama_free(ctx);
-    }
-
-    // online prefix tree 实验作用域。
-    {
-        // 保存在线 prefix tree 节点。
-        std::vector<online_prefix_node> online_nodes;
-
-        // 最少复用 prefix token 数，小于这个阈值就不走 prefix reuse。
-        const int min_reuse_prefix_tokens = 4;
-
-        // prefix cache seq 从 0 开始分配。
-        const int cache_seq_base = 0;
-
-        // request seq 从 128 开始，避免和 cache seq 冲突。
-        const int request_seq_base = 128;
-
-        // delta materialize 目标 seq 从 request_seq_base + requests.size() 开始。
-        const int delta_request_seq_base = request_seq_base + (int) requests.size();
-
-        // 创建 online prefix context 参数。
-        llama_context_params ctx_params =
-                llama_context_default_params();
-
-        // 设置上下文长度。
-        ctx_params.n_ctx = n_ctx;
-
-        // 设置 batch 大小。
-        ctx_params.n_batch = 256;
-
-        // 设置 micro-batch 大小。
-        ctx_params.n_ubatch = 64;
-
-        // 设置最大 seq 数量，要容纳 cache seq、request seq、delta seq。
-        ctx_params.n_seq_max =
-                (uint32_t) (request_seq_base + (int) requests.size() * 3 + 32);
-
-        // 关闭性能统计。
-        ctx_params.no_perf = true;
-
-        // 使用 unified KV buffer，保证 seq_cp / delta materialize 能工作。
-        ctx_params.kv_unified = true;
-
-        // 创建 online prefix context。
-        llama_context * ctx =
-                llama_init_from_model(model, ctx_params);
-
-        // 如果 context 创建失败，退出。
-        if (ctx == nullptr) {
-            fprintf(stderr, "failed to create online-prefix context\n");
-            return 1;
-        }
-
-        // 获取 llama.cpp 的 memory/KV 管理对象。
-        llama_memory_t mem =
-                llama_get_memory(ctx);
-
-        // 估算每个 token 的 KV cache 占用，单位 MB。
-        const double kv_mb_per_token =
-                estimate_kv_mb_per_token(
-                        model,
-                        ctx_params.type_k,
-                        ctx_params.type_v);
-
-        // 打印每 token KV 内存估算值。
-        fprintf(stderr,
-                "estimated kv memory per token: %.6f MB\n",
-                kv_mb_per_token);
-
-        // 遍历所有请求，执行 online prefix build / reuse / delta materialize。
-        for (int i = 0; i < (int) requests.size(); i++) {
-            // 当前原始请求。
-            const request_item & req = requests[i];
-
-            // 当前请求的 token。
-            const request_tokens & toks = tokenized[i];
-
-            // 找到当前请求对应 group。
-            const lora_group_runtime * group =
-                    find_group(groups, toks.routed_group_id);
-
-            // 如果没有路由到 group，就跳过。
-            if (group == nullptr) {
-                fprintf(stderr, "request %d has no routed group\n", i);
-                continue;
-            }
-
-            // 在已有 online prefix nodes 中查找是否命中公共 prefix。
-            online_route_result route =
-                    route_online_prefix_node(
-                            online_nodes,
-                            toks.routed_group_id,
-                            toks.full);
-
-            // 当前请求实际使用的 seq id。
-            const llama_seq_id request_seq_id =
-                    (llama_seq_id) (request_seq_base + i);
-
-            // 判断当前请求是不是该 group 的 anchor LoRA 请求。
-            const bool is_anchor_request =
-                    group != nullptr && req.leaf_lora_id == group->anchor_lora_id;
-
-            // 如果不是 anchor 请求，并且命中了足够长的 prefix，就走 online prefix reuse。
-            if (!is_anchor_request &&
-                    route.exact_prefix_hit &&
-                    route.exact_prefix_len >= min_reuse_prefix_tokens) {
-                // 根据命中的 node_id 找到 prefix node。
-                const online_prefix_node * hit =
-                        find_online_node(online_nodes, route.node_id);
-
-                // 如果没找到，说明 tree 状态异常，跳过。
-                if (hit == nullptr) {
-                    fprintf(stderr,
-                            "online prefix node not found: %d\n",
-                            route.node_id);
-                    continue;
-                }
-
-                // 运行 prefix reuse：复制 hit 节点的 prefix KV，再重新计算 suffix。
-                sample_result r =
-                        run_online_prefix_reuse_request(
-                                ctx,
-                                mem,
-                                lora_nodes,
-                                groups,
-                                *hit,
-                                req,
-                                toks,
-                                request_seq_id,
-                                route.exact_prefix_len,
-                                n_predict,
-                                kv_mb_per_token);
-
-                // 保存 prefix reuse 结果。
-                results.push_back(r);
-
-                // 如果当前请求有 suffix，就尝试 suffix delta materialize。
-                // 这里 request_seq_id 是刚刚完整算过 suffix 的 child KV。
-                if (route.suffix_len > 0) {
-                    // 给 delta materialize 结果分配新的目标 seq。
-                    const llama_seq_id delta_request_seq_id =
-                            (llama_seq_id) (request_seq_base + (int) requests.size() + i);
-
-                    // 尝试用 anchor KV + child_full KV 构造 delta，并 materialize 到新 seq。
-                    sample_result r_delta =
-                            run_online_suffix_delta_materialize_request(
-                                    ctx,
-                                    mem,
-                                    lora_nodes,
-                                    groups,
-                                    *hit,
-                                    req,
-                                    toks,
-                                    request_seq_id,
-                                    delta_request_seq_id,
-                                    route.exact_prefix_len,
-                                    n_predict,
-                                    kv_mb_per_token);
-
-                    // 保存 delta materialize 结果。
-                    results.push_back(r_delta);
-
-                    // 打印 suffix delta materialize 的详细统计。
-                    fprintf(stderr,
-                            "suffix delta materialize: request=%d anchor_node=%d child_full_seq=%d dst_seq=%d ok=%d delta_ms=%.4f suffix_saved_ms=%.4f delta_fp32_mb=%.4f materialized_kv_mb=%.4f\n",
-                            i,
-                            hit->node_id,
-                            request_seq_id,
-                            delta_request_seq_id,
-                            r_delta.suffix_delta_materialized,
-                            r_delta.delta_materialize_ms,
-                            r.suffix_ms,
-                            r_delta.delta_fp32_mb,
-                            r_delta.materialized_kv_mb);
-                }
-
-                // 基础请求数量为 6：ctx_50 三条 + ctx_100 三条。
-                const int base_request_count = 6;
-
-                // 多 repeat 时，把请求 index 归一化回 0~5，方便匹配 probe case。
-                const int normalized_request_index = i % base_request_count;
-
-                // 根据当前 child request index 找到对应 probe 结果。
-                const kv_delta_probe_result * probe =
-                        find_probe_for_child_request(
-                                probe_results,
-                                probe_cases,
-                                normalized_request_index);
-
-                // 遍历 online nodes，更新命中的 node 状态。
-                for (auto & node : online_nodes) {
-                    // 只更新当前命中的 node。
-                    if (node.node_id == route.node_id) {
-                        // 命中次数 +1。
-                        node.hit_count++;
-
-                        // 标记 prefix 可以复用。
-                        node.prefix_can_reuse = 1;
-
-                        // 当前不是新分支，而是复用已有 prefix。
-                        node.should_open_new_branch = 0;
-
-                        // 如果 probe 成功，就把 probe 的 cosine / L2 / 决策写入 node。
-                        if (probe != nullptr && probe->probe_status == "ok") {
-                            apply_probe_to_online_node(
-                                    node,
-                                    *probe,
-                                    route.node_id);
-                        } else {
-                            // 如果没有 probe 或 probe 失败，就保守设置为 suffix 重新计算。
-                            node.suffix_can_delta = 0;
-                            node.delta_parent_node_id = -1;
-                            node.reuse_decision = "exact_prefix_reuse_suffix_recompute";
-                        }
-
-                        // 找到目标 node 后退出循环。
-                        break;
-                    }
-                }
-
-                // 打印 online prefix 命中情况。
-                fprintf(stderr,
-                        "online prefix hit: request=%d group=%s node=%d prefix=%d suffix=%d saved_kv=%.4f MB\n",
-                        i,
-                        group->group_name.c_str(),
-                        route.node_id,
-                        route.exact_prefix_len,
-                        route.suffix_len,
-                        r.estimated_saved_kv_mb);
-
-                // 当前请求已经处理完，进入下一个请求。
-                continue;
-            }
-
-            // 如果没有命中可复用 prefix，或者当前请求是 anchor 请求，就创建新的 prefix node。
-            const int node_id = (int) online_nodes.size();
-
-            // 为这个新 prefix node 分配 cache seq。
-            const llama_seq_id cache_seq_id =
-                    (llama_seq_id) (cache_seq_base + node_id);
-
-            // 运行 online build：完整 eval 当前 prompt，把 KV 写入 cache_seq_id。
-            sample_result r =
-                    run_online_build_prefix_request(
-                            ctx,
-                            mem,
-                            lora_nodes,
-                            groups,
-                            req,
-                            toks,
-                            cache_seq_id,
-                            request_seq_id,
-                            node_id,
-                            n_predict);
-
-            // 保存 build prefix 结果。
-            results.push_back(r);
-
-            // 创建新的 online prefix node。
-            online_prefix_node node;
-
-            // 节点 id。
-            node.node_id = node_id;
-
-            // 节点所属 group。
-            node.group_id = toks.routed_group_id;
-
-            // group 名称。
-            node.group_name = group->group_name;
-
-            // 当前节点的 KV 保存在哪个 cache seq。
-            node.cache_seq_id = cache_seq_id;
-
-            // 当前节点保存的 prefix 长度，这里是完整 prompt 长度。
-            node.prefix_len = (int) toks.full.size();
-
-            // 保存当前 prompt token，后续用于 common prefix 匹配。
-            node.prefix_tokens = toks.full;
-
-            // 初始命中次数为 0。
-            node.hit_count = 0;
-
-            // 新节点暂时没有父节点。
-            node.parent_node_id = -1;
-
-            // 新节点暂时没有 delta parent。
-            node.delta_parent_node_id = -1;
-
-            // 新节点还没有被 probe 判断为 prefix 可复用。
-            node.prefix_can_reuse = 0;
-
-            // 新节点还没有 suffix delta。
-            node.suffix_can_delta = 0;
-
-            // 新节点默认表示需要开新分支。
-            node.should_open_new_branch = 1;
-
-            // suffix cosine 初始化为 0。
-            node.suffix_kv_cos = 0.0;
-
-            // suffix L2 初始化为 0。
-            node.suffix_kv_l2 = 0.0;
-
-            // 节点决策标签为创建 prefix node。
-            node.reuse_decision = "create_prefix_node";
-
-            // 把新节点加入 online prefix tree。
-            online_nodes.push_back(node);
-
-            // 打印新节点创建信息。
-            fprintf(stderr,
-                    "online prefix node created: request=%d group=%s node=%d prefix_len=%d\n",
-                    i,
-                    group->group_name.c_str(),
-                    node.node_id,
-                    node.prefix_len);
-        }
-
-        // 打印 online prefix tree 总结。
-        fprintf(stderr, "\nonline prefix tree summary:\n");
-
-        // 遍历所有 online nodes，输出节点状态。
-        for (const auto & node : online_nodes) {
-            fprintf(stderr,
-                    "  node=%d group=%s parent=%d delta_parent=%d prefix_len=%d hit_count=%d decision=%s suffix_cos=%.6f suffix_l2=%.6f\n",
-                    node.node_id,
-                    node.group_name.c_str(),
-                    node.parent_node_id,
-                    node.delta_parent_node_id,
-                    node.prefix_len,
-                    node.hit_count,
-                    node.reuse_decision.c_str(),
-                    node.suffix_kv_cos,
-                    node.suffix_kv_l2);
-        }
-
-        // 保存 online prefix tree 到 CSV。
-        save_online_prefix_delta_tree(online_nodes);
-
-        // 清空 LoRA 绑定。
-        clear_lora(ctx);
-
-        // 释放 online prefix context。
-        llama_free(ctx);
-    }
-
-    // 保存所有实验结果到 CSV。
-    save_results(results);
-
-    // 下面这大段是旧的手写 probe 实验代码，现在已经注释掉。
-    // 它原来用于手动构造 same_prompt / code / mobile_like / cross_task 等 probe pair。
-    // 当前主流程已经使用 make_kv_delta_probe_cases() 自动生成 probe cases。
-
-    // 释放所有 LoRA adapter。
-    for (auto & node : lora_nodes) {
-        // 如果 adapter 已加载，就释放。
-        if (node.adapter != nullptr) {
-            llama_adapter_lora_free(node.adapter);
-        }
-    }
-
-    // 释放 base model。
     llama_model_free(model);
 
-    // 打印实验完成信息。
-    fprintf(stderr, "group node KV reuse + LoRA tree experiment finished.\n");
-
-    // 正常退出。
+    fprintf(stderr,
+            "dataset experiment finished: delta_rows=%zu online_rows=%zu nodes=%zu output=%s\n",
+            delta_results.size(),
+            online_results.size(),
+            final_nodes.size(),
+            options.output_dir.c_str());
     return 0;
 }
-
-
-// int main(int argc, char ** argv) {
-//     // ------------------------------------------------------------
-//     // 1. 初始化 llama.cpp backend
-//     // ------------------------------------------------------------
-
-//     // llama_backend_init() 会初始化 llama.cpp 的后端环境。
-//     // 如果启用了 CUDA，这里会准备 GPU backend。
-//     llama_backend_init();
-
-//     // llama_numa_init() 用于 NUMA 机器的内存优化。
-//     // 普通单机实验里用 GGML_NUMA_STRATEGY_DISABLED 即可。
-//     llama_numa_init(GGML_NUMA_STRATEGY_DISABLED);
-
-//     // ------------------------------------------------------------
-//     // 2. 设置路径参数
-//     // ------------------------------------------------------------
-
-//     // base model 路径。
-//     // 这里建议使用纯 Transformer 的 Qwen2.5-1.5B GGUF。
-//     // 注意：这是 base model，不是 LoRA。
-//     const std::string model_path =
-//         "D:/ecnu_experiment/Model/Qwen2.5-1.5B-gguf/Qwen2.5-1.5B-Instruct-f16.gguf";
-
-//     // LoRA 根目录。
-//     // 后面每个 adapter 都从这里拼路径。
-//     const std::string lora_root =
-//         "D:/ecnu_experiment/Model/LoRA/Qwen2.5_1.5B_gguf";
-
-//     // 输出目录。
-//     // 所有 CSV 都保存到这里，Python 脚本会读取这个目录。
-//     const std::string output_dir =
-//         "D:/ecnu_experiment/LLama.cpp/llama.cpp/examples/lora-base-test/output";
-
-//     // ------------------------------------------------------------
-//     // 3. 设置模型运行参数
-//     // ------------------------------------------------------------
-
-//     // llama_model_params 是加载模型时使用的参数。
-//     llama_model_params model_params = llama_model_default_params();
-
-//     // n_gpu_layers 表示有多少层放到 GPU 上。
-//     // 999 通常表示尽量全放 GPU。
-//     model_params.n_gpu_layers = 999;
-
-//     // llama_context_params 是创建推理上下文时使用的参数。
-//     llama_context_params ctx_params = llama_context_default_params();
-
-//     // n_ctx 是 KV cache 的最大 token 容量。
-//     // 长上下文实验需要设大一些。
-//     ctx_params.n_ctx = 4096;
-
-//     // n_batch 是一次 decode 可以处理的 token 数。
-//     // 太大可能显存压力大，太小吞吐低。
-//     ctx_params.n_batch = 512;
-
-//     // n_ubatch 是底层 micro-batch 大小。
-//     // CUDA 下过大可能引发显存或 graph reserve 压力。
-//     ctx_params.n_ubatch = 64;
-
-//     // 多 seq KV copy / seq_cp 路径需要 full KV buffer。
-//     // 如果这里不是 true，之前会遇到：
-//     // GGML_ASSERT(is_full && "seq_cp() is only supported for full KV buffers") failed
-//     ctx_params.kv_unified = true;
-
-//     // 是否启用 flash attention。
-//     // Qwen2.5 + CUDA 通常可以打开。
-//     ctx_params.flash_attn_type = LLAMA_FLASH_ATTN_TYPE_ENABLED;
-
-//     // ------------------------------------------------------------
-//     // 4. 加载 base model
-//     // ------------------------------------------------------------
-
-//     // 从 GGUF 文件加载模型。
-//     llama_model * model = llama_model_load_from_file(model_path.c_str(), model_params);
-
-//     // 如果模型加载失败，直接退出。
-//     if (model == nullptr) {
-//         fprintf(stderr, "failed to load model: %s\n", model_path.c_str());
-//         llama_backend_free();
-//         return 1;
-//     }
-
-//     // 从模型里拿 vocab。
-//     // tokenize 时需要 vocab。
-//     const llama_vocab * vocab = llama_model_get_vocab(model);
-
-//     // ------------------------------------------------------------
-//     // 5. 创建主 context
-//     // ------------------------------------------------------------
-
-//     // llama_context 是一次推理会话的上下文。
-//     // KV cache 也挂在 context 里面。
-//     llama_context * ctx = llama_init_from_model(model, ctx_params);
-
-//     // 如果 context 创建失败，释放 model 后退出。
-//     if (ctx == nullptr) {
-//         fprintf(stderr, "failed to create llama context\n");
-//         llama_model_free(model);
-//         llama_backend_free();
-//         return 1;
-//     }
-
-//     // ------------------------------------------------------------
-//     // 6. 构造 LoRA 节点配置
-//     // ------------------------------------------------------------
-
-//     // runtime_loras 保存所有 LoRA adapter 的运行时信息。
-//     // 每个节点包括：
-//     // 1. LoRA 名字。
-//     // 2. LoRA 文件路径。
-//     // 3. llama_adapter_lora 指针。
-//     // 4. 它属于哪个 group。
-//     std::vector<lora_node_runtime> runtime_loras = make_runtime_lora_nodes();
-
-//     // ------------------------------------------------------------
-//     // 7. 加载 LoRA adapter
-//     // ------------------------------------------------------------
-
-//     for (auto & node : runtime_loras) {
-//         // llama_adapter_lora_init() 会把 LoRA adapter 从 GGUF 文件加载进来。
-//         node.adapter = llama_adapter_lora_init(model, node.path.c_str());
-
-//         // 如果某个 LoRA 加载失败，记录错误。
-//         if (node.adapter == nullptr) {
-//             fprintf(stderr, "failed to load lora adapter: %s\n", node.path.c_str());
-//             continue;
-//         }
-
-//         // 打印加载成功的信息，方便 debug。
-//         fprintf(stderr, "loaded lora: name=%s path=%s\n",
-//                 node.name.c_str(),
-//                 node.path.c_str());
-//     }
-
-//     // ------------------------------------------------------------
-//     // 8. 构造 LoRA group
-//     // ------------------------------------------------------------
-
-//     // group 表示一类任务或一组相似 LoRA。
-//     // 例如：
-//     // code group 里面可以有 code_r16 / code_r16v2 / code_r16v3。
-//     // 后面 prefix tree 会按 group 做 anchor。
-//     std::vector<lora_group_runtime> groups = make_runtime_groups(vocab);
-
-//     // ------------------------------------------------------------
-//     // 9. 构造长上下文实验请求
-//     // ------------------------------------------------------------
-
-//     // requests 是本次实验的所有请求。
-//     // 每个 request 包含：
-//     // 1. prompt 文本。
-//     // 2. 使用哪个 LoRA。
-//     // 3. 属于哪个 group。
-//     // 4. context_tag，例如 ctx_50 / ctx_100。
-//     // 5. repeat_id，用于多次重复实验取平均。
-//     const int n_repeats = 3;
-
-//     std::vector<request_item> requests =
-//             make_repeated_long_context_requests(n_repeats);
-
-//     // ------------------------------------------------------------
-//     // 10. tokenize 所有请求
-//     // ------------------------------------------------------------
-
-//     std::vector<request_tokens> tokenized_requests;
-
-//     // 预留空间，避免 vector 反复扩容。
-//     tokenized_requests.reserve(requests.size());
-
-//     for (int i = 0; i < (int) requests.size(); ++i) {
-//         const request_item & req = requests[i];
-
-//         request_tokens rt;
-//         tokenize_text(vocab, req.prompt, rt.full);
-//         rt.routed_group_id = route_prompt_to_group(groups, rt.full);
-
-//         tokenized_requests.push_back(std::move(rt));
-//     }
-
-//     // ------------------------------------------------------------
-//     // 11. 先跑 KV delta probe
-//     // ------------------------------------------------------------
-
-//     // probe 的目的：
-//     // 比较两个相似请求 A/B 的 KV 是否接近。
-//     //
-//     // 例如：
-//     // A = 长文章 + "请总结"
-//     // B = 长文章 + "请优化"
-//     //
-//     // 如果公共 prefix 的 KV 一致，suffix 的 KV 差异也比较小，
-//     // 后面才考虑保存 delta = KV_B - KV_A。
-//     std::vector<kv_delta_probe_case> probe_cases =
-//         make_kv_delta_probe_cases();
-
-//     // 执行 probe。
-//     // 这里会真正 eval 两个 prompt，并读取 KV cache 做 cosine / L2。
-//     std::vector<kv_delta_probe_result> probe_results =
-//             run_kv_delta_probe_suite(
-//                     model,
-//                     vocab,
-//                     (int) ctx_params.n_ctx,
-//                     probe_cases);
-
-//     // 保存 probe 结果。
-//     // Python 的 plot_kv_delta_probe.py 会读取这个 CSV。
-//     save_kv_delta_probe_results(probe_results);
-
-//     // ------------------------------------------------------------
-//     // 12. 准备保存最终实验结果
-//     // ------------------------------------------------------------
-
-//     // sample_results 保存 baseline / online prefix / suffix delta 的计时结果。
-//     std::vector<sample_result> sample_results;
-
-//     // 预留空间。
-//     sample_results.reserve(requests.size() * 4);
-
-//     // estimated_kv_mb_per_token 用于估算每复用一个 token 可以节省多少 KV 显存。
-//     const double kv_mb_per_token =
-//         estimate_kv_mb_per_token(model, GGML_TYPE_F16, GGML_TYPE_F16);
-
-//     // ------------------------------------------------------------
-//     // 13. 跑 baseline：完全不复用 KV
-//     // ------------------------------------------------------------
-
-//     // baseline 是对照组。
-//     // 每个请求都从 0 开始完整 prefill prompt。
-//     // 不复制 prefix KV，也不使用 suffix delta。
-//     const int n_predict = 32;
-
-//     for (int i = 0; i < (int) tokenized_requests.size(); ++i) {
-//         const request_item & req = requests[i];
-//         const request_tokens & toks = tokenized_requests[i];
-
-//         sample_result r = run_baseline_request(
-//                 ctx,
-//                 runtime_loras,
-//                 groups,
-//                 req,
-//                 toks,
-//                 i,
-//                 n_predict);
-
-//         sample_results.push_back(std::move(r));
-//     }
-
-//     // ------------------------------------------------------------
-//     // 14. 清理 KV cache，准备跑 online prefix tree
-//     // ------------------------------------------------------------
-
-//     // baseline 跑完后，KV cache 里已经有很多 seq。
-//     // 为了避免污染 online 实验，这里清掉全部 KV。
-//     llama_memory_clear(llama_get_memory(ctx), true);
-
-//     // 清空 LoRA。
-//     clear_lora(ctx);
-
-//     // ------------------------------------------------------------
-//     // 15. 初始化 online prefix tree
-//     // ------------------------------------------------------------
-
-//     // online_nodes 是在线 prefix tree 的节点列表。
-//     //
-//     // 每个 node 表示一个已经缓存过的 prefix。
-//     // 新请求进来后，会去找有没有公共 prefix 节点可以复用。
-//     std::vector<online_prefix_node> online_nodes;
-
-//     // next_seq_id 用于给每个 KV 分支分配 seq。
-//     //
-//     // seq 可以理解成 KV cache 里的“请求编号”或“分支编号”。
-//     // 例如：
-//     // seq=0 保存 anchor prompt 的 KV。
-//     // seq=1 保存另一个 LoRA 请求的 KV。
-//     llama_seq_id next_seq_id = 0;
-
-//     // ------------------------------------------------------------
-//     // 16. 跑 online prefix tree 主流程
-//     // ------------------------------------------------------------
-
-//     for (int i = 0; i < (int) tokenized_requests.size(); ++i) {
-//         // 当前请求。
-//         const request_tokens & rt = tokenized_requests[i];
-
-//         // 当前请求配置。
-//         const request_item & req = requests[i];
-
-//         // --------------------------------------------------------
-//         // 16.1 查找当前请求是否能命中已有 prefix node
-//         // --------------------------------------------------------
-
-//         // route_online_prefix_node() 会做几件事：
-//         // 1. 在 online_nodes 里面找同 group 的节点。
-//         // 2. 计算当前请求和节点 prefix 的公共前缀长度。
-//         // 3. 如果公共前缀足够长，就认为 prefix hit。
-//         // 4. 返回命中的 node id、prefix_len、suffix_len。
-//         route_online_prefix_node(online_nodes, rt.routed_group_id, rt.full);
-
-//         // --------------------------------------------------------
-//         // 16.2 如果没有命中 prefix node，就创建新节点
-//         // --------------------------------------------------------
-
-//         if (!route.exact_prefix_hit) {
-//             // 没命中说明当前请求没有可复用的 prefix。
-//             // 所以需要完整 prefill 当前 prompt，并把它作为新的 anchor node。
-//             sample_result r = run_online_build_prefix_request(
-//                 ctx,
-//                 rt,
-//                 runtime_loras,
-//                 next_seq_id,
-//                 kv_mb_per_token);
-
-//             // 保存当前实验结果。
-//             sample_results.push_back(r);
-
-//             // 构造新的 online prefix node。
-//             online_prefix_node node;
-
-//             // node_id 是节点编号。
-//             node.node_id = (int) online_nodes.size();
-
-//             // group_name 表示这个节点属于哪个任务组。
-//             node.group_name = req.group_name;
-
-//             // parent_node_id 表示 prefix tree 的父节点。
-//             // 当前简化版本没有真正做多层树，所以先设为 -1。
-//             node.parent_node_id = -1;
-
-//             // delta_parent_node_id 表示如果后面 suffix delta 成功，
-//             // 当前节点的 delta 是基于哪个 anchor 节点算出来的。
-//             // 新建节点没有 delta parent。
-//             node.delta_parent_node_id = -1;
-
-//             // prefix_len 表示这个节点缓存了多少 prompt token。
-//             node.prefix_len = (int) rt.full.size();
-
-//             // prefix_tokens 保存这个节点对应的 token。
-//             node.prefix_tokens = rt.full;
-
-//             // seq_id 表示这个节点的 KV 存在哪个 seq 里。
-//             node.cache_seq_id = r.seq_id;
-
-//             // hit_count 表示后面有多少请求命中过这个节点。
-//             node.hit_count = 0;
-
-//             // prefix_can_reuse 表示这个节点能否被后续请求复用。
-//             node.prefix_can_reuse = true;
-
-//             // suffix_can_delta 表示这个节点是否有可用 suffix delta。
-//             // 新建节点还没有 delta。
-//             node.suffix_can_delta = false;
-
-//             // suffix_delta_materialized 表示是否已经把 delta 恢复成真实 KV。
-//             node.suffix_delta_materialized = false;
-
-//             // 决策标签。
-//             node.node.reuse_decision = "create_prefix_node";
-
-//             // 保存节点。
-//             online_nodes.push_back(std::move(node));
-
-//             // 继续处理下一个请求。
-//             continue;
-//         }
-
-//         // --------------------------------------------------------
-//         // 16.3 如果命中 prefix node，先走 prefix KV 复用
-//         // --------------------------------------------------------
-
-//         // 找到被命中的 anchor node。
-//         online_prefix_node * anchor_node =
-//             find_online_node(online_nodes, route.node_id);
-
-//         // 如果理论上命中了，但节点找不到，说明代码状态异常。
-//         if (anchor_node == nullptr) {
-//             fprintf(stderr, "route hit but anchor node not found: node_id=%d\n",
-//                     route.node_id);
-//             continue;
-//         }
-
-//         // 命中次数 +1。
-//         anchor_node->hit_count += 1;
-
-//         // 跑 online prefix reuse。
-//         //
-//         // 这一步主要做：
-//         // 1. 把 anchor node 的 prefix KV copy 到新的 seq。
-//         // 2. 对 suffix token 重新 eval。
-//         // 3. 统计 TTFT / suffix eval 耗时。
-//         sample_result reuse_result = run_online_prefix_reuse_request(
-//             ctx,
-//             rt,
-//             runtime_loras,
-//             *anchor_node,
-//             route,
-//             next_seq_id,
-//             kv_mb_per_token);
-
-//         // 保存 prefix reuse 结果。
-//         sample_results.push_back(reuse_result);
-
-//         // --------------------------------------------------------
-//         // 16.4 把 probe 结果映射到 online node
-//         // --------------------------------------------------------
-
-//         // 根据当前请求找到对应的 probe 结果。
-//         //
-//         // 例如：
-//         // 当前请求是 ctx_100 optimize，
-//         // anchor 是 ctx_100 write，
-//         // 那么这里会找 ctx_100_write_vs_optimize 的 probe 结果。
-//         const kv_delta_probe_result * probe =
-//             find_probe_for_child_request(probe_results, i);
-
-//         // 如果找到了 probe 结果，就把它写回 node。
-//         if (probe != nullptr) {
-//             apply_probe_to_online_node(*anchor_node, *probe);
-//         }
-
-//         // --------------------------------------------------------
-//         // 16.5 如果 probe 判断 suffix delta 可用，就尝试 materialize
-//         // --------------------------------------------------------
-
-//         // suffix_can_delta 表示 probe 指标满足阈值。
-//         // 但它只说明“理论上可以保存 delta”，不代表 materialize 一定成功。
-//         if (anchor_node->suffix_can_delta) {
-//             // 尝试 suffix delta materialize。
-//             //
-//             // 这一步实验性比较强：
-//             // 1. 根据 anchor KV 和 delta 恢复 child KV。
-//             // 2. 把恢复出来的 KV 写入新的 seq。
-//             // 3. 如果成功，可以避免重新 eval suffix。
-//             sample_result delta_result =
-//                 run_online_suffix_delta_materialize_request(
-//                     ctx,
-//                     rt,
-//                     runtime_loras,
-//                     *anchor_node,
-//                     route,
-//                     next_seq_id,
-//                     kv_mb_per_token);
-
-//             // 保存 suffix delta 结果。
-//             sample_results.push_back(delta_result);
-
-//             // 如果 materialize 成功，更新 node 状态。
-//             if (delta_result.suffix_delta_materialized) {
-//                 anchor_node->suffix_delta_materialized = true;
-//                 anchor_node->delta_parent_node_id = anchor_node->node_id;
-//                 anchor_node->decision_label = "prefix_reuse_suffix_delta_materialized";
-//             } else {
-//                 // 如果失败，保留 prefix reuse + suffix recompute 路径。
-//                 anchor_node->decision_label = "prefix_reuse_suffix_recompute";
-//             }
-//         } else {
-//             // 如果 probe 不支持 suffix delta，就只做 prefix reuse。
-//             anchor_node->decision_label = "prefix_reuse_suffix_recompute";
-//         }
-//     }
-
-//     // ------------------------------------------------------------
-//     // 17. 保存 online prefix tree 结构
-//     // ------------------------------------------------------------
-
-//     // 保存 online tree 节点信息。
-//     // Python 的 plot_online_prefix_delta_tree.py 会读取这个 CSV。
-//     save_online_prefix_delta_tree(
-//         output_dir + "/online_prefix_delta_tree_summary.csv",
-//         online_nodes);
-
-//     // ------------------------------------------------------------
-//     // 18. 保存 sample_results
-//     // ------------------------------------------------------------
-
-//     // group_node_kv_lora_tree_summary.csv 是主要实验结果。
-//     // Python 的 plot_online_prefix_reuse.py 会读取它画：
-//     // 1. TTFT
-//     // 2. 总耗时
-//     // 3. TPS
-//     // 4. 估算 KV 节省
-//     save_results(
-//         output_dir + "/group_node_kv_lora_tree_summary.csv",
-//         sample_results);
-
-//     // ------------------------------------------------------------
-//     // 19. 打印 online prefix tree 简要信息
-//     // ------------------------------------------------------------
-
-//     fprintf(stderr, "\nonline prefix tree summary:\n");
-
-//     for (const auto & node : online_nodes) {
-//         fprintf(stderr,
-//                 "  node=%d group=%s parent=%d delta_parent=%d "
-//                 "prefix_len=%d hit_count=%d decision=%s "
-//                 "suffix_cos=%.6f suffix_l2=%.6f\n",
-//                 node.node_id,
-//                 node.group_name.c_str(),
-//                 node.parent_node_id,
-//                 node.delta_parent_node_id,
-//                 node.prefix_len,
-//                 node.hit_count,
-//                 node.decision_label.c_str(),
-//                 node.suffix_kv_cos,
-//                 node.suffix_kv_l2);
-//     }
-
-//     // ------------------------------------------------------------
-//     // 20. 清理 LoRA adapter
-//     // ------------------------------------------------------------
-
-//     // 先从 context 里清空当前绑定的 LoRA。
-//     clear_lora(ctx);
-
-//     // 再释放每个 adapter。
-//     for (auto & node : runtime_loras) {
-//         if (node.adapter != nullptr) {
-//             llama_adapter_lora_free(node.adapter);
-//             node.adapter = nullptr;
-//         }
-//     }
-
-//     // ------------------------------------------------------------
-//     // 21. 清理 context 和 model
-//     // ------------------------------------------------------------
-
-//     // 释放 llama context。
-//     llama_free(ctx);
-
-//     // 释放 model。
-//     llama_model_free(model);
-
-//     // 释放 llama backend。
-//     llama_backend_free();
-
-//     // ------------------------------------------------------------
-//     // 22. 正常结束
-//     // ------------------------------------------------------------
-
-//     fprintf(stderr, "group node KV reuse + LoRA tree experiment finished.\n");
-
-//     return 0;
-// }
