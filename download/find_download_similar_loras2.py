@@ -246,13 +246,23 @@ class HubClient:
 
     def get_json(self, path: str) -> tuple[dict | list, str]:
         last_error: Exception | None = None
-        for endpoint in self.endpoints:
-            try:
-                response = self.session.get(endpoint + path, timeout=45)
-                response.raise_for_status()
-                return response.json(), endpoint
-            except (requests.RequestException, ValueError) as error:
-                last_error = error
+        for attempt in range(3):
+            for endpoint in self.endpoints:
+                try:
+                    response = self.session.get(
+                        endpoint + path,
+                        timeout=(30, 120),
+                    )
+                    response.raise_for_status()
+                    return response.json(), endpoint
+                except (requests.RequestException, ValueError) as error:
+                    last_error = error
+                    print(
+                        f"  metadata attempt {attempt + 1}/3 failed on "
+                        f"{endpoint}: {error}"
+                    )
+            if attempt < 2:
+                time.sleep(2 ** attempt)
         raise RuntimeError(f"all endpoints failed for {path}: {last_error}")
 
     def inspect_repo(self, repo_id: str) -> dict[str, Any]:
@@ -286,6 +296,7 @@ class HubClient:
                 "base_model": config.get("base_model_name_or_path"),
                 "peft_type": config.get("peft_type"),
                 "task_type": config.get("task_type"),
+                "bias": config.get("bias", "none"),
                 "rank": config.get("r"),
                 "alpha": config.get("lora_alpha"),
                 "target_modules": target_modules,
@@ -302,6 +313,8 @@ class HubClient:
             reasons.append("base model is not Qwen2.5-1.5B-Instruct")
         if result.get("modules_to_save"):
             reasons.append("contains unsupported modules_to_save")
+        if str(result.get("bias") or "none").lower() != "none":
+            reasons.append(f"unsupported trained bias: {result.get('bias')}")
         unsupported = set(target_modules) - ALLOWED_TARGET_MODULES
         if unsupported:
             reasons.append(f"unsupported targets: {sorted(unsupported)}")
@@ -346,6 +359,50 @@ def local_adapter_valid(adapter_dir: Path) -> bool:
         (adapter_dir / "adapter_model.safetensors").is_file()
         or (adapter_dir / "adapter_model.bin").is_file()
     )
+
+
+def inspect_local_adapter(adapter_dir: Path, repo_id: str) -> dict[str, Any]:
+    """Validate a downloaded adapter without relying on the Hub metadata API."""
+    if not local_adapter_valid(adapter_dir):
+        return {
+            "repo_id": repo_id,
+            "compatible": False,
+            "reject_reason": f"local adapter files are incomplete: {adapter_dir}",
+        }
+    config = json.loads(
+        (adapter_dir / "adapter_config.json").read_text(encoding="utf-8")
+    )
+    target_modules = sorted(config.get("target_modules") or [])
+    result: dict[str, Any] = {
+        "repo_id": repo_id,
+        "base_model": config.get("base_model_name_or_path"),
+        "peft_type": config.get("peft_type"),
+        "task_type": config.get("task_type"),
+        "bias": config.get("bias", "none"),
+        "rank": config.get("r"),
+        "alpha": config.get("lora_alpha"),
+        "target_modules": target_modules,
+        "modules_to_save": config.get("modules_to_save"),
+        "compatible": False,
+        "reject_reason": "",
+    }
+    reasons: list[str] = []
+    if str(result.get("peft_type") or "").upper() != "LORA":
+        reasons.append("peft_type is not LORA")
+    if str(result.get("task_type") or "").upper() != "CAUSAL_LM":
+        reasons.append("task_type is not CAUSAL_LM")
+    if not is_qwen25_15b_instruct(result.get("base_model")):
+        reasons.append("base model is not Qwen2.5-1.5B-Instruct")
+    if result.get("modules_to_save"):
+        reasons.append("contains unsupported modules_to_save")
+    if str(result.get("bias") or "none").lower() != "none":
+        reasons.append(f"unsupported trained bias: {result.get('bias')}")
+    unsupported = set(target_modules) - ALLOWED_TARGET_MODULES
+    if unsupported:
+        reasons.append(f"unsupported targets: {sorted(unsupported)}")
+    result["reject_reason"] = "; ".join(reasons)
+    result["compatible"] = not reasons
+    return result
 
 
 def load_resumable_entries(manifest_path: Path) -> list[dict[str, Any]]:
@@ -434,21 +491,28 @@ def download_repo(repo_id: str, local_dir: Path, endpoints: list[str]) -> str:
         "chat_template.jinja",
     ]
     last_error: Exception | None = None
-    for endpoint in endpoints:
-        try:
-            snapshot_download(
-                repo_id=repo_id,
-                local_dir=str(local_dir),
-                allow_patterns=allow_patterns,
-                endpoint=endpoint,
-                max_workers=4,
-            )
-            if not local_adapter_valid(local_dir):
-                raise RuntimeError("download completed but adapter files are incomplete")
-            return endpoint
-        except Exception as error:  # Continue with the next endpoint/repository.
-            last_error = error
-            print(f"  endpoint failed: {endpoint}: {error}")
+    for attempt in range(3):
+        for endpoint in endpoints:
+            try:
+                snapshot_download(
+                    repo_id=repo_id,
+                    local_dir=str(local_dir),
+                    allow_patterns=allow_patterns,
+                    endpoint=endpoint,
+                    max_workers=4,
+                    etag_timeout=60,
+                )
+                if not local_adapter_valid(local_dir):
+                    raise RuntimeError("download completed but adapter files are incomplete")
+                return endpoint
+            except Exception as error:  # Continue with the next endpoint/repository.
+                last_error = error
+                print(
+                    f"  download attempt {attempt + 1}/3 failed on "
+                    f"{endpoint}: {error}"
+                )
+        if attempt < 2:
+            time.sleep(2 ** attempt)
     raise RuntimeError(f"download failed on all endpoints: {last_error}")
 
 
@@ -605,9 +669,93 @@ def run_verify(args: argparse.Namespace) -> None:
     print(f"verified {len(entries)} unique physical LoRAs")
 
 
+def run_replace(args: argparse.Namespace, client: HubClient) -> None:
+    """Replace one failed manifest entry without changing its LoRA ID."""
+    if args.replace_id is None or not args.replace_repo:
+        raise ValueError("replace requires --replace-id and --replace-repo")
+    if not args.manifest.is_file():
+        raise FileNotFoundError(f"manifest does not exist: {args.manifest}")
+
+    data = json.loads(args.manifest.read_text(encoding="utf-8"))
+    entries = data.get("loras", [])
+    target = next(
+        (entry for entry in entries if int(entry.get("lora_id", -1)) == args.replace_id),
+        None,
+    )
+    if target is None:
+        raise ValueError(f"lora_id={args.replace_id} is not present in the manifest")
+
+    duplicate = next(
+        (
+            entry
+            for entry in entries
+            if entry.get("repo_id") == args.replace_repo
+            and int(entry.get("lora_id", -1)) != args.replace_id
+        ),
+        None,
+    )
+    if duplicate is not None:
+        raise ValueError(
+            f"replacement repository is already lora_id={duplicate['lora_id']}"
+        )
+
+    print(f"replacing lora_id={args.replace_id}")
+    print(f"  old: {target.get('repo_id')}")
+    print(f"  new: {args.replace_repo}")
+    endpoints = unique([args.endpoint, args.fallback_endpoint])
+    group = infer_group(args.replace_repo)
+    adapter_dir = args.save_root / "adapters" / group / repo_slug(args.replace_repo)
+    remote_metadata: dict[str, Any] | None = None
+    if args.skip_remote_inspect:
+        print("skipping remote metadata inspection; validating downloaded files locally")
+    else:
+        try:
+            remote_metadata = client.inspect_repo(args.replace_repo)
+            if not remote_metadata.get("compatible"):
+                raise RuntimeError(
+                    f"replacement is incompatible: {remote_metadata.get('reject_reason')}"
+                )
+        except RuntimeError as error:
+            print(f"warning: remote inspection failed; validating after download: {error}")
+
+    endpoint = download_repo(args.replace_repo, adapter_dir, endpoints)
+    metadata = inspect_local_adapter(adapter_dir, args.replace_repo)
+    if not metadata.get("compatible"):
+        raise RuntimeError(
+            f"downloaded replacement is incompatible: {metadata.get('reject_reason')}"
+        )
+    if remote_metadata:
+        metadata["downloads"] = remote_metadata.get("downloads")
+
+    old_repo = target.get("repo_id", "")
+    old_adapter_dir = target.get("adapter_dir", "")
+    target.update(
+        {
+            "repo_id": args.replace_repo,
+            "group": group,
+            "source": "downloaded",
+            "status": "downloaded",
+            "adapter_dir": str(adapter_dir),
+            "gguf_path": "",
+            "gguf_size_mb": "",
+            "base_model": metadata.get("base_model"),
+            "rank": metadata.get("rank"),
+            "alpha": metadata.get("alpha"),
+            "target_modules": metadata.get("target_modules"),
+            "downloads": metadata.get("downloads"),
+            "download_endpoint": endpoint,
+            "convert_error": "",
+            "replaced_repo_id": old_repo,
+            "replaced_adapter_dir": old_adapter_dir,
+        }
+    )
+    write_manifest(args.manifest, entries, int(data.get("target_total") or 87))
+    print(f"replacement downloaded and manifest updated: {args.manifest}")
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
-    parser.add_argument("action", choices=["plan", "download", "verify"])
+    parser.add_argument("action", choices=["plan", "download", "verify", "replace"])
     parser.add_argument("--endpoint", default=DEFAULT_ENDPOINT)
     parser.add_argument("--fallback-endpoint", default=OFFICIAL_ENDPOINT)
     parser.add_argument("--target-total", type=int, default=DEFAULT_TARGET_TOTAL)
@@ -617,6 +765,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--existing-gguf-root", type=Path, default=DEFAULT_GGUF_ROOT)
     parser.add_argument("--manifest", type=Path)
     parser.add_argument("--plan-path", type=Path)
+    parser.add_argument("--replace-id", type=int)
+    parser.add_argument("--replace-repo")
+    parser.add_argument("--skip-remote-inspect", action="store_true")
     args = parser.parse_args()
     if args.manifest is None:
         args.manifest = args.save_root / "lora_87_manifest.json"
@@ -633,8 +784,10 @@ def main() -> None:
         run_plan(args, client)
     elif args.action == "download":
         run_download(args, client)
-    else:
+    elif args.action == "verify":
         run_verify(args)
+    else:
+        run_replace(args, client)
 
 
 if __name__ == "__main__":
