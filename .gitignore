@@ -118,6 +118,12 @@ poetry.toml
 /examples/lora-base-test/output_indomain
 /examples/lora-base-test/output_similarity_sweep
 /examples/lora-base-test/original_real_default
+/examples/lora-base-test/output_87_delta_ingroup
+/examples/lora-base-test/output_87_off
+/examples/lora-base-test/output_87_smoke
+/examples/lora-base-test/output_87_delta_crossgroup
+/examples/lora-base-test/output_87_deferred
+/examples/lora-base-test/output_87_sync
 
 
 # Test binaries

@@ -63,6 +63,10 @@ struct experiment_options {
     int max_cache_nodes = 8;
     int max_cache_variants = 24;
     int max_cache_tokens = 8192;
+    // off: do not probe/build cross-LoRA delta on the request path.
+    // sync: probe and build delta before serving the request.
+    // deferred: serve with full KV first, then build delta as background work.
+    std::string cross_lora_policy = "off";
 };
 
 // 打印使用说明
@@ -79,7 +83,8 @@ static void print_usage(const char * program) {
             "  --n-ctx N\n"
             "  --max-cache-nodes N\n"
             "  --max-cache-variants N\n"
-            "  --max-cache-tokens N\n",
+            "  --max-cache-tokens N\n"
+            "  --cross-lora-policy off|sync|deferred\n",
             program);
 }
 
@@ -149,6 +154,16 @@ static bool parse_options(
         } else if (arg == "--max-cache-tokens") {
             value = require_value(i);
             if (!value || !parse_int(value, options.max_cache_tokens)) return false;
+        } else if (arg == "--cross-lora-policy") {
+            value = require_value(i);
+            if (!value) return false;
+            options.cross_lora_policy = value;
+            if (options.cross_lora_policy != "off" &&
+                    options.cross_lora_policy != "sync" &&
+                    options.cross_lora_policy != "deferred") {
+                fprintf(stderr, "invalid cross-LoRA policy: %s\n", value);
+                return false;
+            }
         } else {
             fprintf(stderr, "unknown option: %s\n", arg.c_str());
             return false;
@@ -280,6 +295,11 @@ struct online_result {
     int delta_candidate = 0;
     double prefix_kv_cos = 0.0;
     double prefix_kv_l2 = 0.0;
+    double delta_probe_ms = 0.0;
+    double delta_build_ms = 0.0;
+    double delta_background_ms = 0.0;
+    int delta_build_ok = 0;
+    double delta_saved_rate = 0.0;
     double lora_bind_ms = 0.0;
     double prefix_ms = 0.0;
     double suffix_ms = 0.0;
@@ -621,6 +641,55 @@ static bool run_decode(
             ? n_predict / std::max(0.001, result.decode_ms / 1000.0)
             : 0.0;
     return true;
+}
+
+// Probe and encode one cross-LoRA prefix after both full KV variants exist.
+// scratch_seq is temporary and is cleared before and after delta construction.
+static void build_online_delta(
+        llama_context * context,
+        llama_memory_t memory,
+        llama_seq_id anchor_seq,
+        llama_seq_id child_seq,
+        llama_seq_id scratch_seq,
+        int prefix_tokens,
+        int anchor_id,
+        int child_id,
+        online_result & result) {
+    llama_memory_seq_rm(memory, scratch_seq, -1, -1);
+
+    llama_kv_delta_probe_stats probe = {};
+    double start = now_ms();
+    const bool probe_ok = llama_kv_seq_delta_probe(
+            context,
+            anchor_seq,
+            child_seq,
+            0,
+            prefix_tokens,
+            &probe);
+    result.delta_probe_ms = now_ms() - start;
+    result.delta_candidate = probe_ok && probe.can_reuse_as_delta ? 1 : 0;
+    result.prefix_kv_cos = probe.kv_cos_avg;
+    result.prefix_kv_l2 = probe.kv_l2_avg;
+
+    if (probe_ok && probe.can_reuse_as_delta) {
+        llama_kv_delta_branch_stats branch = {};
+        start = now_ms();
+        const bool build_ok = llama_kv_seq_delta_build_branch(
+                context,
+                anchor_seq,
+                child_seq,
+                scratch_seq,
+                0,
+                prefix_tokens,
+                anchor_id,
+                child_id,
+                &branch);
+        result.delta_build_ms = now_ms() - start;
+        result.delta_build_ok = build_ok ? 1 : 0;
+        result.delta_saved_rate = branch.logical_saved_rate;
+    }
+
+    llama_memory_seq_rm(memory, scratch_seq, -1, -1);
 }
 
 // =============================================================================
@@ -1232,18 +1301,23 @@ static std::vector<online_result> run_online_experiment(
             }
             result.prefix_ms = now_ms() - prefix_start;
 
-            llama_kv_delta_probe_stats probe = {};
-            const bool probe_ok = llama_kv_seq_delta_probe(
-                    context,
-                    nodes[node_index].anchor_seq_id,
-                    child_cache_seq,
-                    0,
-                    (int) tokens.prefix.size(),
-                    &probe);
-            result.delta_candidate = probe_ok && probe.can_reuse_as_delta ? 1 : 0;
-            result.prefix_kv_cos = probe.kv_cos_avg;
-            result.prefix_kv_l2 = probe.kv_l2_avg;
-            result.mode = "build_cross_lora_full_prefix_variant";
+            if (options.cross_lora_policy == "sync") {
+                build_online_delta(
+                        context,
+                        memory,
+                        nodes[node_index].anchor_seq_id,
+                        child_cache_seq,
+                        request_seq,
+                        (int) tokens.prefix.size(),
+                        nodes[node_index].anchor_lora_id,
+                        request.lora_id,
+                        result);
+                result.mode = "build_cross_lora_sync_delta";
+            } else if (options.cross_lora_policy == "deferred") {
+                result.mode = "build_cross_lora_deferred_delta";
+            } else {
+                result.mode = "build_cross_lora_full_kv_only";
+            }
 
             nodes[node_index].variants.push_back({ request.lora_id, child_cache_seq, 0 });
             variant = &nodes[node_index].variants.back();
@@ -1282,6 +1356,22 @@ static std::vector<online_result> run_online_experiment(
                     result);
         }
         llama_memory_seq_rm(memory, request_seq, -1, -1);
+        if (result.cross_lora_prefix_match &&
+                options.cross_lora_policy == "deferred" &&
+                variant != nullptr) {
+            const double background_start = now_ms();
+            build_online_delta(
+                    context,
+                    memory,
+                    nodes[node_index].anchor_seq_id,
+                    variant->cache_seq_id,
+                    request_seq,
+                    (int) tokens.prefix.size(),
+                    nodes[node_index].anchor_lora_id,
+                    request.lora_id,
+                    result);
+            result.delta_background_ms = now_ms() - background_start;
+        }
         result.cache_nodes = (int) nodes.size();
         result.cache_variants = count_variants(nodes);
         result.physical_cache_tokens = count_cache_tokens(nodes);
@@ -1347,7 +1437,8 @@ static void save_online_results(
     output << "benchmark,request_id,arrival_ms,user_id,session_id,app_name,group_name,"
            << "context_id,lora_id,lora_name,mode,node_id,exact_prefix_hit,"
            << "same_lora_variant_hit,cross_lora_prefix_match,prefix_tokens,suffix_tokens,"
-           << "prompt_tokens,delta_candidate,prefix_kv_cos,prefix_kv_l2,lora_bind_ms,"
+           << "prompt_tokens,delta_candidate,prefix_kv_cos,prefix_kv_l2,delta_probe_ms,"
+           << "delta_build_ms,delta_background_ms,delta_build_ok,delta_saved_rate,lora_bind_ms,"
            << "prefix_ms,suffix_ms,ttft_ms,decode_ms,total_ms,tps,cache_nodes,"
            << "cache_variants,physical_cache_tokens\n";
     for (const auto & row : results) {
@@ -1361,6 +1452,9 @@ static void save_online_results(
                << row.prefix_tokens << ',' << row.suffix_tokens << ','
                << row.prompt_tokens << ',' << row.delta_candidate << ','
                << row.prefix_kv_cos << ',' << row.prefix_kv_l2 << ','
+               << row.delta_probe_ms << ',' << row.delta_build_ms << ','
+               << row.delta_background_ms << ',' << row.delta_build_ok << ','
+               << row.delta_saved_rate << ','
                << row.lora_bind_ms << ',' << row.prefix_ms << ',' << row.suffix_ms << ','
                << row.ttft_ms << ',' << row.decode_ms << ',' << row.total_ms << ','
                << row.tps << ',' << row.cache_nodes << ',' << row.cache_variants << ','
@@ -1411,7 +1505,6 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // 加载模型
     ggml_backend_load_all();
     llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers = options.n_gpu_layers;
@@ -1424,7 +1517,6 @@ int main(int argc, char ** argv) {
     }
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
-    // 加载 LoRA adapters
     std::unordered_map<int, lora_runtime *> loaded_loras;
     for (auto & lora : lora_list) {
         if (lora.adapter_path.empty()) {
@@ -1457,12 +1549,13 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    // 加载数据集
-    const std::vector<dataset_request> delta_requests = load_requests(delta_request_path);
-    const std::vector<delta_pair_item> delta_pairs = load_delta_pairs(delta_pair_path);
-    const std::vector<dataset_request> grouped_requests = load_requests(grouped_request_path);
+    const std::vector<dataset_request> delta_requests =
+            load_requests(delta_request_path);
+    const std::vector<delta_pair_item> delta_pairs =
+            load_delta_pairs(delta_pair_path);
+    const std::vector<dataset_request> grouped_requests =
+            load_requests(grouped_request_path);
 
-    // 构建请求映射
     std::unordered_map<int, dataset_request> delta_request_map;
     for (const auto & request : delta_requests) {
         delta_request_map[request.request_id] = request;
@@ -1475,7 +1568,6 @@ int main(int argc, char ** argv) {
             grouped_requests.size(),
             loaded_loras.size());
 
-    // ===== 实验 1: Delta 探测 =====
     std::vector<delta_result> delta_results;
     std::vector<delta_layer_result> delta_layers;
     run_delta_experiment(
@@ -1489,7 +1581,6 @@ int main(int argc, char ** argv) {
             delta_layers);
     save_delta_results(options.output_dir, delta_results, delta_layers);
 
-    // ===== 实验 2a: Baseline（无缓存）=====
     std::vector<online_result> online_results = run_baseline_experiment(
             model,
             vocab,
@@ -1497,7 +1588,6 @@ int main(int argc, char ** argv) {
             grouped_requests,
             loaded_loras);
 
-    // ===== 实验 2b: Online（带缓存）=====
     std::vector<prefix_node> final_nodes;
     std::vector<online_result> exact_prefix_results = run_online_experiment(
             model,
@@ -1513,7 +1603,6 @@ int main(int argc, char ** argv) {
     save_online_results(options.output_dir, online_results);
     save_tree_summary(options.output_dir, final_nodes);
 
-    // 清理
     for (auto & lora : lora_list) {
         if (lora.adapter) llama_adapter_lora_free(lora.adapter);
     }
