@@ -841,20 +841,6 @@ extern "C" {
             llama_pos p0,
             llama_pos p1,
             struct llama_kv_delta_materialize_stats * stats);
-    // Restore a target KV range from an anchor sequence and a previously
-    // registered Q8 delta branch. Unlike llama_kv_seq_delta_materialize(),
-    // this does not require the full child KV to remain resident.
-    LLAMA_API bool llama_kv_seq_delta_materialize_branch(
-            struct llama_context * ctx,
-            llama_seq_id seq_anchor,
-            llama_seq_id seq_child_delta,
-            llama_seq_id seq_dst,
-            llama_pos p0,
-            llama_pos p1,
-            struct llama_kv_delta_materialize_stats * stats);
-    LLAMA_API bool llama_kv_seq_delta_remove_branch(
-            struct llama_context * ctx,
-            llama_seq_id seq_child_delta);
     LLAMA_API bool llama_get_kv_memory_stats(
             const struct llama_context * ctx,
             uint32_t page_size,

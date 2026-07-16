@@ -74,7 +74,6 @@ struct experiment_options {
     int prefix_chunk_tokens = 128;
     int max_host_delta_mb = 1024;
     std::string prefetch_policy = "none";
-    std::string prefetch_storage = "auto"; // auto | full | delta
     std::string background_policy = "arrival";
     double background_min_gap_ms = 15000.0;
 };
@@ -99,7 +98,6 @@ static void print_usage(const char * program) {
             "  --prefix-chunk-tokens N\n"
             "  --max-host-delta-mb N\n"
             "  --prefetch-policy none|oracle\n"
-            "  --prefetch-storage auto|full|delta\n"
             "  --background-policy none|arrival|unlimited\n"
             "  --background-min-gap-ms N\n",
             program);
@@ -207,16 +205,6 @@ static bool parse_options(
             options.prefetch_policy = value;
             if (options.prefetch_policy != "none" && options.prefetch_policy != "oracle") {
                 fprintf(stderr, "invalid prefetch policy: %s\n", value);
-                return false;
-            }
-        } else if (arg == "--prefetch-storage") {
-            value = require_value(i);
-            if (!value) return false;
-            options.prefetch_storage = value;
-            if (options.prefetch_storage != "auto" &&
-                    options.prefetch_storage != "full" &&
-                    options.prefetch_storage != "delta") {
-                fprintf(stderr, "invalid prefetch storage: %s\n", value);
                 return false;
             }
         } else if (arg == "--background-policy") {
@@ -347,17 +335,12 @@ struct online_result {
     int chunk_hit_tokens = 0;
     int materialize_ok = 0;
     double materialize_ms = 0.0;
-    double delta_validation_ms = 0.0;
     double reconstruction_cos = 0.0;
     double reconstruction_l2 = 0.0;
     int predicted_lora_id = -1;
     double idle_gap_ms = 0.0;
     double prefetch_ms = 0.0;
     int prefetch_built = 0;
-    int prefetch_full_built = 0;
-    int prefetch_delta_built = 0;
-    int prefetch_skipped_no_anchor = 0;
-    int prefetch_dropped_expired = 0;
     int host_delta_variants = 0;
     unsigned long long host_delta_bytes = 0;
     int background_queue_length = 0;
@@ -414,8 +397,6 @@ struct prefix_variant {
     unsigned long long delta_bytes = 0;
     double materialize_ms = 0.0;
     double predicted_probability = 0.0;
-    double reconstruction_cos = 0.0;
-    double reconstruction_l2 = 0.0;
 };
 
 struct prefix_node {
@@ -1695,8 +1676,6 @@ static bool restore_variant_v2(
         result->prefix_ms += elapsed;
         result->materialize_ms += elapsed;
         result->materialize_ok = ok ? 1 : 0;
-        result->reconstruction_cos = variant.reconstruction_cos;
-        result->reconstruction_l2 = variant.reconstruction_l2;
     }
     return ok;
 }
@@ -1766,7 +1745,8 @@ static bool convert_variant_to_host_delta(
         return false;
     }
     if (result) {
-        result->delta_validation_ms += materialize_ms;
+        result->materialize_ok = 1;
+        result->materialize_ms += materialize_ms;
         if (reconstruction_ok) {
             result->reconstruction_cos = reconstruction.kv_cos_avg;
             result->reconstruction_l2 = reconstruction.kv_l2_avg;
@@ -1776,10 +1756,6 @@ static bool convert_variant_to_host_delta(
     variant.residency = variant_residency::host_delta;
     variant.delta_bytes = delta_bytes;
     variant.materialize_ms = materialize_ms;
-    if (reconstruction_ok) {
-        variant.reconstruction_cos = reconstruction.kv_cos_avg;
-        variant.reconstruction_l2 = reconstruction.kv_l2_avg;
-    }
     return true;
 }
 
@@ -1840,10 +1816,7 @@ static int prefetch_oracle_chunks(
         llama_seq_id validation_seq,
         int request_index,
         int & next_node_id,
-        online_result & current_result,
-        int & full_built,
-        int & delta_built,
-        int & skipped_no_anchor) {
+        online_result & current_result) {
     tokenized_request tokens;
     if (!tokenize_request(vocab, next_request, tokens) || tokens.prefix.empty()) return 0;
     const int chunk_size = options.prefix_chunk_tokens > 0
@@ -1856,10 +1829,6 @@ static int prefetch_oracle_chunks(
     for (int node_id : path) {
         int index = find_node_by_id(nodes, node_id);
         if (index < 0 || find_variant(nodes[index], next_request.lora_id) != nullptr) continue;
-        if (options.prefetch_storage == "delta" && nodes[index].anchor_seq_id < 0) {
-            skipped_no_anchor++;
-            continue;
-        }
         const int depth = nodes[index].depth_tokens;
         if (!ensure_cache_capacity_v2(
                     context, memory, nodes, free_sequences, options,
@@ -1904,27 +1873,10 @@ static int prefetch_oracle_chunks(
         if (nodes[index].anchor_seq_id < 0) {
             nodes[index].anchor_seq_id = seq;
             nodes[index].anchor_lora_id = next_request.lora_id;
-            full_built++;
         } else if (nodes[index].anchor_lora_id != next_request.lora_id) {
-            if (options.prefetch_storage == "full") {
-                full_built++;
-            } else {
-                const bool converted = convert_variant_to_host_delta(
-                        context, memory, nodes[index], stored, validation_seq,
-                        options, nodes, &current_result);
-                if (converted) {
-                    delta_built++;
-                } else if (options.prefetch_storage == "delta") {
-                    llama_memory_seq_rm(memory, stored.cache_seq_id, -1, -1);
-                    free_sequences.push_back(stored.cache_seq_id);
-                    nodes[index].variants.pop_back();
-                    continue;
-                } else {
-                    full_built++;
-                }
-            }
-        } else {
-            full_built++;
+            convert_variant_to_host_delta(
+                    context, memory, nodes[index], stored, validation_seq,
+                    options, nodes, &current_result);
         }
         built++;
     }
@@ -1934,8 +1886,6 @@ static int prefetch_oracle_chunks(
 struct prefetch_job {
     dataset_request request;
     int enqueue_index = -1;
-    int target_request_id = -1;
-    long long deadline_arrival_ms = 0;
 };
 
 static std::vector<online_result> run_online_system_v2(
@@ -1964,12 +1914,6 @@ static std::vector<online_result> run_online_system_v2(
 
     for (int request_index = 0; request_index < limit; ++request_index) {
         const dataset_request & request = requests[request_index];
-        int dropped_expired = 0;
-        while (!prefetch_queue.empty() &&
-                prefetch_queue.front().target_request_id <= request.request_id) {
-            prefetch_queue.pop_front();
-            dropped_expired++;
-        }
         const auto lora_it = loras.find(request.lora_id);
         if (lora_it == loras.end()) continue;
         lora_runtime & lora = *lora_it->second;
@@ -1995,7 +1939,6 @@ static std::vector<online_result> run_online_system_v2(
         result.prefix_tokens = (int) tokens.prefix.size();
         result.suffix_tokens = (int) tokens.suffix.size();
         result.prompt_tokens = (int) tokens.full.size();
-        result.prefetch_dropped_expired = dropped_expired;
         const double request_start = now_ms();
         result.lora_bind_ms = bind_lora(context, lora);
 
@@ -2091,7 +2034,6 @@ static std::vector<online_result> run_online_system_v2(
         if (options.cross_lora_policy == "deferred" &&
                 background_allowed(options, result.idle_gap_ms)) {
             const double background_start = now_ms();
-            online_result background_metrics;
             for (int node_id : added) {
                 const int index = find_node_by_id(nodes, node_id);
                 if (index < 0) continue;
@@ -2099,7 +2041,7 @@ static std::vector<online_result> run_online_system_v2(
                 if (variant != nullptr) {
                     convert_variant_to_host_delta(
                             context, memory, nodes[index], *variant, validation_seq,
-                            options, nodes, &background_metrics);
+                            options, nodes, &result);
                 }
             }
             result.delta_background_ms = now_ms() - background_start;
@@ -2116,13 +2058,7 @@ static std::vector<online_result> run_online_system_v2(
                     break;
                 }
             }
-            if (!duplicate) {
-                prefetch_queue.push_back({
-                        next_request,
-                        request_index,
-                        next_request.request_id,
-                        next_request.arrival_ms });
-            }
+            if (!duplicate) prefetch_queue.push_back({ next_request, request_index });
         }
 
         double remaining_gap = options.background_policy == "unlimited"
@@ -2137,18 +2073,10 @@ static std::vector<online_result> run_online_system_v2(
                 continue;
             }
             const double prefetch_start = now_ms();
-            online_result prefetch_metrics;
-            int full_built = 0;
-            int delta_built = 0;
-            int skipped_no_anchor = 0;
             result.prefetch_built += prefetch_oracle_chunks(
                     context, memory, vocab, options, job.request, *predicted_lora->second,
                     nodes, free_sequences, validation_seq, request_index,
-                    next_node_id, prefetch_metrics,
-                    full_built, delta_built, skipped_no_anchor);
-            result.prefetch_full_built += full_built;
-            result.prefetch_delta_built += delta_built;
-            result.prefetch_skipped_no_anchor += skipped_no_anchor;
+                    next_node_id, result);
             const double elapsed = now_ms() - prefetch_start;
             result.prefetch_ms += elapsed;
             prefetch_queue.pop_front();
@@ -2230,10 +2158,9 @@ static void save_online_results(
            << "delta_build_ms,delta_background_ms,delta_build_ok,delta_saved_rate,lora_bind_ms,"
            << "prefix_ms,suffix_ms,ttft_ms,decode_ms,total_ms,tps,cache_nodes,"
            << "cache_variants,physical_cache_tokens,chunk_hit_tokens,materialize_ok,"
-           << "materialize_ms,delta_validation_ms,reconstruction_cos,reconstruction_l2,predicted_lora_id,"
-           << "idle_gap_ms,prefetch_ms,prefetch_built,prefetch_full_built,prefetch_delta_built,"
-           << "prefetch_skipped_no_anchor,prefetch_dropped_expired,host_delta_variants,"
-           << "host_delta_bytes,background_queue_length,background_overrun_ms\n";
+           << "materialize_ms,reconstruction_cos,reconstruction_l2,predicted_lora_id,"
+           << "idle_gap_ms,prefetch_ms,prefetch_built,host_delta_variants,host_delta_bytes,"
+           << "background_queue_length,background_overrun_ms\n";
     for (const auto & row : results) {
         output << csv_escape(row.benchmark) << ',' << row.request_id << ','
                << row.arrival_ms << ',' << row.user_id << ',' << row.session_id << ','
@@ -2253,14 +2180,10 @@ static void save_online_results(
                << row.tps << ',' << row.cache_nodes << ',' << row.cache_variants << ','
                << row.physical_cache_tokens << ',' << row.chunk_hit_tokens << ','
                << row.materialize_ok << ',' << row.materialize_ms << ','
-               << row.delta_validation_ms << ',' << row.reconstruction_cos << ','
-               << row.reconstruction_l2 << ','
+               << row.reconstruction_cos << ',' << row.reconstruction_l2 << ','
                << row.predicted_lora_id << ',' << row.idle_gap_ms << ','
                << row.prefetch_ms << ',' << row.prefetch_built << ','
-               << row.prefetch_full_built << ',' << row.prefetch_delta_built << ','
-               << row.prefetch_skipped_no_anchor << ','
-               << row.prefetch_dropped_expired << ',' << row.host_delta_variants << ','
-               << row.host_delta_bytes << ','
+               << row.host_delta_variants << ',' << row.host_delta_bytes << ','
                << row.background_queue_length << ',' << row.background_overrun_ms << '\n';
     }
 }
@@ -2273,8 +2196,7 @@ static void save_tree_summary(
     output << "node_id,parent_node_id,group_name,context_id,prefix_hash,prefix_tokens,"
            << "chunk_begin,chunk_end,segment_kind,anchor_lora_id,node_hit_count,"
            << "last_access_index,variant_lora_id,variant_seq_id,variant_hit_count,"
-           << "variant_residency,delta_bytes,materialize_ms,predicted_probability,"
-           << "reconstruction_cos,reconstruction_l2\n";
+           << "variant_residency,delta_bytes,materialize_ms,predicted_probability\n";
     for (const auto & node : nodes) {
         for (const auto & variant : node.variants) {
             output << node.node_id << ',' << node.parent_node_id << ','
@@ -2288,8 +2210,7 @@ static void save_tree_summary(
                    << variant.hit_count << ','
                    << (variant.residency == variant_residency::gpu_full ? "gpu_full" : "host_delta")
                    << ',' << variant.delta_bytes << ',' << variant.materialize_ms << ','
-                   << variant.predicted_probability << ',' << variant.reconstruction_cos << ','
-                   << variant.reconstruction_l2 << '\n';
+                   << variant.predicted_probability << '\n';
         }
     }
 }

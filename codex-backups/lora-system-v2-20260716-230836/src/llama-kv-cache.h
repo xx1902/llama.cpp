@@ -299,14 +299,6 @@ public:
             llama_pos p0,
             llama_pos p1,
             kv_delta_materialize_stats & stats);
-    bool seq_delta_materialize_branch(
-            llama_seq_id seq_anchor,
-            llama_seq_id seq_child_delta,
-            llama_seq_id seq_dst,
-            llama_pos p0,
-            llama_pos p1,
-            kv_delta_materialize_stats & stats);
-    bool seq_delta_remove_branch(llama_seq_id seq_child_delta);
     bool seq_delta_probe(
             llama_seq_id seq_a,
             llama_seq_id seq_b,
