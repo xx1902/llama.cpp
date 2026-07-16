@@ -1394,25 +1394,24 @@ static void save_tree_summary(
 
 int main(int argc, char ** argv) {
     std::setlocale(LC_NUMERIC, "C");
-
+    // 解析参数
     experiment_options options;
     if (!parse_options(argc, argv, options)) {
         return argc > 1 ? 1 : 0;
     }
+    // 构造文件路径
+    const std::string delta_request_path = options.workload_dir + "/delta/delta_requests.jsonl";
+    const std::string delta_pair_path = options.workload_dir + "/delta/delta_pairs.jsonl";
+    const std::string grouped_request_path = options.workload_dir + "/grouped/grouped_requests.jsonl";
 
-    const std::string delta_request_path =
-            options.workload_dir + "/delta/delta_requests.jsonl";
-    const std::string delta_pair_path =
-            options.workload_dir + "/delta/delta_pairs.jsonl";
-    const std::string grouped_request_path =
-            options.workload_dir + "/grouped/grouped_requests.jsonl";
-
+    // 加载 LoRA 配置
     std::vector<lora_runtime> lora_list = load_lora_config(options.lora_config_path);
     if (lora_list.empty()) {
         fprintf(stderr, "no LoRA configuration loaded\n");
         return 1;
     }
 
+    // 加载模型
     ggml_backend_load_all();
     llama_model_params model_params = llama_model_default_params();
     model_params.n_gpu_layers = options.n_gpu_layers;
@@ -1425,6 +1424,7 @@ int main(int argc, char ** argv) {
     }
     const llama_vocab * vocab = llama_model_get_vocab(model);
 
+    // 加载 LoRA adapters
     std::unordered_map<int, lora_runtime *> loaded_loras;
     for (auto & lora : lora_list) {
         if (lora.adapter_path.empty()) {
@@ -1457,13 +1457,12 @@ int main(int argc, char ** argv) {
         return 1;
     }
 
-    const std::vector<dataset_request> delta_requests =
-            load_requests(delta_request_path);
-    const std::vector<delta_pair_item> delta_pairs =
-            load_delta_pairs(delta_pair_path);
-    const std::vector<dataset_request> grouped_requests =
-            load_requests(grouped_request_path);
+    // 加载数据集
+    const std::vector<dataset_request> delta_requests = load_requests(delta_request_path);
+    const std::vector<delta_pair_item> delta_pairs = load_delta_pairs(delta_pair_path);
+    const std::vector<dataset_request> grouped_requests = load_requests(grouped_request_path);
 
+    // 构建请求映射
     std::unordered_map<int, dataset_request> delta_request_map;
     for (const auto & request : delta_requests) {
         delta_request_map[request.request_id] = request;
@@ -1476,6 +1475,7 @@ int main(int argc, char ** argv) {
             grouped_requests.size(),
             loaded_loras.size());
 
+    // ===== 实验 1: Delta 探测 =====
     std::vector<delta_result> delta_results;
     std::vector<delta_layer_result> delta_layers;
     run_delta_experiment(
@@ -1489,6 +1489,7 @@ int main(int argc, char ** argv) {
             delta_layers);
     save_delta_results(options.output_dir, delta_results, delta_layers);
 
+    // ===== 实验 2a: Baseline（无缓存）=====
     std::vector<online_result> online_results = run_baseline_experiment(
             model,
             vocab,
@@ -1496,6 +1497,7 @@ int main(int argc, char ** argv) {
             grouped_requests,
             loaded_loras);
 
+    // ===== 实验 2b: Online（带缓存）=====
     std::vector<prefix_node> final_nodes;
     std::vector<online_result> exact_prefix_results = run_online_experiment(
             model,
@@ -1511,6 +1513,7 @@ int main(int argc, char ** argv) {
     save_online_results(options.output_dir, online_results);
     save_tree_summary(options.output_dir, final_nodes);
 
+    // 清理
     for (auto & lora : lora_list) {
         if (lora.adapter) llama_adapter_lora_free(lora.adapter);
     }

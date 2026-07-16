@@ -114,6 +114,11 @@ poetry.toml
 /examples/simple-lora-kv/output
 
 /examples/lora-base/output
+/examples/lora-base-test/output
+/examples/lora-base-test/output_indomain
+/examples/lora-base-test/output_similarity_sweep
+/examples/lora-base-test/original_real_default
+
 
 # Test binaries
 /tests/test-backend-ops
