@@ -41,7 +41,6 @@ class LogicalLora:
     name: str
     task: str
     is_anchor: bool = False
-    actual_adapter_path: str | None = None
 
 
 GROUPS: dict[str, list[LogicalLora]] = {
@@ -61,13 +60,6 @@ GROUPS: dict[str, list[LogicalLora]] = {
         LogicalLora(8, "information_queries", "Generate useful search queries.", False),
     ],
 }
-
-# A profile can replace GROUPS and route all App events to one selected group.
-# This is useful when the available real adapters cover one application family
-# more faithfully than the placeholder three-group workload.
-ACTIVE_DEFAULT_GROUP = "conversation"
-ACTIVE_APP_GROUP_KEYWORDS: dict[str, set[str]] = {}
-ACTIVE_PROFILE_NAME = "default"
 
 
 WRITING_APP_KEYWORDS = {
@@ -111,44 +103,6 @@ def clean_text(value: object) -> str:
     return SPACE_RE.sub(" ", text).strip()
 
 
-def load_workload_profile(path: Path) -> None:
-    """Replace logical LoRA groups and App routing from a JSON profile."""
-    global GROUPS, ACTIVE_DEFAULT_GROUP, ACTIVE_APP_GROUP_KEYWORDS, ACTIVE_PROFILE_NAME
-
-    profile = json.loads(path.read_text(encoding="utf-8"))
-    groups: dict[str, list[LogicalLora]] = {}
-    for group_name, entries in profile["groups"].items():
-        groups[group_name] = [
-            LogicalLora(
-                lora_id=int(entry["lora_id"]),
-                name=str(entry["name"]),
-                task=str(entry["task"]),
-                is_anchor=bool(entry.get("is_anchor", False)),
-                actual_adapter_path=entry.get("actual_adapter_path"),
-            )
-            for entry in entries
-        ]
-
-    all_ids = [lora.lora_id for loras in groups.values() for lora in loras]
-    if len(all_ids) != len(set(all_ids)):
-        raise ValueError("workload profile contains duplicate lora_id values")
-    if not groups:
-        raise ValueError("workload profile contains no groups")
-
-    default_group = profile.get("default_group", next(iter(groups)))
-    if default_group not in groups:
-        raise ValueError(f"default_group is not defined: {default_group}")
-
-    GROUPS = groups
-    ACTIVE_DEFAULT_GROUP = default_group
-    ACTIVE_APP_GROUP_KEYWORDS = {
-        group_name: {str(keyword).lower() for keyword in keywords}
-        for group_name, keywords in profile.get("app_group_keywords", {}).items()
-        if group_name in groups
-    }
-    ACTIVE_PROFILE_NAME = str(profile.get("name", path.stem))
-
-
 def stable_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
 
@@ -175,11 +129,9 @@ def truncate_context(text: str, max_chars: int) -> str:
 def make_prefix(group_name: str, context: str) -> str:
     # The task is deliberately placed at the end so every LoRA sees an exact
     # shared token prefix before branching into a different instruction.
-    # group_name remains metadata only; writing it into the prompt would make
-    # positive and control groups receive slightly different token sequences.
-    del group_name
     return (
         "You are an on-device assistant.\n"
+        f"Context type: {group_name}.\n"
         "Context:\n"
         f"{context}\n\n"
         "Task:\n"
@@ -266,12 +218,8 @@ def build_delta_workload(
     request_id = 0
 
     sources = {
-        group_name: context_pool_for_group(
-            group_name,
-            writing_contexts,
-            conversation_contexts_data,
-        )
-        for group_name in GROUPS
+        "writing": writing_contexts,
+        "conversation": conversation_contexts_data,
     }
 
     for group_name, contexts in sources.items():
@@ -336,22 +284,13 @@ def build_delta_workload(
 
 def app_to_group(app_name: str) -> str:
     normalized = clean_text(app_name).lower()
-    if ACTIVE_APP_GROUP_KEYWORDS:
-        for group_name, keywords in ACTIVE_APP_GROUP_KEYWORDS.items():
-            if any(keyword in normalized for keyword in keywords):
-                return group_name
-        return ACTIVE_DEFAULT_GROUP
-
     if any(keyword in normalized for keyword in WRITING_APP_KEYWORDS):
-        if "writing" in GROUPS:
-            return "writing"
+        return "writing"
     if any(keyword in normalized for keyword in CONVERSATION_APP_KEYWORDS):
-        if "conversation" in GROUPS:
-            return "conversation"
+        return "conversation"
     if any(keyword in normalized for keyword in INFORMATION_APP_KEYWORDS):
-        if "information" in GROUPS:
-            return "information"
-    return ACTIVE_DEFAULT_GROUP if ACTIVE_DEFAULT_GROUP in GROUPS else next(iter(GROUPS))
+        return "information"
+    return "conversation"
 
 
 def pareto_choice(rng: np.random.Generator, items: list[LogicalLora], alpha: float) -> LogicalLora:
@@ -438,7 +377,7 @@ def context_pool_for_group(
     writing_contexts: list[dict],
     conversation_contexts_data: list[dict],
 ) -> list[dict]:
-    if "conversation" in group_name.lower() or "chat" in group_name.lower():
+    if group_name == "conversation":
         return conversation_contexts_data
     return writing_contexts
 
@@ -751,7 +690,7 @@ def save_group_config(output_dir: Path) -> None:
             {
                 "lora_id": lora.lora_id,
                 "logical_name": lora.name,
-                "actual_adapter_path": lora.actual_adapter_path,
+                "actual_adapter_path": None,
                 "task": lora.task,
                 "is_anchor": lora.is_anchor,
             }
@@ -791,50 +730,29 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gru-min-history", type=int, default=3)
     parser.add_argument("--gru-duration-slice-min", type=int, default=10)
     parser.add_argument("--gru-max-duration-min", type=int, default=200)
-    parser.add_argument(
-        "--profile",
-        type=Path,
-        default=None,
-        help="Optional JSON profile that defines real LoRA groups and adapter paths.",
-    )
-    parser.add_argument(
-        "--skip-gru",
-        action="store_true",
-        help="Skip GRU files when building a KV-only workload profile.",
-    )
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    if args.profile is not None:
-        load_workload_profile(args.profile)
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
     xsum = load_from_disk(str(args.dataset_root / "xsum_dataset"))
-    needs_conversation_context = any(
-        "conversation" in group_name.lower() or "chat" in group_name.lower()
-        for group_name in GROUPS
-    )
+    sharegpt = load_from_disk(str(args.dataset_root / "sharegpt52k_dataset"))
 
     writing_contexts = xsum_contexts(
         xsum,
         args.contexts_per_source,
         args.max_context_chars,
     )
-    conversation_contexts_data: list[dict] = []
-    if needs_conversation_context:
-        sharegpt = load_from_disk(str(args.dataset_root / "sharegpt52k_dataset"))
-        conversation_contexts_data = sharegpt_contexts(
-            sharegpt,
-            args.contexts_per_source,
-            args.max_context_chars,
-        )
+    conversation_contexts_data = sharegpt_contexts(
+        sharegpt,
+        args.contexts_per_source,
+        args.max_context_chars,
+    )
 
-    if not writing_contexts:
-        raise RuntimeError("No valid XSum contexts were produced")
-    if needs_conversation_context and not conversation_contexts_data:
-        raise RuntimeError("No valid ShareGPT contexts were produced")
+    if not writing_contexts or not conversation_contexts_data:
+        raise RuntimeError("No valid XSum or ShareGPT contexts were produced")
 
     delta_stats = build_delta_workload(
         args.output_dir / "delta",
@@ -854,30 +772,21 @@ def main() -> None:
         args.time_scale,
         args.kill_gap_seconds,
     )
-    if args.skip_gru:
-        gru_stats = {
-            "gru_users": 0,
-            "gru_events": 0,
-            "gru_samples": 0,
-            "gru_duration_slice_min": args.gru_duration_slice_min,
-        }
-    else:
-        gru_stats = build_gru_workload(
-            args.output_dir / "gru",
-            args.dataset_root / "lsapp" / "df_start.csv",
-            args.gru_user_limit,
-            args.gru_events_per_user,
-            args.gru_history_length,
-            args.gru_min_history,
-            args.gru_duration_slice_min,
-            args.gru_max_duration_min,
-        )
+    gru_stats = build_gru_workload(
+        args.output_dir / "gru",
+        args.dataset_root / "lsapp" / "df_start.csv",
+        args.gru_user_limit,
+        args.gru_events_per_user,
+        args.gru_history_length,
+        args.gru_min_history,
+        args.gru_duration_slice_min,
+        args.gru_max_duration_min,
+    )
     save_group_config(args.output_dir)
 
     summary = {
         "dataset_root": str(args.dataset_root),
         "output_dir": str(args.output_dir),
-        "profile_name": ACTIVE_PROFILE_NAME,
         "xsum_contexts": len(writing_contexts),
         "sharegpt_contexts": len(conversation_contexts_data),
         **delta_stats,
