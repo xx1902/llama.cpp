@@ -866,10 +866,6 @@ extern "C" {
             const char * path,
             int32_t parent_node_id,
             int32_t child_node_id);
-    LLAMA_API bool llama_kv_seq_delta_get_branch_stats(
-            const struct llama_context * ctx,
-            llama_seq_id seq_child_delta,
-            struct llama_kv_delta_branch_stats * stats);
     LLAMA_API bool llama_get_kv_memory_stats(
             const struct llama_context * ctx,
             uint32_t page_size,

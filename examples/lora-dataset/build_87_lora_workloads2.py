@@ -475,24 +475,14 @@ def build_group_metadata(
     return config, app_to_group, sorted(mapping_rows, key=lambda row: row["app_id"])
 
 
-def make_prefix_segments(context: str) -> list[dict[str, str]]:
-    return [
-        {
-            "type": "shared_system",
-            "text": (
-                "You are an on-device assistant.\n"
-                "The following user context may be shared by several applications.\n"
-            ),
-        },
-        {
-            "type": "user_context",
-            "text": f"User context:\n{context}\n\nApplication task:\n",
-        },
-    ]
-
-
 def make_prefix(context: str) -> str:
-    return "".join(segment["text"] for segment in make_prefix_segments(context))
+    return (
+        "You are an on-device assistant.\n"
+        "The following user context may be shared by several applications.\n"
+        "User context:\n"
+        f"{context}\n\n"
+        "Application task:\n"
+    )
 
 
 def task_suffix(app_name: str, adapter: Adapter) -> str:
@@ -550,7 +540,6 @@ def build_delta_workload(
                         "task": suffix,
                         "chunk_token_size": chunk_tokens,
                         "prefix_segment_types": ["shared_system", "user_context"],
-                        "prefix_segments": make_prefix_segments(context_item["context"]),
                         "estimated_common_prefix_tokens": estimated_tokens(prefix),
                     }
                 )
@@ -734,7 +723,6 @@ def build_online_workload(
                 "task": suffix,
                 "chunk_token_size": chunk_tokens,
                 "prefix_segment_types": ["shared_system", "user_context"],
-                "prefix_segments": make_prefix_segments(current_context["context"]),
                 "estimated_common_prefix_tokens": estimated_tokens(prefix),
             }
         )
@@ -786,8 +774,6 @@ def build_online_workload(
                 "common_prefix_hash": stable_hash(smoke_prefix),
                 "prompt": smoke_prefix + task_suffix(app_name, adapter),
                 "chunk_token_size": chunk_tokens,
-                "prefix_segment_types": ["shared_system", "user_context"],
-                "prefix_segments": make_prefix_segments(smoke_context["context"]),
             }
         )
     write_jsonl(output_dir / "all_apps_same_prefix.jsonl", smoke_rows)

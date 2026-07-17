@@ -317,9 +317,6 @@ public:
             const char * path,
             int32_t parent_node_id,
             int32_t child_node_id);
-    bool seq_delta_get_branch_stats(
-            llama_seq_id seq_child_delta,
-            kv_delta_branch & stats) const;
     bool seq_delta_probe(
             llama_seq_id seq_a,
             llama_seq_id seq_b,

@@ -80,9 +80,6 @@ struct experiment_options {
     std::string prefetch_storage = "auto"; // auto | full | delta
     std::string prediction_file;
     int prediction_top_k = 1;
-    double prefetch_min_probability = 0.0;
-    int max_prefetch_chunks_per_lora = 0; // 0 keeps the original behavior.
-    double prefetch_cost_safety_factor = 1.0;
     std::string delta_store_dir;
     std::string delta_store_policy = "none"; // none | build | load | auto
     std::string background_policy = "arrival";
@@ -117,9 +114,6 @@ static void print_usage(const char * program) {
             "  --prefetch-storage auto|full|delta\n"
             "  --prediction-file FILE\n"
             "  --prediction-top-k N\n"
-            "  --prefetch-min-probability P\n"
-            "  --max-prefetch-chunks-per-lora N\n"
-            "  --prefetch-cost-safety-factor F\n"
             "  --delta-store-dir DIR\n"
             "  --delta-store-policy none|build|load|auto\n"
             "  --background-policy none|arrival|cost-aware|unlimited\n"
@@ -264,19 +258,6 @@ static bool parse_options(
             value = require_value(i);
             if (!value || !parse_int(value, options.prediction_top_k) ||
                     options.prediction_top_k <= 0) return false;
-        } else if (arg == "--prefetch-min-probability") {
-            value = require_value(i);
-            if (!value || !parse_double(value, options.prefetch_min_probability) ||
-                    options.prefetch_min_probability < 0.0 ||
-                    options.prefetch_min_probability > 1.0) return false;
-        } else if (arg == "--max-prefetch-chunks-per-lora") {
-            value = require_value(i);
-            if (!value || !parse_int(value, options.max_prefetch_chunks_per_lora) ||
-                    options.max_prefetch_chunks_per_lora < 0) return false;
-        } else if (arg == "--prefetch-cost-safety-factor") {
-            value = require_value(i);
-            if (!value || !parse_double(value, options.prefetch_cost_safety_factor) ||
-                    options.prefetch_cost_safety_factor < 1.0) return false;
         } else if (arg == "--delta-store-dir") {
             value = require_value(i);
             if (!value) return false;
@@ -331,24 +312,6 @@ static bool parse_options(
                 options.max_cache_variants);
         return false;
     }
-    if (options.system_v2) {
-        // Keep explicit headroom for the foreground request sequence. The
-        // unified KV cache is bounded by n_ctx, so a larger logical cache
-        // budget would let background jobs consume cells needed by prefill.
-        const int foreground_reserve = std::max({
-                1024,
-                options.n_batch * 2,
-                options.context_chunk_tokens * 2 + options.n_predict });
-        const int safe_cache_tokens = std::max(1, options.n_ctx - foreground_reserve);
-        if (options.max_cache_tokens > safe_cache_tokens) {
-            fprintf(stderr,
-                    "clamping --max-cache-tokens from %d to %d: n_ctx=%d, "
-                    "foreground reserve=%d\n",
-                    options.max_cache_tokens, safe_cache_tokens,
-                    options.n_ctx, foreground_reserve);
-            options.max_cache_tokens = safe_cache_tokens;
-        }
-    }
     return true;
 }
 
@@ -364,7 +327,6 @@ struct lora_runtime {
     std::string adapter_path;            // 适配器文件路径
     bool is_anchor = false;              // 是否是 anchor LoRA
     llama_adapter_lora * adapter = nullptr;  // llama.cpp 适配器指针
-    double initial_load_ms = 0.0;
 };
 
 // 数据集请求
@@ -481,14 +443,6 @@ struct online_result {
     int delta_store_saved = 0;
     int delta_candidates_marked = 0;
     int delta_compressed_background = 0;
-    int delta_jobs_dequeued = 0;
-    int delta_skipped_missing_node = 0;
-    int delta_skipped_nonresident = 0;
-    int delta_rejected_probe = 0;
-    int delta_rejected_quality = 0;
-    int delta_rejected_build = 0;
-    int delta_rejected_host_limit = 0;
-    int delta_rejected_validation = 0;
     int prefetch_delta_materialized = 0;
     int background_anchor_built = 0;
     int reconstruction_checks = 0;
@@ -1446,10 +1400,6 @@ static std::vector<online_result> run_online_experiment(
     const int limit = std::min(options.max_online_requests, (int) requests.size());
 
     for (int request_index = 0; request_index < limit; ++request_index) {
-        if (request_index % 10 == 0 || request_index + 1 == limit) {
-            fprintf(stderr, "online progress: %d/%d, nodes=%d\n",
-                    request_index + 1, limit, (int) nodes.size());
-        }
         const dataset_request & request = requests[request_index];
         const auto lora_it = loras.find(request.lora_id);
         if (lora_it == loras.end()) continue;
@@ -1810,11 +1760,6 @@ static void merge_delta_metrics(online_result & target, const online_result & so
     target.delta_store_bytes_read += source.delta_store_bytes_read;
     target.delta_full_kv_bytes_added += source.delta_full_kv_bytes_added;
     target.delta_bytes_added += source.delta_bytes_added;
-    target.delta_rejected_probe += source.delta_rejected_probe;
-    target.delta_rejected_quality += source.delta_rejected_quality;
-    target.delta_rejected_build += source.delta_rejected_build;
-    target.delta_rejected_host_limit += source.delta_rejected_host_limit;
-    target.delta_rejected_validation += source.delta_rejected_validation;
     target.delta_build_ok |= source.delta_build_ok;
     if (source.delta_saved_rate > 0.0) {
         target.delta_saved_rate = std::max(target.delta_saved_rate, source.delta_saved_rate);
@@ -2161,14 +2106,8 @@ static bool convert_variant_to_host_delta(
         result->prefix_kv_cos = probe.kv_cos_avg;
         result->prefix_kv_l2 = probe.kv_l2_avg;
     }
-    if (!probe_ok || !probe.can_reuse_as_delta) {
-        if (result) result->delta_rejected_probe++;
-        return false;
-    }
-    if (probe.kv_cos_avg < 0.97 || probe.kv_l2_avg > 0.25) {
-        if (result) result->delta_rejected_quality++;
-        return false;
-    }
+    if (!probe_ok || !probe.can_reuse_as_delta ||
+            probe.kv_cos_avg < 0.97 || probe.kv_l2_avg > 0.25) return false;
 
     llama_kv_delta_branch_stats branch = {};
     start = now_ms();
@@ -2180,16 +2119,12 @@ static bool convert_variant_to_host_delta(
         result->delta_build_ok = build_ok ? 1 : 0;
         result->delta_saved_rate = branch.logical_saved_rate;
     }
-    if (!build_ok) {
-        if (result) result->delta_rejected_build++;
-        return false;
-    }
+    if (!build_ok) return false;
 
     const unsigned long long delta_bytes = branch.delta_q8_bytes + branch.delta_scale_bytes;
     const unsigned long long host_limit =
             (unsigned long long) std::max(0, options.max_host_delta_mb) * 1024ULL * 1024ULL;
     if (count_host_delta_bytes(nodes) + delta_bytes > host_limit) {
-        if (result) result->delta_rejected_host_limit++;
         llama_kv_seq_delta_remove_branch(context, variant.cache_seq_id);
         return false;
     }
@@ -2218,7 +2153,6 @@ static bool convert_variant_to_host_delta(
                 0, node.depth_tokens, &reconstruction);
         llama_memory_seq_rm(memory, validation_seq, -1, -1);
         if (!materialize_ok) {
-            if (result) result->delta_rejected_validation++;
             llama_kv_seq_delta_remove_branch(context, variant.cache_seq_id);
             return false;
         }
@@ -2416,7 +2350,6 @@ static bool build_configured_anchor_for_node(
     llama_memory_seq_rm(memory, seq, -1, -1);
     bind_lora(context, anchor_lora);
     if (!eval_tokens(context, nodes[index].prefix_tokens, seq, 0, options.n_ubatch)) {
-        llama_memory_seq_rm(memory, seq, -1, -1);
         free_sequences.push_back(seq);
         return false;
     }
@@ -2485,12 +2418,7 @@ static int prefetch_oracle_chunks(
             context, memory, options, nodes, path, next_request.lora_id,
             free_sequences, request_index, current_result);
 
-    int built_this_lora = 0;
     for (int node_id : path) {
-        if (options.max_prefetch_chunks_per_lora > 0 &&
-                built_this_lora >= options.max_prefetch_chunks_per_lora) {
-            break;
-        }
         int index = find_node_by_id(nodes, node_id);
         if (index < 0) continue;
         prefix_variant * existing = find_variant(nodes[index], next_request.lora_id);
@@ -2517,7 +2445,6 @@ static int prefetch_oracle_chunks(
                         existing->host_full_state.size(), restored_seq);
                 const double restore_ms = now_ms() - restore_start;
                 if (restored == 0) {
-                    llama_memory_seq_rm(memory, restored_seq, -1, -1);
                     free_sequences.push_back(restored_seq);
                     continue;
                 }
@@ -2527,7 +2454,6 @@ static int prefetch_oracle_chunks(
                 current_result.prefetch_materialized_bytes += existing->host_full_state.size();
                 full_built++;
                 built++;
-                built_this_lora++;
                 continue;
             }
             if (existing->residency == variant_residency::host_delta &&
@@ -2553,7 +2479,6 @@ static int prefetch_oracle_chunks(
                     current_result.prefetch_materialized_bytes += existing->materialized_kv_bytes;
                     full_built++;
                     built++;
-                    built_this_lora++;
                 }
             }
             continue;
@@ -2593,7 +2518,6 @@ static int prefetch_oracle_chunks(
             ready = eval_tokens(context, cumulative, seq, 0, options.n_ubatch);
         }
         if (!ready) {
-            llama_memory_seq_rm(memory, seq, -1, -1);
             free_sequences.push_back(seq);
             continue;
         }
@@ -2631,7 +2555,6 @@ static int prefetch_oracle_chunks(
             full_built++;
         }
         built++;
-        built_this_lora++;
     }
     return built;
 }
@@ -2692,12 +2615,6 @@ static std::vector<online_result> run_online_system_v2(
     const int limit = std::min(options.max_online_requests, (int) requests.size());
 
     for (int request_index = 0; request_index < limit; ++request_index) {
-        if (request_index % 10 == 0 || request_index + 1 == limit) {
-            fprintf(stderr,
-                    "system-v2 progress: %d/%d, nodes=%d, prefetch_queue=%d, delta_queue=%d\n",
-                    request_index + 1, limit, (int) nodes.size(),
-                    (int) prefetch_queue.size(), (int) delta_queue.size());
-        }
         const dataset_request & request = requests[request_index];
         int dropped_expired = 0;
         while (!prefetch_queue.empty() &&
@@ -2729,28 +2646,6 @@ static std::vector<online_result> run_online_system_v2(
         result.suffix_tokens = (int) tokens.suffix.size();
         result.prompt_tokens = (int) tokens.full.size();
         result.prefetch_dropped_expired = dropped_expired;
-
-        // Reserve enough unified-KV cells for the entire foreground prompt
-        // and first decode tokens before looking up a cached prefix. This may
-        // demote/offload low-value background variants, but it prevents an
-        // idle compression or prefetch job from starving the next request.
-        const int foreground_tokens = std::min(
-                options.n_ctx,
-                (int) tokens.full.size() + std::max(1, options.n_predict));
-        const int protected_node_id = path.empty() ? -1 : path.back();
-        if (!ensure_cache_capacity_v2(
-                    context, memory, nodes, free_sequences, options,
-                    foreground_tokens, 0, protected_node_id,
-                    request_index, false)) {
-            llama_memory_seq_rm(memory, request_seq, -1, -1);
-            result.mode = "foreground_capacity_failed";
-            result.physical_cache_tokens = count_gpu_cache_tokens_v2(nodes);
-            result.cache_nodes = (int) nodes.size();
-            result.cache_variants = count_variants(nodes);
-            results.push_back(result);
-            continue;
-        }
-
         const double request_start = now_ms();
         result.lora_bind_ms = bind_lora(context, lora);
         int hit_index = -1;
@@ -2804,7 +2699,6 @@ static std::vector<online_result> run_online_system_v2(
                     tokens.prefix.begin() + hit_depth, tokens.prefix.end());
             if (!eval_tokens(context, remaining, request_seq, hit_depth, options.n_ubatch)) {
                 result.mode += "_prefix_eval_failed";
-                llama_memory_seq_rm(memory, request_seq, -1, -1);
                 results.push_back(result);
                 continue;
             }
@@ -2842,12 +2736,7 @@ static std::vector<online_result> run_online_system_v2(
         const double next_arrival = request_index + 1 < limit
                 ? (double) requests[request_index + 1].arrival_ms
                 : (double) request.arrival_ms;
-        const double interarrival_gap = std::max(
-                0.0, next_arrival - (double) request.arrival_ms);
-        // Background work can only use the slack left after foreground
-        // inference. Using the raw inter-arrival interval overestimates the
-        // budget and admits jobs that cannot finish before the next request.
-        result.idle_gap_ms = std::max(0.0, interarrival_gap - result.total_ms);
+        result.idle_gap_ms = std::max(0.0, next_arrival - (double) request.arrival_ms);
 
         if (options.cross_lora_policy == "deferred") {
             for (int node_id : added) {
@@ -2896,14 +2785,10 @@ static std::vector<online_result> run_online_system_v2(
                         (int) prediction_it->second.size());
                 for (int prediction_index = 0; prediction_index < top_k; ++prediction_index) {
                     const prediction_candidate & candidate = prediction_it->second[prediction_index];
-                    if (prediction_index == 0) result.predicted_lora_id = candidate.lora_id;
-                    if (candidate.probability < options.prefetch_min_probability) continue;
-                    const auto predicted_lora_it = loras.find(candidate.lora_id);
-                    if (predicted_lora_it == loras.end() || predicted_lora_it->second == nullptr) continue;
+                    if (loras.find(candidate.lora_id) == loras.end()) continue;
                     dataset_request predicted_request = request;
                     predicted_request.lora_id = candidate.lora_id;
-                    predicted_request.lora_name = predicted_lora_it->second->logical_name;
-                    predicted_request.group_name = predicted_lora_it->second->group_name;
+                    if (prediction_index == 0) result.predicted_lora_id = candidate.lora_id;
                     bool duplicate = false;
                     for (const auto & job : prefetch_queue) {
                         if (job.request.context_id == predicted_request.context_id &&
@@ -2928,9 +2813,7 @@ static std::vector<online_result> run_online_system_v2(
                 ? std::numeric_limits<double>::infinity()
                 : result.idle_gap_ms;
         while (!prefetch_queue.empty() &&
-                background_allowed(
-                        options, remaining_gap,
-                        estimated_prefetch_ms * options.prefetch_cost_safety_factor)) {
+                background_allowed(options, remaining_gap, estimated_prefetch_ms)) {
             const prefetch_job job = prefetch_queue.front();
             const auto predicted_lora = loras.find(job.request.lora_id);
             if (predicted_lora == loras.end()) {
@@ -2974,18 +2857,11 @@ static std::vector<online_result> run_online_system_v2(
                 background_allowed(options, remaining_gap, estimated_compression_ms)) {
             const delta_compress_job job = delta_queue.front();
             delta_queue.pop_front();
-            result.delta_jobs_dequeued++;
             int index = find_node_by_id(nodes, job.node_id);
-            if (index < 0) {
-                result.delta_skipped_missing_node++;
-                continue;
-            }
+            if (index < 0) continue;
             prefix_variant * variant = find_variant(nodes[index], job.lora_id);
             if (variant == nullptr || variant->delta_available ||
-                    variant->residency != variant_residency::gpu_full) {
-                result.delta_skipped_nonresident++;
-                continue;
-            }
+                    variant->residency != variant_residency::gpu_full) continue;
             if (nodes[index].anchor_seq_id < 0) {
                 auto anchor_it = group_anchors.find(nodes[index].group_name);
                 if (anchor_it == group_anchors.end() || anchor_it->second == nullptr ||
@@ -3117,9 +2993,6 @@ static void save_online_results(
            << "idle_gap_ms,prefetch_ms,prefetch_built,prefetch_full_built,prefetch_delta_built,"
            << "prefetch_skipped_no_anchor,prefetch_dropped_expired,delta_store_loaded,delta_store_saved,host_delta_variants,"
            << "delta_candidates_marked,delta_compressed_background,prefetch_delta_materialized,"
-           << "delta_jobs_dequeued,delta_skipped_missing_node,delta_skipped_nonresident,"
-           << "delta_rejected_probe,delta_rejected_quality,delta_rejected_build,"
-           << "delta_rejected_host_limit,delta_rejected_validation,"
            << "background_anchor_built,reconstruction_checks,reconstruction_cos_sum,"
            << "reconstruction_cos_min,reconstruction_l2_max,delta_full_kv_bytes_added,"
            << "delta_bytes_added,delta_store_load_ms,delta_store_bytes_read,delta_store_read_gbps,"
@@ -3156,10 +3029,6 @@ static void save_online_results(
                << row.delta_store_saved << ',' << row.host_delta_variants << ','
                << row.delta_candidates_marked << ',' << row.delta_compressed_background << ','
                << row.prefetch_delta_materialized << ','
-               << row.delta_jobs_dequeued << ',' << row.delta_skipped_missing_node << ','
-               << row.delta_skipped_nonresident << ',' << row.delta_rejected_probe << ','
-               << row.delta_rejected_quality << ',' << row.delta_rejected_build << ','
-               << row.delta_rejected_host_limit << ',' << row.delta_rejected_validation << ','
                << row.background_anchor_built << ',' << row.reconstruction_checks << ','
                << row.reconstruction_cos_sum << ',' << row.reconstruction_cos_min << ','
                << row.reconstruction_l2_max << ',' << row.delta_full_kv_bytes_added << ','
@@ -3235,8 +3104,6 @@ static void save_system_parameters(
     unsigned long long lora_bytes = 0;
     unsigned long long min_lora_bytes = std::numeric_limits<unsigned long long>::max();
     unsigned long long max_lora_bytes = 0;
-    double lora_load_total_ms = 0.0;
-    double lora_load_max_ms = 0.0;
     int valid_loras = 0;
     for (const auto & lora : loras) {
         if (lora.adapter_path.empty() || !std::filesystem::exists(lora.adapter_path)) continue;
@@ -3244,24 +3111,17 @@ static void save_system_parameters(
         lora_bytes += bytes;
         min_lora_bytes = std::min(min_lora_bytes, bytes);
         max_lora_bytes = std::max(max_lora_bytes, bytes);
-        lora_load_total_ms += lora.initial_load_ms;
-        lora_load_max_ms = std::max(lora_load_max_ms, lora.initial_load_ms);
         valid_loras++;
     }
     if (valid_loras == 0) min_lora_bytes = 0;
     std::ofstream output(output_dir + "/system_parameters.csv");
     output << "model_bytes,lora_count,total_lora_bytes,mean_lora_bytes,min_lora_bytes,max_lora_bytes,"
-           << "lora_load_total_ms,lora_load_mean_ms,lora_load_max_ms,"
            << "n_ctx,n_batch,n_ubatch,max_cache_nodes,max_cache_variants,max_cache_tokens,"
            << "max_host_delta_bytes,max_host_full_bytes,system_chunk_tokens,context_chunk_tokens,background_policy,"
-           << "background_min_gap_ms,background_safety_margin_ms,delta_validation_rate,"
-           << "prefetch_min_probability,max_prefetch_chunks_per_lora,prefetch_cost_safety_factor\n";
+           << "background_min_gap_ms,background_safety_margin_ms,delta_validation_rate\n";
     output << model_bytes << ',' << valid_loras << ',' << lora_bytes << ','
            << (valid_loras > 0 ? lora_bytes / (unsigned long long) valid_loras : 0) << ','
            << min_lora_bytes << ',' << max_lora_bytes << ','
-           << lora_load_total_ms << ','
-           << (valid_loras > 0 ? lora_load_total_ms / valid_loras : 0.0) << ','
-           << lora_load_max_ms << ','
            << options.n_ctx << ',' << options.n_batch << ',' << options.n_ubatch << ','
            << options.max_cache_nodes << ',' << options.max_cache_variants << ','
            << options.max_cache_tokens << ','
@@ -3269,10 +3129,7 @@ static void save_system_parameters(
            << (unsigned long long) options.max_host_full_mb * 1024ULL * 1024ULL << ','
            << options.system_chunk_tokens << ',' << options.context_chunk_tokens << ','
            << csv_escape(options.background_policy) << ',' << options.background_min_gap_ms << ','
-           << options.background_safety_margin_ms << ',' << options.delta_validation_rate << ','
-           << options.prefetch_min_probability << ','
-           << options.max_prefetch_chunks_per_lora << ','
-           << options.prefetch_cost_safety_factor << '\n';
+           << options.background_safety_margin_ms << ',' << options.delta_validation_rate << '\n';
 }
 
 // =============================================================================
@@ -3319,9 +3176,7 @@ int main(int argc, char ** argv) {
                     lora.logical_name.c_str());
             continue;
         }
-        const double lora_load_start = now_ms();
         lora.adapter = llama_adapter_lora_init(model, lora.adapter_path.c_str());
-        lora.initial_load_ms = now_ms() - lora_load_start;
         if (!lora.adapter) {
             fprintf(stderr,
                     "skip LoRA %d (%s): failed to load %s\n",

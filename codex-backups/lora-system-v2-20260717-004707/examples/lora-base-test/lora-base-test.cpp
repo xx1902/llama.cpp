@@ -72,23 +72,11 @@ struct experiment_options {
 
     bool system_v2 = false;
     int prefix_chunk_tokens = 128;
-    int system_chunk_tokens = 64;
-    int context_chunk_tokens = 128;
     int max_host_delta_mb = 1024;
-    int max_host_full_mb = 4096;
     std::string prefetch_policy = "none";
     std::string prefetch_storage = "auto"; // auto | full | delta
-    std::string prediction_file;
-    int prediction_top_k = 1;
-    double prefetch_min_probability = 0.0;
-    int max_prefetch_chunks_per_lora = 0; // 0 keeps the original behavior.
-    double prefetch_cost_safety_factor = 1.0;
-    std::string delta_store_dir;
-    std::string delta_store_policy = "none"; // none | build | load | auto
     std::string background_policy = "arrival";
     double background_min_gap_ms = 15000.0;
-    double background_safety_margin_ms = 10.0;
-    double delta_validation_rate = 0.10;
 };
 
 // 打印使用说明
@@ -109,23 +97,11 @@ static void print_usage(const char * program) {
             "  --cross-lora-policy off|sync|deferred\n"
             "  --system-v2 0|1\n"
             "  --prefix-chunk-tokens N\n"
-            "  --system-chunk-tokens N\n"
-            "  --context-chunk-tokens N\n"
             "  --max-host-delta-mb N\n"
-            "  --max-host-full-mb N\n"
-            "  --prefetch-policy none|oracle|file\n"
+            "  --prefetch-policy none|oracle\n"
             "  --prefetch-storage auto|full|delta\n"
-            "  --prediction-file FILE\n"
-            "  --prediction-top-k N\n"
-            "  --prefetch-min-probability P\n"
-            "  --max-prefetch-chunks-per-lora N\n"
-            "  --prefetch-cost-safety-factor F\n"
-            "  --delta-store-dir DIR\n"
-            "  --delta-store-policy none|build|load|auto\n"
-            "  --background-policy none|arrival|cost-aware|unlimited\n"
-            "  --background-min-gap-ms N\n"
-            "  --background-safety-margin-ms N\n"
-            "  --delta-validation-rate 0..1\n",
+            "  --background-policy none|arrival|unlimited\n"
+            "  --background-min-gap-ms N\n",
             program);
 }
 
@@ -222,27 +198,14 @@ static bool parse_options(
         } else if (arg == "--prefix-chunk-tokens") {
             value = require_value(i);
             if (!value || !parse_int(value, options.prefix_chunk_tokens)) return false;
-        } else if (arg == "--system-chunk-tokens") {
-            value = require_value(i);
-            if (!value || !parse_int(value, options.system_chunk_tokens) ||
-                    options.system_chunk_tokens <= 0) return false;
-        } else if (arg == "--context-chunk-tokens") {
-            value = require_value(i);
-            if (!value || !parse_int(value, options.context_chunk_tokens) ||
-                    options.context_chunk_tokens <= 0) return false;
         } else if (arg == "--max-host-delta-mb") {
             value = require_value(i);
             if (!value || !parse_int(value, options.max_host_delta_mb)) return false;
-        } else if (arg == "--max-host-full-mb") {
-            value = require_value(i);
-            if (!value || !parse_int(value, options.max_host_full_mb) ||
-                    options.max_host_full_mb < 0) return false;
         } else if (arg == "--prefetch-policy") {
             value = require_value(i);
             if (!value) return false;
             options.prefetch_policy = value;
-            if (options.prefetch_policy != "none" && options.prefetch_policy != "oracle" &&
-                    options.prefetch_policy != "file") {
+            if (options.prefetch_policy != "none" && options.prefetch_policy != "oracle") {
                 fprintf(stderr, "invalid prefetch policy: %s\n", value);
                 return false;
             }
@@ -256,49 +219,12 @@ static bool parse_options(
                 fprintf(stderr, "invalid prefetch storage: %s\n", value);
                 return false;
             }
-        } else if (arg == "--prediction-file") {
-            value = require_value(i);
-            if (!value) return false;
-            options.prediction_file = value;
-        } else if (arg == "--prediction-top-k") {
-            value = require_value(i);
-            if (!value || !parse_int(value, options.prediction_top_k) ||
-                    options.prediction_top_k <= 0) return false;
-        } else if (arg == "--prefetch-min-probability") {
-            value = require_value(i);
-            if (!value || !parse_double(value, options.prefetch_min_probability) ||
-                    options.prefetch_min_probability < 0.0 ||
-                    options.prefetch_min_probability > 1.0) return false;
-        } else if (arg == "--max-prefetch-chunks-per-lora") {
-            value = require_value(i);
-            if (!value || !parse_int(value, options.max_prefetch_chunks_per_lora) ||
-                    options.max_prefetch_chunks_per_lora < 0) return false;
-        } else if (arg == "--prefetch-cost-safety-factor") {
-            value = require_value(i);
-            if (!value || !parse_double(value, options.prefetch_cost_safety_factor) ||
-                    options.prefetch_cost_safety_factor < 1.0) return false;
-        } else if (arg == "--delta-store-dir") {
-            value = require_value(i);
-            if (!value) return false;
-            options.delta_store_dir = value;
-        } else if (arg == "--delta-store-policy") {
-            value = require_value(i);
-            if (!value) return false;
-            options.delta_store_policy = value;
-            if (options.delta_store_policy != "none" &&
-                    options.delta_store_policy != "build" &&
-                    options.delta_store_policy != "load" &&
-                    options.delta_store_policy != "auto") {
-                fprintf(stderr, "invalid delta store policy: %s\n", value);
-                return false;
-            }
         } else if (arg == "--background-policy") {
             value = require_value(i);
             if (!value) return false;
             options.background_policy = value;
             if (options.background_policy != "none" &&
                     options.background_policy != "arrival" &&
-                    options.background_policy != "cost-aware" &&
                     options.background_policy != "unlimited") {
                 fprintf(stderr, "invalid background policy: %s\n", value);
                 return false;
@@ -306,14 +232,6 @@ static bool parse_options(
         } else if (arg == "--background-min-gap-ms") {
             value = require_value(i);
             if (!value || !parse_double(value, options.background_min_gap_ms)) return false;
-        } else if (arg == "--background-safety-margin-ms") {
-            value = require_value(i);
-            if (!value || !parse_double(value, options.background_safety_margin_ms) ||
-                    options.background_safety_margin_ms < 0.0) return false;
-        } else if (arg == "--delta-validation-rate") {
-            value = require_value(i);
-            if (!value || !parse_double(value, options.delta_validation_rate) ||
-                    options.delta_validation_rate < 0.0 || options.delta_validation_rate > 1.0) return false;
         } else {
             fprintf(stderr, "unknown option: %s\n", arg.c_str());
             return false;
@@ -323,31 +241,6 @@ static bool parse_options(
     if (options.lora_config_path.empty()) {
         options.lora_config_path =
                 options.workload_dir + "/lora_groups.json";
-    }
-    if (options.system_v2 && options.max_cache_variants > 254) {
-        fprintf(stderr,
-                "invalid --max-cache-variants=%d: system v2 reserves two sequences "
-                "and llama.cpp requires n_seq_max <= 256; use a value <= 254\n",
-                options.max_cache_variants);
-        return false;
-    }
-    if (options.system_v2) {
-        // Keep explicit headroom for the foreground request sequence. The
-        // unified KV cache is bounded by n_ctx, so a larger logical cache
-        // budget would let background jobs consume cells needed by prefill.
-        const int foreground_reserve = std::max({
-                1024,
-                options.n_batch * 2,
-                options.context_chunk_tokens * 2 + options.n_predict });
-        const int safe_cache_tokens = std::max(1, options.n_ctx - foreground_reserve);
-        if (options.max_cache_tokens > safe_cache_tokens) {
-            fprintf(stderr,
-                    "clamping --max-cache-tokens from %d to %d: n_ctx=%d, "
-                    "foreground reserve=%d\n",
-                    options.max_cache_tokens, safe_cache_tokens,
-                    options.n_ctx, foreground_reserve);
-            options.max_cache_tokens = safe_cache_tokens;
-        }
     }
     return true;
 }
@@ -364,18 +257,12 @@ struct lora_runtime {
     std::string adapter_path;            // 适配器文件路径
     bool is_anchor = false;              // 是否是 anchor LoRA
     llama_adapter_lora * adapter = nullptr;  // llama.cpp 适配器指针
-    double initial_load_ms = 0.0;
 };
 
 // 数据集请求
 struct dataset_request {
     int chunk_token_size = 0;
     std::vector<std::string> prefix_segment_types;
-    struct prefix_segment {
-        std::string type;
-        std::string text;
-    };
-    std::vector<prefix_segment> prefix_segments;
     int request_id = -1;                 // 请求 ID
     std::string experiment;              // 实验类型
     std::string group_name;              // 所属 group
@@ -406,15 +293,9 @@ struct delta_pair_item {
 
 // Tokenize 后的请求
 struct tokenized_request {
-    struct segment_range {
-        int begin = 0;
-        int end = 0;
-        std::string type;
-    };
     std::vector<llama_token> prefix;     // prefix tokens
     std::vector<llama_token> full;       // 完整 prompt tokens
     std::vector<llama_token> suffix;     // suffix tokens
-    std::vector<segment_range> prefix_segments;
     bool exact_prefix_layout = false;    // prefix 是否精确匹配
 };
 
@@ -477,42 +358,8 @@ struct online_result {
     int prefetch_delta_built = 0;
     int prefetch_skipped_no_anchor = 0;
     int prefetch_dropped_expired = 0;
-    int delta_store_loaded = 0;
-    int delta_store_saved = 0;
-    int delta_candidates_marked = 0;
-    int delta_compressed_background = 0;
-    int delta_jobs_dequeued = 0;
-    int delta_skipped_missing_node = 0;
-    int delta_skipped_nonresident = 0;
-    int delta_rejected_probe = 0;
-    int delta_rejected_quality = 0;
-    int delta_rejected_build = 0;
-    int delta_rejected_host_limit = 0;
-    int delta_rejected_validation = 0;
-    int prefetch_delta_materialized = 0;
-    int background_anchor_built = 0;
-    int reconstruction_checks = 0;
-    double reconstruction_cos_sum = 0.0;
-    double reconstruction_cos_min = 0.0;
-    double reconstruction_l2_max = 0.0;
-    unsigned long long delta_full_kv_bytes_added = 0;
-    unsigned long long delta_bytes_added = 0;
-    double delta_store_load_ms = 0.0;
-    unsigned long long delta_store_bytes_read = 0;
-    double prefetch_materialize_ms = 0.0;
-    unsigned long long prefetch_materialized_bytes = 0;
-    double prefetch_materialize_gbps = 0.0;
-    double delta_store_read_gbps = 0.0;
     int host_delta_variants = 0;
-    int host_full_variants = 0;
     unsigned long long host_delta_bytes = 0;
-    unsigned long long host_full_bytes = 0;
-    unsigned long long host_full_kv_equivalent_bytes = 0;
-    double host_delta_compression_rate = 0.0;
-    unsigned long long kv_continuous_bytes = 0;
-    unsigned long long kv_paged_bytes = 0;
-    double kv_cell_used_rate = 0.0;
-    double kv_page_used_rate = 0.0;
     int background_queue_length = 0;
     double background_overrun_ms = 0.0;
     std::string benchmark;
@@ -556,7 +403,6 @@ struct online_result {
 enum class variant_residency {
     gpu_full,
     host_delta,
-    host_full,
 };
 
 struct prefix_variant {
@@ -565,11 +411,7 @@ struct prefix_variant {
     int hit_count = 0;
     int last_access_index = -1;
     variant_residency residency = variant_residency::gpu_full;
-    bool delta_available = false;
     unsigned long long delta_bytes = 0;
-    unsigned long long full_kv_bytes_equivalent = 0;
-    unsigned long long materialized_kv_bytes = 0;
-    std::vector<uint8_t> host_full_state;
     double materialize_ms = 0.0;
     double predicted_probability = 0.0;
     double reconstruction_cos = 0.0;
@@ -687,15 +529,6 @@ static dataset_request parse_request(const json & item) {
             }
         }
     }
-    if (item.contains("prefix_segments") && item["prefix_segments"].is_array()) {
-        for (const auto & segment : item["prefix_segments"]) {
-            if (!segment.is_object()) continue;
-            dataset_request::prefix_segment parsed;
-            parsed.type = segment.value("type", "user_context");
-            parsed.text = segment.value("text", "");
-            if (!parsed.text.empty()) request.prefix_segments.push_back(std::move(parsed));
-        }
-    }
     request.request_id = item.value("request_id", -1);
     request.experiment = item.value("experiment", "unknown");
     request.group_name = item.value("group_name", "unknown");
@@ -736,41 +569,6 @@ static std::vector<delta_pair_item> load_delta_pairs(const std::string & path) {
         pairs.push_back(std::move(pair));
     }
     return pairs;
-}
-
-struct prediction_candidate {
-    int lora_id = -1;
-    double probability = 0.0;
-};
-
-static std::unordered_map<int, std::vector<prediction_candidate>> load_prediction_file(
-        const std::string & path) {
-    std::unordered_map<int, std::vector<prediction_candidate>> predictions;
-    if (path.empty()) return predictions;
-    for (const auto & item : read_jsonl(path)) {
-        const int request_id = item.value("request_id", -1);
-        if (request_id < 0) continue;
-        std::vector<prediction_candidate> candidates;
-        if (item.contains("predictions") && item["predictions"].is_array()) {
-            for (const auto & prediction : item["predictions"]) {
-                if (!prediction.is_object()) continue;
-                prediction_candidate candidate;
-                candidate.lora_id = prediction.value("lora_id", -1);
-                candidate.probability = prediction.value("probability", 0.0);
-                if (candidate.lora_id >= 0) candidates.push_back(candidate);
-            }
-        } else {
-            prediction_candidate candidate;
-            candidate.lora_id = item.value("predicted_lora_id", -1);
-            candidate.probability = item.value("probability", 1.0);
-            if (candidate.lora_id >= 0) candidates.push_back(candidate);
-        }
-        std::sort(candidates.begin(), candidates.end(), [](const auto & left, const auto & right) {
-            return left.probability > right.probability;
-        });
-        if (!candidates.empty()) predictions[request_id] = std::move(candidates);
-    }
-    return predictions;
 }
 
 // =============================================================================
@@ -834,32 +632,6 @@ static bool tokenize_request(
     tokens.suffix.assign(
             tokens.full.begin() + tokens.prefix.size(),
             tokens.full.end());
-
-    // Tokenize cumulative segment text so chunk boundaries follow the exact
-    // prompt partition instead of relying on a first-chunk heuristic.
-    tokens.prefix_segments.clear();
-    if (!request.prefix_segments.empty()) {
-        std::string cumulative;
-        int previous_end = 0;
-        for (const auto & segment : request.prefix_segments) {
-            cumulative += segment.text;
-            std::vector<llama_token> cumulative_tokens;
-            if (!tokenize_text(vocab, cumulative, cumulative_tokens)) return false;
-            int end = common_prefix_length(cumulative_tokens, tokens.prefix);
-            end = std::max(previous_end, std::min(end, (int) tokens.prefix.size()));
-            if (end > previous_end) {
-                tokens.prefix_segments.push_back({ previous_end, end, segment.type });
-                previous_end = end;
-            }
-        }
-        if (previous_end < (int) tokens.prefix.size()) {
-            const std::string type = request.prefix_segments.back().type;
-            tokens.prefix_segments.push_back({ previous_end, (int) tokens.prefix.size(), type });
-        }
-    }
-    if (tokens.prefix_segments.empty()) {
-        tokens.prefix_segments.push_back({ 0, (int) tokens.prefix.size(), "user_context" });
-    }
     return true;
 }
 
@@ -1276,12 +1048,6 @@ static prefix_variant * find_variant(prefix_node & node, int lora_id) {
     return nullptr;
 }
 
-static prefix_variant * find_gpu_variant(prefix_node & node, int lora_id) {
-    prefix_variant * variant = find_variant(node, lora_id);
-    return variant != nullptr && variant->residency == variant_residency::gpu_full
-            ? variant : nullptr;
-}
-
 static void release_node(
         llama_memory_t memory,
         const prefix_node & node,
@@ -1446,10 +1212,6 @@ static std::vector<online_result> run_online_experiment(
     const int limit = std::min(options.max_online_requests, (int) requests.size());
 
     for (int request_index = 0; request_index < limit; ++request_index) {
-        if (request_index % 10 == 0 || request_index + 1 == limit) {
-            fprintf(stderr, "online progress: %d/%d, nodes=%d\n",
-                    request_index + 1, limit, (int) nodes.size());
-        }
         const dataset_request & request = requests[request_index];
         const auto lora_it = loras.find(request.lora_id);
         if (lora_it == loras.end()) continue;
@@ -1755,7 +1517,7 @@ static int count_host_delta_variants(const std::vector<prefix_node> & nodes) {
     int total = 0;
     for (const auto & node : nodes) {
         for (const auto & variant : node.variants) {
-            total += variant.delta_available ? 1 : 0;
+            total += variant.residency == variant_residency::host_delta ? 1 : 0;
         }
     }
     return total;
@@ -1765,71 +1527,10 @@ static unsigned long long count_host_delta_bytes(const std::vector<prefix_node> 
     unsigned long long total = 0;
     for (const auto & node : nodes) {
         for (const auto & variant : node.variants) {
-            if (variant.delta_available) total += variant.delta_bytes;
+            if (variant.residency == variant_residency::host_delta) total += variant.delta_bytes;
         }
     }
     return total;
-}
-
-static unsigned long long count_host_full_kv_equivalent_bytes(
-        const std::vector<prefix_node> & nodes) {
-    unsigned long long total = 0;
-    for (const auto & node : nodes) {
-        for (const auto & variant : node.variants) {
-            if (variant.delta_available) total += variant.full_kv_bytes_equivalent;
-        }
-    }
-    return total;
-}
-
-static int count_host_full_variants(const std::vector<prefix_node> & nodes) {
-    int total = 0;
-    for (const auto & node : nodes) {
-        for (const auto & variant : node.variants) {
-            total += !variant.host_full_state.empty() ? 1 : 0;
-        }
-    }
-    return total;
-}
-
-static unsigned long long count_host_full_bytes(const std::vector<prefix_node> & nodes) {
-    unsigned long long total = 0;
-    for (const auto & node : nodes) {
-        for (const auto & variant : node.variants) total += variant.host_full_state.size();
-    }
-    return total;
-}
-
-static void merge_delta_metrics(online_result & target, const online_result & source) {
-    target.delta_probe_ms += source.delta_probe_ms;
-    target.delta_build_ms += source.delta_build_ms;
-    target.delta_validation_ms += source.delta_validation_ms;
-    target.delta_store_loaded += source.delta_store_loaded;
-    target.delta_store_saved += source.delta_store_saved;
-    target.delta_store_load_ms += source.delta_store_load_ms;
-    target.delta_store_bytes_read += source.delta_store_bytes_read;
-    target.delta_full_kv_bytes_added += source.delta_full_kv_bytes_added;
-    target.delta_bytes_added += source.delta_bytes_added;
-    target.delta_rejected_probe += source.delta_rejected_probe;
-    target.delta_rejected_quality += source.delta_rejected_quality;
-    target.delta_rejected_build += source.delta_rejected_build;
-    target.delta_rejected_host_limit += source.delta_rejected_host_limit;
-    target.delta_rejected_validation += source.delta_rejected_validation;
-    target.delta_build_ok |= source.delta_build_ok;
-    if (source.delta_saved_rate > 0.0) {
-        target.delta_saved_rate = std::max(target.delta_saved_rate, source.delta_saved_rate);
-    }
-    if (source.reconstruction_cos > 0.0) {
-        target.reconstruction_checks++;
-        target.reconstruction_cos_sum += source.reconstruction_cos;
-        target.reconstruction_cos_min = target.reconstruction_cos_min == 0.0
-                ? source.reconstruction_cos
-                : std::min(target.reconstruction_cos_min, source.reconstruction_cos);
-        target.reconstruction_l2_max = std::max(
-                target.reconstruction_l2_max, source.reconstruction_l2);
-        target.reconstruction_cos = target.reconstruction_cos_min;
-        target.reconstruction_l2 = target.reconstruction_l2_max;
-    }
 }
 
 static int find_node_by_id(const std::vector<prefix_node> & nodes, int node_id) {
@@ -1851,25 +1552,18 @@ static double family_value(const prefix_node & node, int request_index) {
     double materialize = 0.0;
     unsigned long long bytes = 0;
     int variant_hits = 0;
-    int delta_children = 0;
     for (const auto & variant : node.variants) {
         predicted += variant.predicted_probability;
         materialize += variant.materialize_ms;
         bytes += variant.delta_bytes;
-        bytes += variant.host_full_state.size();
-        delta_children += variant.delta_available ? 1 : 0;
         variant_hits += variant.hit_count;
         if (variant.residency == variant_residency::gpu_full) {
             bytes += (unsigned long long) node.depth_tokens * 1024ULL;
         }
     }
     const int age = std::max(0, request_index - node.last_access_index);
-    const double segment_bonus = node.segment_kind == "shared_system" ? 8.0 :
-            node.segment_kind == "user_context" ? 5.0 : 1.0;
     return 4.0 * std::log1p((double) node.hit_count + variant_hits)
             + 20.0 * predicted
-            + 3.0 * delta_children
-            + segment_bonus
             + 0.002 * node.depth_tokens
             + 4.0 / (1.0 + age)
             - 0.05 * ((double) bytes / 1024.0 / 1024.0)
@@ -1882,93 +1576,13 @@ static void release_node_v2(
         const prefix_node & node,
         std::vector<llama_seq_id> & free_sequences) {
     for (const auto & variant : node.variants) {
-        if (variant.delta_available) {
+        if (variant.residency == variant_residency::host_delta) {
             llama_kv_seq_delta_remove_branch(context, variant.cache_seq_id);
-        }
-        if (variant.cache_seq_id >= 0) {
+        } else {
             llama_memory_seq_rm(memory, variant.cache_seq_id, -1, -1);
-            free_sequences.push_back(variant.cache_seq_id);
         }
+        free_sequences.push_back(variant.cache_seq_id);
     }
-}
-
-static bool demote_predicted_delta_variant(
-        llama_memory_t memory,
-        std::vector<prefix_node> & nodes,
-        int protected_node_id,
-        int request_index) {
-    prefix_variant * victim = nullptr;
-    double victim_value = std::numeric_limits<double>::infinity();
-    for (auto & node : nodes) {
-        if (node.node_id == protected_node_id) continue;
-        for (auto & variant : node.variants) {
-            if (variant.residency != variant_residency::gpu_full || !variant.delta_available ||
-                    variant.cache_seq_id < 0) continue;
-            const int age = std::max(0, request_index - variant.last_access_index);
-            const double value = 20.0 * variant.predicted_probability
-                    + 3.0 * std::log1p((double) variant.hit_count)
-                    + 2.0 / (1.0 + age);
-            if (value < victim_value) {
-                victim_value = value;
-                victim = &variant;
-            }
-        }
-    }
-    if (victim == nullptr) return false;
-    llama_memory_seq_rm(memory, victim->cache_seq_id, -1, -1);
-    victim->residency = variant_residency::host_delta;
-    victim->predicted_probability = 0.0;
-    return true;
-}
-
-static bool offload_gpu_variant_to_host(
-        llama_context * context,
-        llama_memory_t memory,
-        std::vector<prefix_node> & nodes,
-        std::vector<llama_seq_id> & free_sequences,
-        const experiment_options & options,
-        int protected_node_id,
-        int request_index) {
-    prefix_node * victim_node = nullptr;
-    prefix_variant * victim = nullptr;
-    double victim_value = std::numeric_limits<double>::infinity();
-    for (auto & node : nodes) {
-        if (node.node_id == protected_node_id) continue;
-        for (auto & variant : node.variants) {
-            if (variant.residency != variant_residency::gpu_full ||
-                    variant.delta_available || variant.cache_seq_id < 0 ||
-                    node.anchor_seq_id == variant.cache_seq_id) continue;
-            const int age = std::max(0, request_index - variant.last_access_index);
-            const double value = 20.0 * variant.predicted_probability
-                    + 3.0 * std::log1p((double) variant.hit_count)
-                    + 2.0 / (1.0 + age);
-            if (value < victim_value) {
-                victim_value = value;
-                victim_node = &node;
-                victim = &variant;
-            }
-        }
-    }
-    if (victim == nullptr || victim_node == nullptr) return false;
-    if (victim->host_full_state.empty()) {
-        const size_t size = llama_state_seq_get_size(context, victim->cache_seq_id);
-        const unsigned long long limit =
-                (unsigned long long) options.max_host_full_mb * 1024ULL * 1024ULL;
-        if (size == 0 || count_host_full_bytes(nodes) + size > limit) return false;
-        victim->host_full_state.resize(size);
-        if (llama_state_seq_get_data(
-                    context, victim->host_full_state.data(), size,
-                    victim->cache_seq_id) != size) {
-            victim->host_full_state.clear();
-            return false;
-        }
-    }
-    llama_memory_seq_rm(memory, victim->cache_seq_id, -1, -1);
-    free_sequences.push_back(victim->cache_seq_id);
-    victim->cache_seq_id = -1;
-    victim->residency = variant_residency::host_full;
-    victim->predicted_probability = 0.0;
-    return true;
 }
 
 static bool ensure_cache_capacity_v2(
@@ -1980,26 +1594,14 @@ static bool ensure_cache_capacity_v2(
         int additional_gpu_tokens,
         unsigned long long additional_host_bytes,
         int protected_node_id,
-        int request_index,
-        bool requires_free_sequence = true) {
+        int request_index) {
     const unsigned long long host_limit =
             (unsigned long long) std::max(0, options.max_host_delta_mb) * 1024ULL * 1024ULL;
-    while ((requires_free_sequence && free_sequences.empty()) ||
+    while (free_sequences.empty() ||
             count_variants(nodes) >= options.max_cache_variants ||
             count_gpu_cache_tokens_v2(nodes) + additional_gpu_tokens > options.max_cache_tokens ||
             count_host_delta_bytes(nodes) + additional_host_bytes > host_limit ||
             (int) nodes.size() > options.max_cache_nodes) {
-        if (count_gpu_cache_tokens_v2(nodes) + additional_gpu_tokens > options.max_cache_tokens &&
-                demote_predicted_delta_variant(memory, nodes, protected_node_id, request_index)) {
-            continue;
-        }
-        if (((requires_free_sequence && free_sequences.empty()) ||
-                count_gpu_cache_tokens_v2(nodes) + additional_gpu_tokens > options.max_cache_tokens) &&
-                offload_gpu_variant_to_host(
-                        context, memory, nodes, free_sequences, options,
-                        protected_node_id, request_index)) {
-            continue;
-        }
         int victim_index = -1;
         double victim_value = std::numeric_limits<double>::infinity();
         for (int index = 0; index < (int) nodes.size(); ++index) {
@@ -2037,42 +1639,33 @@ static int find_chunk_node(
 static std::vector<int> ensure_chunk_path(
         std::vector<prefix_node> & nodes,
         const dataset_request & request,
-        const tokenized_request & tokenized,
-        const experiment_options & options,
+        const std::vector<llama_token> & prefix,
+        int chunk_tokens,
         int & next_node_id) {
     std::vector<int> path;
-    const std::vector<llama_token> & prefix = tokenized.prefix;
     const int size = (int) prefix.size();
+    const int step = std::max(1, chunk_tokens);
     int parent_id = -1;
-    for (const auto & segment : tokenized.prefix_segments) {
-        const int step = segment.type == "shared_system"
-                ? std::max(1, options.system_chunk_tokens)
-                : segment.type == "user_context"
-                    ? std::max(1, options.context_chunk_tokens)
-                    : std::max(1, options.prefix_chunk_tokens);
-        const int segment_begin = std::max(0, std::min(segment.begin, size));
-        const int segment_end = std::max(segment_begin, std::min(segment.end, size));
-        for (int begin = segment_begin; begin < segment_end; begin += step) {
-            const int end = std::min(segment_end, begin + step);
-            int index = find_chunk_node(nodes, request.group_name, parent_id, prefix, end);
-            if (index < 0) {
-                prefix_node node;
-                node.node_id = next_node_id++;
-                node.parent_node_id = parent_id;
-                node.group_name = request.group_name;
-                node.context_id = request.context_id;
-                node.prefix_hash = request.common_prefix_hash + ":" + std::to_string(end);
-                node.prefix_tokens.assign(prefix.begin(), prefix.begin() + end);
-                node.depth_tokens = end;
-                node.chunk_begin = begin;
-                node.chunk_end = end;
-                node.segment_kind = segment.type;
-                nodes.push_back(std::move(node));
-                index = (int) nodes.size() - 1;
-            }
-            path.push_back(nodes[index].node_id);
-            parent_id = nodes[index].node_id;
+    for (int begin = 0; begin < size; begin += step) {
+        const int end = std::min(size, begin + step);
+        int index = find_chunk_node(nodes, request.group_name, parent_id, prefix, end);
+        if (index < 0) {
+            prefix_node node;
+            node.node_id = next_node_id++;
+            node.parent_node_id = parent_id;
+            node.group_name = request.group_name;
+            node.context_id = request.context_id;
+            node.prefix_hash = request.common_prefix_hash + ":" + std::to_string(end);
+            node.prefix_tokens.assign(prefix.begin(), prefix.begin() + end);
+            node.depth_tokens = end;
+            node.chunk_begin = begin;
+            node.chunk_end = end;
+            node.segment_kind = begin == 0 ? "shared_system" : "user_context";
+            nodes.push_back(std::move(node));
+            index = (int) nodes.size() - 1;
         }
+        path.push_back(nodes[index].node_id);
+        parent_id = nodes[index].node_id;
     }
     return path;
 }
@@ -2083,8 +1676,7 @@ static bool restore_variant_v2(
         const prefix_node & node,
         prefix_variant & variant,
         llama_seq_id dst_seq,
-        online_result * result,
-        bool allow_delta_materialize) {
+        online_result * result) {
     llama_memory_seq_rm(memory, dst_seq, -1, -1);
     const double start = now_ms();
     if (variant.residency == variant_residency::gpu_full) {
@@ -2092,7 +1684,6 @@ static bool restore_variant_v2(
         if (result) result->prefix_ms += now_ms() - start;
         return true;
     }
-    if (!allow_delta_materialize || !variant.delta_available) return false;
     llama_memory_seq_cp(memory, node.anchor_seq_id, dst_seq, 0, node.depth_tokens);
     llama_kv_delta_materialize_stats stats = {};
     const bool ok = llama_kv_seq_delta_materialize_branch(
@@ -2100,7 +1691,6 @@ static bool restore_variant_v2(
             0, node.depth_tokens, &stats);
     const double elapsed = now_ms() - start;
     variant.materialize_ms = elapsed;
-    variant.materialized_kv_bytes = stats.materialized_kv_bytes;
     if (result) {
         result->prefix_ms += elapsed;
         result->materialize_ms += elapsed;
@@ -2109,34 +1699,6 @@ static bool restore_variant_v2(
         result->reconstruction_l2 = variant.reconstruction_l2;
     }
     return ok;
-}
-
-static std::string delta_store_path(
-        const experiment_options & options,
-        const prefix_node & node,
-        int child_lora_id) {
-    if (options.delta_store_dir.empty()) return {};
-    std::filesystem::path directory(options.delta_store_dir);
-    std::string filename =
-            node.group_name + "_" + node.prefix_hash +
-            "_d" + std::to_string(node.depth_tokens) +
-            "_a" + std::to_string(node.anchor_lora_id) +
-            "_c" + std::to_string(child_lora_id) + ".kvdelta";
-    for (char & ch : filename) {
-        if (ch == '<' || ch == '>' || ch == ':' || ch == '"' || ch == '/' ||
-                ch == '\\' || ch == '|' || ch == '?' || ch == '*') ch = '_';
-    }
-    return (directory / filename).string();
-}
-
-static bool should_load_delta_store(const experiment_options & options) {
-    return options.delta_store_policy == "load" ||
-            options.delta_store_policy == "auto";
-}
-
-static bool should_save_delta_store(const experiment_options & options) {
-    return options.delta_store_policy == "build" ||
-            options.delta_store_policy == "auto";
 }
 
 static bool convert_variant_to_host_delta(
@@ -2161,14 +1723,8 @@ static bool convert_variant_to_host_delta(
         result->prefix_kv_cos = probe.kv_cos_avg;
         result->prefix_kv_l2 = probe.kv_l2_avg;
     }
-    if (!probe_ok || !probe.can_reuse_as_delta) {
-        if (result) result->delta_rejected_probe++;
-        return false;
-    }
-    if (probe.kv_cos_avg < 0.97 || probe.kv_l2_avg > 0.25) {
-        if (result) result->delta_rejected_quality++;
-        return false;
-    }
+    if (!probe_ok || !probe.can_reuse_as_delta ||
+            probe.kv_cos_avg < 0.97 || probe.kv_l2_avg > 0.25) return false;
 
     llama_kv_delta_branch_stats branch = {};
     start = now_ms();
@@ -2180,48 +1736,34 @@ static bool convert_variant_to_host_delta(
         result->delta_build_ok = build_ok ? 1 : 0;
         result->delta_saved_rate = branch.logical_saved_rate;
     }
-    if (!build_ok) {
-        if (result) result->delta_rejected_build++;
-        return false;
-    }
+    if (!build_ok) return false;
 
     const unsigned long long delta_bytes = branch.delta_q8_bytes + branch.delta_scale_bytes;
     const unsigned long long host_limit =
             (unsigned long long) std::max(0, options.max_host_delta_mb) * 1024ULL * 1024ULL;
     if (count_host_delta_bytes(nodes) + delta_bytes > host_limit) {
-        if (result) result->delta_rejected_host_limit++;
         llama_kv_seq_delta_remove_branch(context, variant.cache_seq_id);
         return false;
     }
 
-    const uint64_t sample_key = (uint64_t) (node.node_id + 1) * 1315423911ULL
-            + (uint64_t) (variant.lora_id + 1) * 2654435761ULL;
-    const bool should_validate = options.delta_validation_rate >= 1.0 ||
-            (options.delta_validation_rate > 0.0 &&
-             (double) (sample_key % 10000ULL) / 10000.0 < options.delta_validation_rate);
-    double materialize_ms = 0.0;
-    bool reconstruction_ok = false;
+    // Reconstruct into a temporary sequence and compare it with the full child
+    // before the dense child KV is removed.
+    llama_memory_seq_rm(memory, validation_seq, -1, -1);
+    llama_memory_seq_cp(memory, node.anchor_seq_id, validation_seq, 0, node.depth_tokens);
+    llama_kv_delta_materialize_stats materialize = {};
+    const double materialize_start = now_ms();
+    const bool materialize_ok = llama_kv_seq_delta_materialize_branch(
+            context, node.anchor_seq_id, variant.cache_seq_id, validation_seq,
+            0, node.depth_tokens, &materialize);
+    const double materialize_ms = now_ms() - materialize_start;
     llama_kv_delta_probe_stats reconstruction = {};
-    if (should_validate) {
-        // Validation is sampled because full reconstruction is expensive and
-        // is not required on every background compression job.
-        llama_memory_seq_rm(memory, validation_seq, -1, -1);
-        llama_memory_seq_cp(memory, node.anchor_seq_id, validation_seq, 0, node.depth_tokens);
-        llama_kv_delta_materialize_stats materialize = {};
-        const double materialize_start = now_ms();
-        const bool materialize_ok = llama_kv_seq_delta_materialize_branch(
-                context, node.anchor_seq_id, variant.cache_seq_id, validation_seq,
-                0, node.depth_tokens, &materialize);
-        materialize_ms = now_ms() - materialize_start;
-        reconstruction_ok = materialize_ok && llama_kv_seq_delta_probe(
-                context, variant.cache_seq_id, validation_seq,
-                0, node.depth_tokens, &reconstruction);
-        llama_memory_seq_rm(memory, validation_seq, -1, -1);
-        if (!materialize_ok) {
-            if (result) result->delta_rejected_validation++;
-            llama_kv_seq_delta_remove_branch(context, variant.cache_seq_id);
-            return false;
-        }
+    const bool reconstruction_ok = materialize_ok && llama_kv_seq_delta_probe(
+            context, variant.cache_seq_id, validation_seq,
+            0, node.depth_tokens, &reconstruction);
+    llama_memory_seq_rm(memory, validation_seq, -1, -1);
+    if (!materialize_ok) {
+        llama_kv_seq_delta_remove_branch(context, variant.cache_seq_id);
+        return false;
     }
     if (result) {
         result->delta_validation_ms += materialize_ms;
@@ -2232,90 +1774,13 @@ static bool convert_variant_to_host_delta(
     }
     llama_memory_seq_rm(memory, variant.cache_seq_id, -1, -1);
     variant.residency = variant_residency::host_delta;
-    variant.delta_available = true;
     variant.delta_bytes = delta_bytes;
-    variant.full_kv_bytes_equivalent = branch.full_kv_bytes_equivalent;
     variant.materialize_ms = materialize_ms;
     if (reconstruction_ok) {
         variant.reconstruction_cos = reconstruction.kv_cos_avg;
         variant.reconstruction_l2 = reconstruction.kv_l2_avg;
     }
-    if (result) {
-        result->delta_full_kv_bytes_added += branch.full_kv_bytes_equivalent;
-        result->delta_bytes_added += delta_bytes;
-    }
-    if (should_save_delta_store(options)) {
-        const std::string path = delta_store_path(options, node, variant.lora_id);
-        if (!path.empty()) {
-            std::filesystem::create_directories(std::filesystem::path(path).parent_path());
-            if (llama_kv_seq_delta_save_branch(
-                        context, variant.cache_seq_id, path.c_str()) && result) {
-                result->delta_store_saved++;
-            }
-        }
-    }
     return true;
-}
-
-static int load_stored_deltas_for_path(
-        llama_context * context,
-        llama_memory_t memory,
-        const experiment_options & options,
-        std::vector<prefix_node> & nodes,
-        const std::vector<int> & path,
-        int lora_id,
-        std::vector<llama_seq_id> & free_sequences,
-        int request_index,
-        online_result & result) {
-    if (!should_load_delta_store(options)) return 0;
-    int loaded = 0;
-    for (int node_id : path) {
-        int index = find_node_by_id(nodes, node_id);
-        if (index < 0 || nodes[index].anchor_seq_id < 0 ||
-                nodes[index].anchor_lora_id == lora_id ||
-                find_variant(nodes[index], lora_id) != nullptr) continue;
-        const std::string file = delta_store_path(options, nodes[index], lora_id);
-        if (file.empty() || !std::filesystem::exists(file)) continue;
-        const unsigned long long bytes = std::filesystem::file_size(file);
-        if (!ensure_cache_capacity_v2(
-                    context, memory, nodes, free_sequences, options,
-                    0, bytes, node_id, request_index) || free_sequences.empty()) continue;
-        index = find_node_by_id(nodes, node_id);
-        if (index < 0) continue;
-        const llama_seq_id delta_seq = free_sequences.back();
-        free_sequences.pop_back();
-        const double load_start = now_ms();
-        if (!llama_kv_seq_delta_load_branch(
-                    context,
-                    nodes[index].anchor_seq_id,
-                    delta_seq,
-                    file.c_str(),
-                    nodes[index].parent_node_id,
-                    nodes[index].node_id)) {
-            free_sequences.push_back(delta_seq);
-            continue;
-        }
-        result.delta_store_load_ms += now_ms() - load_start;
-        result.delta_store_bytes_read += bytes;
-        prefix_variant variant;
-        variant.lora_id = lora_id;
-        variant.cache_seq_id = delta_seq;
-        variant.last_access_index = request_index;
-        variant.residency = variant_residency::host_delta;
-        variant.delta_available = true;
-        variant.delta_bytes = bytes;
-        llama_kv_delta_branch_stats stored_stats = {};
-        if (llama_kv_seq_delta_get_branch_stats(context, delta_seq, &stored_stats)) {
-            variant.full_kv_bytes_equivalent = stored_stats.full_kv_bytes_equivalent;
-            result.delta_full_kv_bytes_added += stored_stats.full_kv_bytes_equivalent;
-            result.delta_bytes_added += stored_stats.delta_q8_bytes + stored_stats.delta_scale_bytes;
-        }
-        nodes[index].variants.push_back(variant);
-        nodes[index].last_access_index = request_index;
-        loaded++;
-    }
-    result.delta_store_loaded += loaded;
-    return loaded;
 }
 
 static std::vector<int> cache_missing_chunks(
@@ -2325,59 +1790,29 @@ static std::vector<int> cache_missing_chunks(
         std::vector<prefix_node> & nodes,
         const std::vector<int> & path,
         int lora_id,
-        int configured_anchor_lora_id,
         llama_seq_id request_seq,
         std::vector<llama_seq_id> & free_sequences,
         int request_index) {
     std::vector<int> added;
     for (int node_id : path) {
         int index = find_node_by_id(nodes, node_id);
-        if (index < 0) continue;
-        prefix_variant * existing = find_variant(nodes[index], lora_id);
-        if (existing != nullptr && existing->residency == variant_residency::gpu_full) continue;
+        if (index < 0 || find_variant(nodes[index], lora_id) != nullptr) continue;
         const int depth = nodes[index].depth_tokens;
-        if (existing != nullptr && existing->residency == variant_residency::host_delta &&
-                existing->cache_seq_id >= 0) {
-            if (!ensure_cache_capacity_v2(
-                        context, memory, nodes, free_sequences, options,
-                        depth, 0, node_id, request_index, false)) continue;
-            index = find_node_by_id(nodes, node_id);
-            if (index < 0) continue;
-            existing = find_variant(nodes[index], lora_id);
-            if (existing == nullptr) continue;
-            llama_memory_seq_rm(memory, existing->cache_seq_id, -1, -1);
-            llama_memory_seq_cp(memory, request_seq, existing->cache_seq_id, 0, depth);
-            existing->residency = variant_residency::gpu_full;
-            existing->last_access_index = request_index;
-            nodes[index].last_access_index = request_index;
-            added.push_back(node_id);
-            continue;
-        }
         if (!ensure_cache_capacity_v2(
                     context, memory, nodes, free_sequences, options,
                     depth, 0, node_id, request_index)) continue;
         index = find_node_by_id(nodes, node_id);
         if (index < 0 || free_sequences.empty()) continue;
-        existing = find_variant(nodes[index], lora_id);
         const llama_seq_id cache_seq = free_sequences.back();
         free_sequences.pop_back();
         llama_memory_seq_rm(memory, cache_seq, -1, -1);
         llama_memory_seq_cp(memory, request_seq, cache_seq, 0, depth);
-        if (existing != nullptr && existing->residency == variant_residency::host_full) {
-            existing->cache_seq_id = cache_seq;
-            existing->residency = variant_residency::gpu_full;
-            existing->last_access_index = request_index;
-            nodes[index].last_access_index = request_index;
-            added.push_back(node_id);
-            continue;
-        }
         prefix_variant variant;
         variant.lora_id = lora_id;
         variant.cache_seq_id = cache_seq;
         variant.last_access_index = request_index;
         nodes[index].variants.push_back(variant);
-        if (nodes[index].anchor_seq_id < 0 &&
-                (configured_anchor_lora_id < 0 || lora_id == configured_anchor_lora_id)) {
+        if (nodes[index].anchor_seq_id < 0) {
             nodes[index].anchor_seq_id = cache_seq;
             nodes[index].anchor_lora_id = lora_id;
         }
@@ -2387,59 +1822,9 @@ static std::vector<int> cache_missing_chunks(
     return added;
 }
 
-static bool build_configured_anchor_for_node(
-        llama_context * context,
-        llama_memory_t memory,
-        const experiment_options & options,
-        std::vector<prefix_node> & nodes,
-        int node_id,
-        lora_runtime & anchor_lora,
-        std::vector<llama_seq_id> & free_sequences,
-        int request_index) {
-    int index = find_node_by_id(nodes, node_id);
-    if (index < 0) return false;
-    if (nodes[index].anchor_seq_id >= 0) return true;
-    prefix_variant * existing = find_gpu_variant(nodes[index], anchor_lora.lora_id);
-    if (existing != nullptr) {
-        nodes[index].anchor_seq_id = existing->cache_seq_id;
-        nodes[index].anchor_lora_id = anchor_lora.lora_id;
-        return true;
-    }
-    const int depth = nodes[index].depth_tokens;
-    if (!ensure_cache_capacity_v2(
-                context, memory, nodes, free_sequences, options,
-                depth, 0, node_id, request_index) || free_sequences.empty()) return false;
-    index = find_node_by_id(nodes, node_id);
-    if (index < 0) return false;
-    const llama_seq_id seq = free_sequences.back();
-    free_sequences.pop_back();
-    llama_memory_seq_rm(memory, seq, -1, -1);
-    bind_lora(context, anchor_lora);
-    if (!eval_tokens(context, nodes[index].prefix_tokens, seq, 0, options.n_ubatch)) {
-        llama_memory_seq_rm(memory, seq, -1, -1);
-        free_sequences.push_back(seq);
-        return false;
-    }
-    prefix_variant variant;
-    variant.lora_id = anchor_lora.lora_id;
-    variant.cache_seq_id = seq;
-    variant.last_access_index = request_index;
-    nodes[index].variants.push_back(variant);
-    nodes[index].anchor_seq_id = seq;
-    nodes[index].anchor_lora_id = anchor_lora.lora_id;
-    nodes[index].last_access_index = request_index;
-    return true;
-}
-
-static bool background_allowed(
-        const experiment_options & options,
-        double idle_gap_ms,
-        double estimated_cost_ms = 0.0) {
+static bool background_allowed(const experiment_options & options, double idle_gap_ms) {
     if (options.background_policy == "none") return false;
     if (options.background_policy == "unlimited") return true;
-    if (options.background_policy == "cost-aware") {
-        return idle_gap_ms >= estimated_cost_ms + options.background_safety_margin_ms;
-    }
     return idle_gap_ms >= options.background_min_gap_ms;
 }
 
@@ -2450,116 +1835,28 @@ static int prefetch_oracle_chunks(
         const experiment_options & options,
         const dataset_request & next_request,
         lora_runtime & next_lora,
-        lora_runtime * group_anchor_lora,
         std::vector<prefix_node> & nodes,
         std::vector<llama_seq_id> & free_sequences,
         llama_seq_id validation_seq,
         int request_index,
         int & next_node_id,
-        double predicted_probability,
         online_result & current_result,
         int & full_built,
         int & delta_built,
         int & skipped_no_anchor) {
     tokenized_request tokens;
     if (!tokenize_request(vocab, next_request, tokens) || tokens.prefix.empty()) return 0;
+    const int chunk_size = options.prefix_chunk_tokens > 0
+            ? options.prefix_chunk_tokens : std::max(1, next_request.chunk_token_size);
     const std::vector<int> path = ensure_chunk_path(
-            nodes, next_request, tokens, options, next_node_id);
+            nodes, next_request, tokens.prefix, chunk_size, next_node_id);
     int built = 0;
-
-    // Delta storage uses the configured group anchor, not the first LoRA that
-    // happens to reach a node. Build the anchor path first when necessary.
-    if (group_anchor_lora != nullptr && group_anchor_lora->lora_id != next_lora.lora_id) {
-        dataset_request anchor_request = next_request;
-        anchor_request.lora_id = group_anchor_lora->lora_id;
-        anchor_request.lora_name = group_anchor_lora->logical_name;
-        built += prefetch_oracle_chunks(
-                context, memory, vocab, options, anchor_request, *group_anchor_lora,
-                nullptr, nodes, free_sequences, validation_seq, request_index,
-                next_node_id, 0.0, current_result,
-                full_built, delta_built, skipped_no_anchor);
-    }
-
     bind_lora(context, next_lora);
-    load_stored_deltas_for_path(
-            context, memory, options, nodes, path, next_request.lora_id,
-            free_sequences, request_index, current_result);
 
-    int built_this_lora = 0;
     for (int node_id : path) {
-        if (options.max_prefetch_chunks_per_lora > 0 &&
-                built_this_lora >= options.max_prefetch_chunks_per_lora) {
-            break;
-        }
         int index = find_node_by_id(nodes, node_id);
-        if (index < 0) continue;
-        prefix_variant * existing = find_variant(nodes[index], next_request.lora_id);
-        if (existing != nullptr) {
-            existing->predicted_probability = std::max(
-                    existing->predicted_probability, predicted_probability);
-            if (existing->residency == variant_residency::host_full &&
-                    !existing->host_full_state.empty()) {
-                if (!ensure_cache_capacity_v2(
-                            context, memory, nodes, free_sequences, options,
-                            nodes[index].depth_tokens, 0, node_id, request_index, true) ||
-                        free_sequences.empty()) {
-                    continue;
-                }
-                index = find_node_by_id(nodes, node_id);
-                if (index < 0) continue;
-                existing = find_variant(nodes[index], next_request.lora_id);
-                if (existing == nullptr || existing->host_full_state.empty()) continue;
-                const llama_seq_id restored_seq = free_sequences.back();
-                free_sequences.pop_back();
-                const double restore_start = now_ms();
-                const size_t restored = llama_state_seq_set_data(
-                        context, existing->host_full_state.data(),
-                        existing->host_full_state.size(), restored_seq);
-                const double restore_ms = now_ms() - restore_start;
-                if (restored == 0) {
-                    llama_memory_seq_rm(memory, restored_seq, -1, -1);
-                    free_sequences.push_back(restored_seq);
-                    continue;
-                }
-                existing->cache_seq_id = restored_seq;
-                existing->residency = variant_residency::gpu_full;
-                current_result.prefetch_materialize_ms += restore_ms;
-                current_result.prefetch_materialized_bytes += existing->host_full_state.size();
-                full_built++;
-                built++;
-                built_this_lora++;
-                continue;
-            }
-            if (existing->residency == variant_residency::host_delta &&
-                    nodes[index].anchor_seq_id >= 0) {
-                if (!ensure_cache_capacity_v2(
-                            context, memory, nodes, free_sequences, options,
-                            nodes[index].depth_tokens, 0, node_id, request_index, false)) {
-                    continue;
-                }
-                index = find_node_by_id(nodes, node_id);
-                if (index < 0) continue;
-                existing = find_variant(nodes[index], next_request.lora_id);
-                if (existing == nullptr) continue;
-                const double materialize_start = now_ms();
-                const bool materialized = restore_variant_v2(
-                        context, memory, nodes[index], *existing,
-                        existing->cache_seq_id, nullptr, true);
-                const double materialize_elapsed = now_ms() - materialize_start;
-                if (materialized) {
-                    existing->residency = variant_residency::gpu_full;
-                    current_result.prefetch_delta_materialized++;
-                    current_result.prefetch_materialize_ms += materialize_elapsed;
-                    current_result.prefetch_materialized_bytes += existing->materialized_kv_bytes;
-                    full_built++;
-                    built++;
-                    built_this_lora++;
-                }
-            }
-            continue;
-        }
-        if (options.prefetch_storage == "delta" && nodes[index].anchor_seq_id < 0 &&
-                !next_lora.is_anchor) {
+        if (index < 0 || find_variant(nodes[index], next_request.lora_id) != nullptr) continue;
+        if (options.prefetch_storage == "delta" && nodes[index].anchor_seq_id < 0) {
             skipped_no_anchor++;
             continue;
         }
@@ -2579,7 +1876,7 @@ static int prefetch_oracle_chunks(
             if (parent_index >= 0) {
                 prefix_variant * parent = find_variant(nodes[parent_index], next_request.lora_id);
                 if (parent != nullptr && restore_variant_v2(
-                            context, memory, nodes[parent_index], *parent, seq, nullptr, true)) {
+                            context, memory, nodes[parent_index], *parent, seq, nullptr)) {
                     const std::vector<llama_token> chunk(
                             tokens.prefix.begin() + nodes[index].chunk_begin,
                             tokens.prefix.begin() + nodes[index].chunk_end);
@@ -2593,7 +1890,6 @@ static int prefetch_oracle_chunks(
             ready = eval_tokens(context, cumulative, seq, 0, options.n_ubatch);
         }
         if (!ready) {
-            llama_memory_seq_rm(memory, seq, -1, -1);
             free_sequences.push_back(seq);
             continue;
         }
@@ -2602,7 +1898,7 @@ static int prefetch_oracle_chunks(
         variant.lora_id = next_request.lora_id;
         variant.cache_seq_id = seq;
         variant.last_access_index = request_index;
-        variant.predicted_probability = predicted_probability;
+        variant.predicted_probability = 1.0;
         nodes[index].variants.push_back(variant);
         prefix_variant & stored = nodes[index].variants.back();
         if (nodes[index].anchor_seq_id < 0) {
@@ -2631,23 +1927,15 @@ static int prefetch_oracle_chunks(
             full_built++;
         }
         built++;
-        built_this_lora++;
     }
     return built;
 }
 
 struct prefetch_job {
     dataset_request request;
-    double probability = 1.0;
     int enqueue_index = -1;
     int target_request_id = -1;
     long long deadline_arrival_ms = 0;
-};
-
-struct delta_compress_job {
-    int node_id = -1;
-    int lora_id = -1;
-    int enqueue_index = -1;
 };
 
 static std::vector<online_result> run_online_system_v2(
@@ -2671,33 +1959,10 @@ static std::vector<online_result> run_online_system_v2(
     }
     std::vector<prefix_node> nodes;
     std::deque<prefetch_job> prefetch_queue;
-    std::deque<delta_compress_job> delta_queue;
-    const auto file_predictions = load_prediction_file(options.prediction_file);
-    if (options.prefetch_policy == "file" && file_predictions.empty()) {
-        fprintf(stderr,
-                "prefetch-policy=file requires a non-empty prediction file: %s\n",
-                options.prediction_file.c_str());
-        llama_free(context);
-        return results;
-    }
-    std::unordered_map<std::string, lora_runtime *> group_anchors;
-    for (const auto & item : loras) {
-        if (item.second != nullptr && item.second->is_anchor) {
-            group_anchors[item.second->group_name] = item.second;
-        }
-    }
     int next_node_id = 0;
-    double estimated_prefetch_ms = 1000.0;
-    double estimated_compression_ms = 1000.0;
     const int limit = std::min(options.max_online_requests, (int) requests.size());
 
     for (int request_index = 0; request_index < limit; ++request_index) {
-        if (request_index % 10 == 0 || request_index + 1 == limit) {
-            fprintf(stderr,
-                    "system-v2 progress: %d/%d, nodes=%d, prefetch_queue=%d, delta_queue=%d\n",
-                    request_index + 1, limit, (int) nodes.size(),
-                    (int) prefetch_queue.size(), (int) delta_queue.size());
-        }
         const dataset_request & request = requests[request_index];
         int dropped_expired = 0;
         while (!prefetch_queue.empty() &&
@@ -2711,8 +1976,10 @@ static std::vector<online_result> run_online_system_v2(
         tokenized_request tokens;
         if (!tokenize_request(vocab, request, tokens) || tokens.full.empty()) continue;
 
+        const int chunk_size = options.prefix_chunk_tokens > 0
+                ? options.prefix_chunk_tokens : std::max(1, request.chunk_token_size);
         const std::vector<int> path = ensure_chunk_path(
-                nodes, request, tokens, options, next_node_id);
+                nodes, request, tokens.prefix, chunk_size, next_node_id);
 
         online_result result;
         result.benchmark = "online";
@@ -2729,36 +1996,15 @@ static std::vector<online_result> run_online_system_v2(
         result.suffix_tokens = (int) tokens.suffix.size();
         result.prompt_tokens = (int) tokens.full.size();
         result.prefetch_dropped_expired = dropped_expired;
-
-        // Reserve enough unified-KV cells for the entire foreground prompt
-        // and first decode tokens before looking up a cached prefix. This may
-        // demote/offload low-value background variants, but it prevents an
-        // idle compression or prefetch job from starving the next request.
-        const int foreground_tokens = std::min(
-                options.n_ctx,
-                (int) tokens.full.size() + std::max(1, options.n_predict));
-        const int protected_node_id = path.empty() ? -1 : path.back();
-        if (!ensure_cache_capacity_v2(
-                    context, memory, nodes, free_sequences, options,
-                    foreground_tokens, 0, protected_node_id,
-                    request_index, false)) {
-            llama_memory_seq_rm(memory, request_seq, -1, -1);
-            result.mode = "foreground_capacity_failed";
-            result.physical_cache_tokens = count_gpu_cache_tokens_v2(nodes);
-            result.cache_nodes = (int) nodes.size();
-            result.cache_variants = count_variants(nodes);
-            results.push_back(result);
-            continue;
-        }
-
         const double request_start = now_ms();
         result.lora_bind_ms = bind_lora(context, lora);
+
         int hit_index = -1;
         prefix_variant * hit_variant = nullptr;
         for (auto it = path.rbegin(); it != path.rend(); ++it) {
             const int index = find_node_by_id(nodes, *it);
             if (index < 0) continue;
-            prefix_variant * variant = find_gpu_variant(nodes[index], request.lora_id);
+            prefix_variant * variant = find_variant(nodes[index], request.lora_id);
             if (variant != nullptr) {
                 hit_index = index;
                 hit_variant = variant;
@@ -2771,7 +2017,7 @@ static std::vector<online_result> run_online_system_v2(
         if (hit_index >= 0 && hit_variant != nullptr) {
             hit_depth = nodes[hit_index].depth_tokens;
             restored = restore_variant_v2(
-                    context, memory, nodes[hit_index], *hit_variant, request_seq, &result, false);
+                    context, memory, nodes[hit_index], *hit_variant, request_seq, &result);
             if (restored) {
                 hit_variant->hit_count++;
                 hit_variant->last_access_index = request_index;
@@ -2781,7 +2027,8 @@ static std::vector<online_result> run_online_system_v2(
                 result.chunk_hit_tokens = hit_depth;
                 result.exact_prefix_hit = hit_depth == (int) tokens.prefix.size() ? 1 : 0;
                 result.same_lora_variant_hit = result.exact_prefix_hit;
-                result.mode = "chunk_prefix_gpu_reuse";
+                result.mode = hit_variant->residency == variant_residency::host_delta
+                        ? "chunk_prefix_delta_materialize" : "chunk_prefix_gpu_reuse";
             }
         }
         if (!restored) {
@@ -2804,7 +2051,6 @@ static std::vector<online_result> run_online_system_v2(
                     tokens.prefix.begin() + hit_depth, tokens.prefix.end());
             if (!eval_tokens(context, remaining, request_seq, hit_depth, options.n_ubatch)) {
                 result.mode += "_prefix_eval_failed";
-                llama_memory_seq_rm(memory, request_seq, -1, -1);
                 results.push_back(result);
                 continue;
             }
@@ -2813,8 +2059,6 @@ static std::vector<online_result> run_online_system_v2(
 
         const std::vector<int> added = cache_missing_chunks(
                 context, memory, options, nodes, path, request.lora_id,
-                group_anchors.count(request.group_name)
-                        ? group_anchors[request.group_name]->lora_id : -1,
                 request_seq, free_sequences, request_index);
 
         if (options.cross_lora_policy == "sync") {
@@ -2842,32 +2086,23 @@ static std::vector<online_result> run_online_system_v2(
         const double next_arrival = request_index + 1 < limit
                 ? (double) requests[request_index + 1].arrival_ms
                 : (double) request.arrival_ms;
-        const double interarrival_gap = std::max(
-                0.0, next_arrival - (double) request.arrival_ms);
-        // Background work can only use the slack left after foreground
-        // inference. Using the raw inter-arrival interval overestimates the
-        // budget and admits jobs that cannot finish before the next request.
-        result.idle_gap_ms = std::max(0.0, interarrival_gap - result.total_ms);
+        result.idle_gap_ms = std::max(0.0, next_arrival - (double) request.arrival_ms);
 
-        if (options.cross_lora_policy == "deferred") {
+        if (options.cross_lora_policy == "deferred" &&
+                background_allowed(options, result.idle_gap_ms)) {
+            const double background_start = now_ms();
+            online_result background_metrics;
             for (int node_id : added) {
                 const int index = find_node_by_id(nodes, node_id);
                 if (index < 0) continue;
                 prefix_variant * variant = find_variant(nodes[index], request.lora_id);
-                if (variant == nullptr || variant->delta_available ||
-                        nodes[index].anchor_lora_id == request.lora_id) continue;
-                bool duplicate = false;
-                for (const auto & job : delta_queue) {
-                    if (job.node_id == node_id && job.lora_id == request.lora_id) {
-                        duplicate = true;
-                        break;
-                    }
-                }
-                if (!duplicate) {
-                    delta_queue.push_back({ node_id, request.lora_id, request_index });
-                    result.delta_candidates_marked++;
+                if (variant != nullptr) {
+                    convert_variant_to_host_delta(
+                            context, memory, nodes[index], *variant, validation_seq,
+                            options, nodes, &background_metrics);
                 }
             }
+            result.delta_background_ms = now_ms() - background_start;
         }
 
         if (options.prefetch_policy == "oracle" && request_index + 1 < limit) {
@@ -2884,43 +2119,9 @@ static std::vector<online_result> run_online_system_v2(
             if (!duplicate) {
                 prefetch_queue.push_back({
                         next_request,
-                        1.0,
                         request_index,
                         next_request.request_id,
                         next_request.arrival_ms });
-            }
-        } else if (options.prefetch_policy == "file" && request_index + 1 < limit) {
-            const auto prediction_it = file_predictions.find(request.request_id);
-            if (prediction_it != file_predictions.end()) {
-                const int top_k = std::min(options.prediction_top_k,
-                        (int) prediction_it->second.size());
-                for (int prediction_index = 0; prediction_index < top_k; ++prediction_index) {
-                    const prediction_candidate & candidate = prediction_it->second[prediction_index];
-                    if (prediction_index == 0) result.predicted_lora_id = candidate.lora_id;
-                    if (candidate.probability < options.prefetch_min_probability) continue;
-                    const auto predicted_lora_it = loras.find(candidate.lora_id);
-                    if (predicted_lora_it == loras.end() || predicted_lora_it->second == nullptr) continue;
-                    dataset_request predicted_request = request;
-                    predicted_request.lora_id = candidate.lora_id;
-                    predicted_request.lora_name = predicted_lora_it->second->logical_name;
-                    predicted_request.group_name = predicted_lora_it->second->group_name;
-                    bool duplicate = false;
-                    for (const auto & job : prefetch_queue) {
-                        if (job.request.context_id == predicted_request.context_id &&
-                                job.request.lora_id == predicted_request.lora_id) {
-                            duplicate = true;
-                            break;
-                        }
-                    }
-                    if (!duplicate) {
-                        prefetch_queue.push_back({
-                                predicted_request,
-                                candidate.probability,
-                                request_index,
-                                requests[request_index + 1].request_id,
-                                requests[request_index + 1].arrival_ms });
-                    }
-                }
             }
         }
 
@@ -2928,9 +2129,7 @@ static std::vector<online_result> run_online_system_v2(
                 ? std::numeric_limits<double>::infinity()
                 : result.idle_gap_ms;
         while (!prefetch_queue.empty() &&
-                background_allowed(
-                        options, remaining_gap,
-                        estimated_prefetch_ms * options.prefetch_cost_safety_factor)) {
+                background_allowed(options, remaining_gap)) {
             const prefetch_job job = prefetch_queue.front();
             const auto predicted_lora = loras.find(job.request.lora_id);
             if (predicted_lora == loras.end()) {
@@ -2944,75 +2143,15 @@ static std::vector<online_result> run_online_system_v2(
             int skipped_no_anchor = 0;
             result.prefetch_built += prefetch_oracle_chunks(
                     context, memory, vocab, options, job.request, *predicted_lora->second,
-                     group_anchors.count(job.request.group_name)
-                            ? group_anchors[job.request.group_name] : nullptr,
-                     nodes, free_sequences, validation_seq, request_index,
-                     next_node_id, job.probability, prefetch_metrics,
+                    nodes, free_sequences, validation_seq, request_index,
+                    next_node_id, prefetch_metrics,
                     full_built, delta_built, skipped_no_anchor);
             result.prefetch_full_built += full_built;
             result.prefetch_delta_built += delta_built;
             result.prefetch_skipped_no_anchor += skipped_no_anchor;
-            result.prefetch_delta_materialized += prefetch_metrics.prefetch_delta_materialized;
-            result.prefetch_materialize_ms += prefetch_metrics.prefetch_materialize_ms;
-            result.prefetch_materialized_bytes += prefetch_metrics.prefetch_materialized_bytes;
-            merge_delta_metrics(result, prefetch_metrics);
             const double elapsed = now_ms() - prefetch_start;
-            estimated_prefetch_ms = 0.8 * estimated_prefetch_ms + 0.2 * elapsed;
             result.prefetch_ms += elapsed;
             prefetch_queue.pop_front();
-            if (options.background_policy != "unlimited") {
-                remaining_gap -= elapsed;
-                if (remaining_gap < 0.0) {
-                    result.background_overrun_ms += -remaining_gap;
-                    break;
-                }
-            }
-        }
-
-        int compression_attempts = (int) delta_queue.size();
-        while (compression_attempts-- > 0 && !delta_queue.empty() &&
-                background_allowed(options, remaining_gap, estimated_compression_ms)) {
-            const delta_compress_job job = delta_queue.front();
-            delta_queue.pop_front();
-            result.delta_jobs_dequeued++;
-            int index = find_node_by_id(nodes, job.node_id);
-            if (index < 0) {
-                result.delta_skipped_missing_node++;
-                continue;
-            }
-            prefix_variant * variant = find_variant(nodes[index], job.lora_id);
-            if (variant == nullptr || variant->delta_available ||
-                    variant->residency != variant_residency::gpu_full) {
-                result.delta_skipped_nonresident++;
-                continue;
-            }
-            if (nodes[index].anchor_seq_id < 0) {
-                auto anchor_it = group_anchors.find(nodes[index].group_name);
-                if (anchor_it == group_anchors.end() || anchor_it->second == nullptr ||
-                        !build_configured_anchor_for_node(
-                                context, memory, options, nodes, job.node_id,
-                                *anchor_it->second, free_sequences, request_index)) {
-                    delta_queue.push_back(job);
-                    continue;
-                }
-                result.background_anchor_built++;
-                index = find_node_by_id(nodes, job.node_id);
-                if (index < 0) continue;
-                variant = find_variant(nodes[index], job.lora_id);
-                if (variant == nullptr) continue;
-            }
-            if (nodes[index].anchor_lora_id == job.lora_id) continue;
-
-            const double compression_start = now_ms();
-            online_result compression_metrics;
-            const bool compressed = convert_variant_to_host_delta(
-                    context, memory, nodes[index], *variant, validation_seq,
-                    options, nodes, &compression_metrics);
-            const double elapsed = now_ms() - compression_start;
-            estimated_compression_ms = 0.8 * estimated_compression_ms + 0.2 * elapsed;
-            result.delta_background_ms += elapsed;
-            merge_delta_metrics(result, compression_metrics);
-            if (compressed) result.delta_compressed_background++;
             if (options.background_policy != "unlimited") {
                 remaining_gap -= elapsed;
                 if (remaining_gap < 0.0) {
@@ -3026,30 +2165,8 @@ static std::vector<online_result> run_online_system_v2(
         result.cache_variants = count_variants(nodes);
         result.physical_cache_tokens = count_gpu_cache_tokens_v2(nodes);
         result.host_delta_variants = count_host_delta_variants(nodes);
-        result.host_full_variants = count_host_full_variants(nodes);
         result.host_delta_bytes = count_host_delta_bytes(nodes);
-        result.host_full_bytes = count_host_full_bytes(nodes);
-        result.host_full_kv_equivalent_bytes = count_host_full_kv_equivalent_bytes(nodes);
-        result.host_delta_compression_rate = result.host_full_kv_equivalent_bytes > 0
-                ? 1.0 - (double) result.host_delta_bytes /
-                    (double) result.host_full_kv_equivalent_bytes
-                : 0.0;
-        result.prefetch_materialize_gbps = result.prefetch_materialize_ms > 0.0
-                ? (double) result.prefetch_materialized_bytes /
-                    (result.prefetch_materialize_ms / 1000.0) / 1.0e9
-                : 0.0;
-        result.delta_store_read_gbps = result.delta_store_load_ms > 0.0
-                ? (double) result.delta_store_bytes_read /
-                    (result.delta_store_load_ms / 1000.0) / 1.0e9
-                : 0.0;
-        llama_kv_memory_stats memory_stats = {};
-        if (llama_get_kv_memory_stats(context, 128, &memory_stats)) {
-            result.kv_continuous_bytes = memory_stats.continuous_bytes;
-            result.kv_paged_bytes = memory_stats.paged_bytes;
-            result.kv_cell_used_rate = memory_stats.cell_used_rate;
-            result.kv_page_used_rate = memory_stats.page_used_rate;
-        }
-        result.background_queue_length = (int) prefetch_queue.size() + (int) delta_queue.size();
+        result.background_queue_length = (int) prefetch_queue.size();
         results.push_back(result);
     }
 
@@ -3115,18 +2232,8 @@ static void save_online_results(
            << "cache_variants,physical_cache_tokens,chunk_hit_tokens,materialize_ok,"
            << "materialize_ms,delta_validation_ms,reconstruction_cos,reconstruction_l2,predicted_lora_id,"
            << "idle_gap_ms,prefetch_ms,prefetch_built,prefetch_full_built,prefetch_delta_built,"
-           << "prefetch_skipped_no_anchor,prefetch_dropped_expired,delta_store_loaded,delta_store_saved,host_delta_variants,"
-           << "delta_candidates_marked,delta_compressed_background,prefetch_delta_materialized,"
-           << "delta_jobs_dequeued,delta_skipped_missing_node,delta_skipped_nonresident,"
-           << "delta_rejected_probe,delta_rejected_quality,delta_rejected_build,"
-           << "delta_rejected_host_limit,delta_rejected_validation,"
-           << "background_anchor_built,reconstruction_checks,reconstruction_cos_sum,"
-           << "reconstruction_cos_min,reconstruction_l2_max,delta_full_kv_bytes_added,"
-           << "delta_bytes_added,delta_store_load_ms,delta_store_bytes_read,delta_store_read_gbps,"
-           << "prefetch_materialize_ms,prefetch_materialized_bytes,prefetch_materialize_gbps,"
-           << "host_delta_bytes,host_full_variants,host_full_bytes,host_full_kv_equivalent_bytes,host_delta_compression_rate,"
-           << "kv_continuous_bytes,kv_paged_bytes,kv_cell_used_rate,kv_page_used_rate,"
-           << "background_queue_length,background_overrun_ms\n";
+           << "prefetch_skipped_no_anchor,prefetch_dropped_expired,host_delta_variants,"
+           << "host_delta_bytes,background_queue_length,background_overrun_ms\n";
     for (const auto & row : results) {
         output << csv_escape(row.benchmark) << ',' << row.request_id << ','
                << row.arrival_ms << ',' << row.user_id << ',' << row.session_id << ','
@@ -3152,25 +2259,8 @@ static void save_online_results(
                << row.prefetch_ms << ',' << row.prefetch_built << ','
                << row.prefetch_full_built << ',' << row.prefetch_delta_built << ','
                << row.prefetch_skipped_no_anchor << ','
-               << row.prefetch_dropped_expired << ',' << row.delta_store_loaded << ','
-               << row.delta_store_saved << ',' << row.host_delta_variants << ','
-               << row.delta_candidates_marked << ',' << row.delta_compressed_background << ','
-               << row.prefetch_delta_materialized << ','
-               << row.delta_jobs_dequeued << ',' << row.delta_skipped_missing_node << ','
-               << row.delta_skipped_nonresident << ',' << row.delta_rejected_probe << ','
-               << row.delta_rejected_quality << ',' << row.delta_rejected_build << ','
-               << row.delta_rejected_host_limit << ',' << row.delta_rejected_validation << ','
-               << row.background_anchor_built << ',' << row.reconstruction_checks << ','
-               << row.reconstruction_cos_sum << ',' << row.reconstruction_cos_min << ','
-               << row.reconstruction_l2_max << ',' << row.delta_full_kv_bytes_added << ','
-               << row.delta_bytes_added << ',' << row.delta_store_load_ms << ','
-               << row.delta_store_bytes_read << ',' << row.delta_store_read_gbps << ','
-               << row.prefetch_materialize_ms << ',' << row.prefetch_materialized_bytes << ','
-               << row.prefetch_materialize_gbps << ',' << row.host_delta_bytes << ','
-               << row.host_full_variants << ',' << row.host_full_bytes << ','
-               << row.host_full_kv_equivalent_bytes << ',' << row.host_delta_compression_rate << ','
-               << row.kv_continuous_bytes << ',' << row.kv_paged_bytes << ','
-               << row.kv_cell_used_rate << ',' << row.kv_page_used_rate << ','
+               << row.prefetch_dropped_expired << ',' << row.host_delta_variants << ','
+               << row.host_delta_bytes << ','
                << row.background_queue_length << ',' << row.background_overrun_ms << '\n';
     }
 }
@@ -3180,14 +2270,11 @@ static void save_tree_summary(
         const std::vector<prefix_node> & nodes) {
     std::filesystem::create_directories(output_dir);
     std::ofstream output(output_dir + "/online_prefix_tree.csv");
-    int final_request_index = 0;
-    for (const auto & node : nodes) final_request_index = std::max(final_request_index, node.last_access_index);
     output << "node_id,parent_node_id,group_name,context_id,prefix_hash,prefix_tokens,"
            << "chunk_begin,chunk_end,segment_kind,anchor_lora_id,node_hit_count,"
            << "last_access_index,variant_lora_id,variant_seq_id,variant_hit_count,"
-           << "variant_residency,storage_tier,delta_available,delta_bytes,full_kv_bytes_equivalent,"
-           << "compression_rate,materialize_ms,"
-           << "predicted_probability,family_score,reconstruction_cos,reconstruction_l2\n";
+           << "variant_residency,delta_bytes,materialize_ms,predicted_probability,"
+           << "reconstruction_cos,reconstruction_l2\n";
     for (const auto & node : nodes) {
         for (const auto & variant : node.variants) {
             output << node.node_id << ',' << node.parent_node_id << ','
@@ -3199,80 +2286,12 @@ static void save_tree_summary(
                    << node.hit_count << ',' << node.last_access_index << ','
                    << variant.lora_id << ',' << variant.cache_seq_id << ','
                    << variant.hit_count << ','
-                   << (variant.residency == variant_residency::gpu_full
-                           ? "gpu_full"
-                           : variant.residency == variant_residency::host_delta
-                               ? "host_delta" : "host_full") << ','
-                   << (variant.residency == variant_residency::host_delta
-                           ? "tier1_host_delta"
-                           : variant.residency == variant_residency::host_full
-                               ? "tier1_host_full"
-                           : variant.predicted_probability > 0.0
-                               ? "tier3_predicted_gpu_kv"
-                               : "tier2_gpu_anchor_hot") << ','
-                   << (variant.delta_available ? 1 : 0) << ','
-                   << variant.delta_bytes << ',' << variant.full_kv_bytes_equivalent << ','
-                   << (variant.full_kv_bytes_equivalent > 0
-                           ? 1.0 - (double) variant.delta_bytes /
-                               (double) variant.full_kv_bytes_equivalent
-                           : 0.0) << ','
-                   << variant.materialize_ms << ','
-                   << variant.predicted_probability << ','
-                   << family_value(node, final_request_index) << ',' << variant.reconstruction_cos << ','
+                   << (variant.residency == variant_residency::gpu_full ? "gpu_full" : "host_delta")
+                   << ',' << variant.delta_bytes << ',' << variant.materialize_ms << ','
+                   << variant.predicted_probability << ',' << variant.reconstruction_cos << ','
                    << variant.reconstruction_l2 << '\n';
         }
     }
-}
-
-static void save_system_parameters(
-        const std::string & output_dir,
-        const experiment_options & options,
-        const std::vector<lora_runtime> & loras) {
-    unsigned long long model_bytes = 0;
-    if (std::filesystem::exists(options.model_path)) {
-        model_bytes = std::filesystem::file_size(options.model_path);
-    }
-    unsigned long long lora_bytes = 0;
-    unsigned long long min_lora_bytes = std::numeric_limits<unsigned long long>::max();
-    unsigned long long max_lora_bytes = 0;
-    double lora_load_total_ms = 0.0;
-    double lora_load_max_ms = 0.0;
-    int valid_loras = 0;
-    for (const auto & lora : loras) {
-        if (lora.adapter_path.empty() || !std::filesystem::exists(lora.adapter_path)) continue;
-        const unsigned long long bytes = std::filesystem::file_size(lora.adapter_path);
-        lora_bytes += bytes;
-        min_lora_bytes = std::min(min_lora_bytes, bytes);
-        max_lora_bytes = std::max(max_lora_bytes, bytes);
-        lora_load_total_ms += lora.initial_load_ms;
-        lora_load_max_ms = std::max(lora_load_max_ms, lora.initial_load_ms);
-        valid_loras++;
-    }
-    if (valid_loras == 0) min_lora_bytes = 0;
-    std::ofstream output(output_dir + "/system_parameters.csv");
-    output << "model_bytes,lora_count,total_lora_bytes,mean_lora_bytes,min_lora_bytes,max_lora_bytes,"
-           << "lora_load_total_ms,lora_load_mean_ms,lora_load_max_ms,"
-           << "n_ctx,n_batch,n_ubatch,max_cache_nodes,max_cache_variants,max_cache_tokens,"
-           << "max_host_delta_bytes,max_host_full_bytes,system_chunk_tokens,context_chunk_tokens,background_policy,"
-           << "background_min_gap_ms,background_safety_margin_ms,delta_validation_rate,"
-           << "prefetch_min_probability,max_prefetch_chunks_per_lora,prefetch_cost_safety_factor\n";
-    output << model_bytes << ',' << valid_loras << ',' << lora_bytes << ','
-           << (valid_loras > 0 ? lora_bytes / (unsigned long long) valid_loras : 0) << ','
-           << min_lora_bytes << ',' << max_lora_bytes << ','
-           << lora_load_total_ms << ','
-           << (valid_loras > 0 ? lora_load_total_ms / valid_loras : 0.0) << ','
-           << lora_load_max_ms << ','
-           << options.n_ctx << ',' << options.n_batch << ',' << options.n_ubatch << ','
-           << options.max_cache_nodes << ',' << options.max_cache_variants << ','
-           << options.max_cache_tokens << ','
-           << (unsigned long long) options.max_host_delta_mb * 1024ULL * 1024ULL << ','
-           << (unsigned long long) options.max_host_full_mb * 1024ULL * 1024ULL << ','
-           << options.system_chunk_tokens << ',' << options.context_chunk_tokens << ','
-           << csv_escape(options.background_policy) << ',' << options.background_min_gap_ms << ','
-           << options.background_safety_margin_ms << ',' << options.delta_validation_rate << ','
-           << options.prefetch_min_probability << ','
-           << options.max_prefetch_chunks_per_lora << ','
-           << options.prefetch_cost_safety_factor << '\n';
 }
 
 // =============================================================================
@@ -3319,9 +2338,7 @@ int main(int argc, char ** argv) {
                     lora.logical_name.c_str());
             continue;
         }
-        const double lora_load_start = now_ms();
         lora.adapter = llama_adapter_lora_init(model, lora.adapter_path.c_str());
-        lora.initial_load_ms = now_ms() - lora_load_start;
         if (!lora.adapter) {
             fprintf(stderr,
                     "skip LoRA %d (%s): failed to load %s\n",
@@ -3408,7 +2425,6 @@ int main(int argc, char ** argv) {
             exact_prefix_results.end());
     save_online_results(options.output_dir, online_results);
     save_tree_summary(options.output_dir, final_nodes);
-    save_system_parameters(options.output_dir, options, lora_list);
 
     for (auto & lora : lora_list) {
         if (lora.adapter) llama_adapter_lora_free(lora.adapter);

@@ -2520,7 +2520,7 @@ bool llama_kv_cache::seq_delta_save_branch(
     if (!output) return false;
 
     const uint64_t magic = 0x4D4F42494C4F5241ULL; // "MOBILORA"
-    const uint32_t version = 2;
+    const uint32_t version = 1;
     const uint32_t tensor_count = (uint32_t) branch->layer_deltas.size();
     output.write((const char *) &magic, sizeof(magic));
     output.write((const char *) &version, sizeof(version));
@@ -2529,8 +2529,6 @@ bool llama_kv_cache::seq_delta_save_branch(
     output.write((const char *) &branch->parent_node_id, sizeof(branch->parent_node_id));
     output.write((const char *) &branch->child_node_id, sizeof(branch->child_node_id));
     output.write((const char *) &tensor_count, sizeof(tensor_count));
-    output.write((const char *) &branch->full_kv_bytes_equivalent,
-            sizeof(branch->full_kv_bytes_equivalent));
 
     for (const auto & delta : branch->layer_deltas) {
         const uint8_t is_k = delta.is_k ? 1 : 0;
@@ -2578,7 +2576,7 @@ bool llama_kv_cache::seq_delta_load_branch(
     input.read((char *) &stored_parent, sizeof(stored_parent));
     input.read((char *) &stored_child, sizeof(stored_child));
     input.read((char *) &tensor_count, sizeof(tensor_count));
-    if (!input || magic != 0x4D4F42494C4F5241ULL || (version != 1 && version != 2) ||
+    if (!input || magic != 0x4D4F42494C4F5241ULL || version != 1 ||
             p1 <= p0 || tensor_count > 2 * layers.size()) return false;
 
     seq_delta_remove_branch(seq_child_delta);
@@ -2590,11 +2588,6 @@ bool llama_kv_cache::seq_delta_load_branch(
     branch.parent_node_id = parent_node_id >= 0 ? parent_node_id : stored_parent;
     branch.child_node_id = child_node_id >= 0 ? child_node_id : stored_child;
     branch.enabled = true;
-    if (version >= 2) {
-        input.read((char *) &branch.full_kv_bytes_equivalent,
-                sizeof(branch.full_kv_bytes_equivalent));
-        if (!input) return false;
-    }
 
     for (uint32_t index = 0; index < tensor_count; ++index) {
         kv_delta_tensor delta;
@@ -2624,15 +2617,6 @@ bool llama_kv_cache::seq_delta_load_branch(
         branch.layer_deltas.push_back(std::move(delta));
     }
     delta_branches.push_back(std::move(branch));
-    return true;
-}
-
-bool llama_kv_cache::seq_delta_get_branch_stats(
-        llama_seq_id seq_child_delta,
-        kv_delta_branch & stats) const {
-    const kv_delta_branch * branch = seq_delta_find_branch(seq_child_delta);
-    if (branch == nullptr) return false;
-    stats = *branch;
     return true;
 }
 

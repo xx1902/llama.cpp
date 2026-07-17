@@ -7,7 +7,6 @@
 
 #include <unordered_map>
 #include <vector>
-#include <string>
 
 struct llama_cparams;
 struct llama_hparams;
@@ -308,18 +307,6 @@ public:
             llama_pos p1,
             kv_delta_materialize_stats & stats);
     bool seq_delta_remove_branch(llama_seq_id seq_child_delta);
-    bool seq_delta_save_branch(
-            llama_seq_id seq_child_delta,
-            const char * path) const;
-    bool seq_delta_load_branch(
-            llama_seq_id seq_anchor,
-            llama_seq_id seq_child_delta,
-            const char * path,
-            int32_t parent_node_id,
-            int32_t child_node_id);
-    bool seq_delta_get_branch_stats(
-            llama_seq_id seq_child_delta,
-            kv_delta_branch & stats) const;
     bool seq_delta_probe(
             llama_seq_id seq_a,
             llama_seq_id seq_b,

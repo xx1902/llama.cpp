@@ -80,9 +80,6 @@ struct experiment_options {
     std::string prefetch_storage = "auto"; // auto | full | delta
     std::string prediction_file;
     int prediction_top_k = 1;
-    double prefetch_min_probability = 0.0;
-    int max_prefetch_chunks_per_lora = 0; // 0 keeps the original behavior.
-    double prefetch_cost_safety_factor = 1.0;
     std::string delta_store_dir;
     std::string delta_store_policy = "none"; // none | build | load | auto
     std::string background_policy = "arrival";
@@ -117,9 +114,6 @@ static void print_usage(const char * program) {
             "  --prefetch-storage auto|full|delta\n"
             "  --prediction-file FILE\n"
             "  --prediction-top-k N\n"
-            "  --prefetch-min-probability P\n"
-            "  --max-prefetch-chunks-per-lora N\n"
-            "  --prefetch-cost-safety-factor F\n"
             "  --delta-store-dir DIR\n"
             "  --delta-store-policy none|build|load|auto\n"
             "  --background-policy none|arrival|cost-aware|unlimited\n"
@@ -264,19 +258,6 @@ static bool parse_options(
             value = require_value(i);
             if (!value || !parse_int(value, options.prediction_top_k) ||
                     options.prediction_top_k <= 0) return false;
-        } else if (arg == "--prefetch-min-probability") {
-            value = require_value(i);
-            if (!value || !parse_double(value, options.prefetch_min_probability) ||
-                    options.prefetch_min_probability < 0.0 ||
-                    options.prefetch_min_probability > 1.0) return false;
-        } else if (arg == "--max-prefetch-chunks-per-lora") {
-            value = require_value(i);
-            if (!value || !parse_int(value, options.max_prefetch_chunks_per_lora) ||
-                    options.max_prefetch_chunks_per_lora < 0) return false;
-        } else if (arg == "--prefetch-cost-safety-factor") {
-            value = require_value(i);
-            if (!value || !parse_double(value, options.prefetch_cost_safety_factor) ||
-                    options.prefetch_cost_safety_factor < 1.0) return false;
         } else if (arg == "--delta-store-dir") {
             value = require_value(i);
             if (!value) return false;
@@ -364,7 +345,6 @@ struct lora_runtime {
     std::string adapter_path;            // 适配器文件路径
     bool is_anchor = false;              // 是否是 anchor LoRA
     llama_adapter_lora * adapter = nullptr;  // llama.cpp 适配器指针
-    double initial_load_ms = 0.0;
 };
 
 // 数据集请求
@@ -1446,10 +1426,6 @@ static std::vector<online_result> run_online_experiment(
     const int limit = std::min(options.max_online_requests, (int) requests.size());
 
     for (int request_index = 0; request_index < limit; ++request_index) {
-        if (request_index % 10 == 0 || request_index + 1 == limit) {
-            fprintf(stderr, "online progress: %d/%d, nodes=%d\n",
-                    request_index + 1, limit, (int) nodes.size());
-        }
         const dataset_request & request = requests[request_index];
         const auto lora_it = loras.find(request.lora_id);
         if (lora_it == loras.end()) continue;
@@ -2485,12 +2461,7 @@ static int prefetch_oracle_chunks(
             context, memory, options, nodes, path, next_request.lora_id,
             free_sequences, request_index, current_result);
 
-    int built_this_lora = 0;
     for (int node_id : path) {
-        if (options.max_prefetch_chunks_per_lora > 0 &&
-                built_this_lora >= options.max_prefetch_chunks_per_lora) {
-            break;
-        }
         int index = find_node_by_id(nodes, node_id);
         if (index < 0) continue;
         prefix_variant * existing = find_variant(nodes[index], next_request.lora_id);
@@ -2527,7 +2498,6 @@ static int prefetch_oracle_chunks(
                 current_result.prefetch_materialized_bytes += existing->host_full_state.size();
                 full_built++;
                 built++;
-                built_this_lora++;
                 continue;
             }
             if (existing->residency == variant_residency::host_delta &&
@@ -2553,7 +2523,6 @@ static int prefetch_oracle_chunks(
                     current_result.prefetch_materialized_bytes += existing->materialized_kv_bytes;
                     full_built++;
                     built++;
-                    built_this_lora++;
                 }
             }
             continue;
@@ -2631,7 +2600,6 @@ static int prefetch_oracle_chunks(
             full_built++;
         }
         built++;
-        built_this_lora++;
     }
     return built;
 }
@@ -2692,12 +2660,6 @@ static std::vector<online_result> run_online_system_v2(
     const int limit = std::min(options.max_online_requests, (int) requests.size());
 
     for (int request_index = 0; request_index < limit; ++request_index) {
-        if (request_index % 10 == 0 || request_index + 1 == limit) {
-            fprintf(stderr,
-                    "system-v2 progress: %d/%d, nodes=%d, prefetch_queue=%d, delta_queue=%d\n",
-                    request_index + 1, limit, (int) nodes.size(),
-                    (int) prefetch_queue.size(), (int) delta_queue.size());
-        }
         const dataset_request & request = requests[request_index];
         int dropped_expired = 0;
         while (!prefetch_queue.empty() &&
@@ -2896,14 +2858,10 @@ static std::vector<online_result> run_online_system_v2(
                         (int) prediction_it->second.size());
                 for (int prediction_index = 0; prediction_index < top_k; ++prediction_index) {
                     const prediction_candidate & candidate = prediction_it->second[prediction_index];
-                    if (prediction_index == 0) result.predicted_lora_id = candidate.lora_id;
-                    if (candidate.probability < options.prefetch_min_probability) continue;
-                    const auto predicted_lora_it = loras.find(candidate.lora_id);
-                    if (predicted_lora_it == loras.end() || predicted_lora_it->second == nullptr) continue;
+                    if (loras.find(candidate.lora_id) == loras.end()) continue;
                     dataset_request predicted_request = request;
                     predicted_request.lora_id = candidate.lora_id;
-                    predicted_request.lora_name = predicted_lora_it->second->logical_name;
-                    predicted_request.group_name = predicted_lora_it->second->group_name;
+                    if (prediction_index == 0) result.predicted_lora_id = candidate.lora_id;
                     bool duplicate = false;
                     for (const auto & job : prefetch_queue) {
                         if (job.request.context_id == predicted_request.context_id &&
@@ -2928,9 +2886,7 @@ static std::vector<online_result> run_online_system_v2(
                 ? std::numeric_limits<double>::infinity()
                 : result.idle_gap_ms;
         while (!prefetch_queue.empty() &&
-                background_allowed(
-                        options, remaining_gap,
-                        estimated_prefetch_ms * options.prefetch_cost_safety_factor)) {
+                background_allowed(options, remaining_gap, estimated_prefetch_ms)) {
             const prefetch_job job = prefetch_queue.front();
             const auto predicted_lora = loras.find(job.request.lora_id);
             if (predicted_lora == loras.end()) {
@@ -3235,8 +3191,6 @@ static void save_system_parameters(
     unsigned long long lora_bytes = 0;
     unsigned long long min_lora_bytes = std::numeric_limits<unsigned long long>::max();
     unsigned long long max_lora_bytes = 0;
-    double lora_load_total_ms = 0.0;
-    double lora_load_max_ms = 0.0;
     int valid_loras = 0;
     for (const auto & lora : loras) {
         if (lora.adapter_path.empty() || !std::filesystem::exists(lora.adapter_path)) continue;
@@ -3244,24 +3198,17 @@ static void save_system_parameters(
         lora_bytes += bytes;
         min_lora_bytes = std::min(min_lora_bytes, bytes);
         max_lora_bytes = std::max(max_lora_bytes, bytes);
-        lora_load_total_ms += lora.initial_load_ms;
-        lora_load_max_ms = std::max(lora_load_max_ms, lora.initial_load_ms);
         valid_loras++;
     }
     if (valid_loras == 0) min_lora_bytes = 0;
     std::ofstream output(output_dir + "/system_parameters.csv");
     output << "model_bytes,lora_count,total_lora_bytes,mean_lora_bytes,min_lora_bytes,max_lora_bytes,"
-           << "lora_load_total_ms,lora_load_mean_ms,lora_load_max_ms,"
            << "n_ctx,n_batch,n_ubatch,max_cache_nodes,max_cache_variants,max_cache_tokens,"
            << "max_host_delta_bytes,max_host_full_bytes,system_chunk_tokens,context_chunk_tokens,background_policy,"
-           << "background_min_gap_ms,background_safety_margin_ms,delta_validation_rate,"
-           << "prefetch_min_probability,max_prefetch_chunks_per_lora,prefetch_cost_safety_factor\n";
+           << "background_min_gap_ms,background_safety_margin_ms,delta_validation_rate\n";
     output << model_bytes << ',' << valid_loras << ',' << lora_bytes << ','
            << (valid_loras > 0 ? lora_bytes / (unsigned long long) valid_loras : 0) << ','
            << min_lora_bytes << ',' << max_lora_bytes << ','
-           << lora_load_total_ms << ','
-           << (valid_loras > 0 ? lora_load_total_ms / valid_loras : 0.0) << ','
-           << lora_load_max_ms << ','
            << options.n_ctx << ',' << options.n_batch << ',' << options.n_ubatch << ','
            << options.max_cache_nodes << ',' << options.max_cache_variants << ','
            << options.max_cache_tokens << ','
@@ -3269,10 +3216,7 @@ static void save_system_parameters(
            << (unsigned long long) options.max_host_full_mb * 1024ULL * 1024ULL << ','
            << options.system_chunk_tokens << ',' << options.context_chunk_tokens << ','
            << csv_escape(options.background_policy) << ',' << options.background_min_gap_ms << ','
-           << options.background_safety_margin_ms << ',' << options.delta_validation_rate << ','
-           << options.prefetch_min_probability << ','
-           << options.max_prefetch_chunks_per_lora << ','
-           << options.prefetch_cost_safety_factor << '\n';
+           << options.background_safety_margin_ms << ',' << options.delta_validation_rate << '\n';
 }
 
 // =============================================================================
@@ -3319,9 +3263,7 @@ int main(int argc, char ** argv) {
                     lora.logical_name.c_str());
             continue;
         }
-        const double lora_load_start = now_ms();
         lora.adapter = llama_adapter_lora_init(model, lora.adapter_path.c_str());
-        lora.initial_load_ms = now_ms() - lora_load_start;
         if (!lora.adapter) {
             fprintf(stderr,
                     "skip LoRA %d (%s): failed to load %s\n",
