@@ -86,7 +86,6 @@ struct experiment_options {
     std::string delta_store_dir;
     std::string delta_store_policy = "none"; // none | build | load | auto
     std::string background_policy = "arrival";
-    double arrival_time_scale = 1.0;
     double background_min_gap_ms = 15000.0;
     double background_safety_margin_ms = 10.0;
     double delta_validation_rate = 0.10;
@@ -138,7 +137,6 @@ static void print_usage(const char * program) {
             "  --delta-store-dir DIR\n"
             "  --delta-store-policy none|build|load|auto\n"
             "  --background-policy none|arrival|cost-aware|unlimited\n"
-            "  --arrival-time-scale F\n"
             "  --background-min-gap-ms N\n"
             "  --background-safety-margin-ms N\n"
             "  --delta-validation-rate 0..1\n"
@@ -329,10 +327,6 @@ static bool parse_options(
                 fprintf(stderr, "invalid background policy: %s\n", value);
                 return false;
             }
-        } else if (arg == "--arrival-time-scale") {
-            value = require_value(i);
-            if (!value || !parse_double(value, options.arrival_time_scale) ||
-                    options.arrival_time_scale <= 0.0) return false;
         } else if (arg == "--background-min-gap-ms") {
             value = require_value(i);
             if (!value || !parse_double(value, options.background_min_gap_ms)) return false;
@@ -693,7 +687,6 @@ struct family_score_breakdown {
 struct family_cache_event {
     int request_index = -1;
     std::string action;
-    std::string reason;
     int node_id = -1;
     int variant_lora_id = -1;
     std::string group_name;
@@ -1387,13 +1380,6 @@ static prefix_variant * find_variant(prefix_node & node, int lora_id) {
     return nullptr;
 }
 
-static const prefix_variant * find_variant(const prefix_node & node, int lora_id) {
-    for (const auto & variant : node.variants) {
-        if (variant.lora_id == lora_id) return &variant;
-    }
-    return nullptr;
-}
-
 static prefix_variant * find_gpu_variant(prefix_node & node, int lora_id) {
     prefix_variant * variant = find_variant(node, lora_id);
     return variant != nullptr && variant->residency == variant_residency::gpu_full
@@ -2014,37 +2000,6 @@ static void expire_consumed_predictions(
     }
 }
 
-// Prediction should influence Tier-2 protection even when the idle window is
-// too short to execute prefetch. Only mark variants that already exist; do not
-// create speculative tree nodes merely because a predictor mentioned a LoRA.
-static int mark_existing_family_prediction(
-        const llama_vocab * vocab,
-        const dataset_request & predicted_request,
-        double probability,
-        int target_request_id,
-        std::vector<prefix_node> & nodes) {
-    if (probability <= 0.0) return 0;
-    tokenized_request tokens;
-    if (!tokenize_request(vocab, predicted_request, tokens) || tokens.prefix.empty()) return 0;
-    int marked = 0;
-    for (auto & node : nodes) {
-        if (node.group_name != predicted_request.group_name ||
-                node.depth_tokens > (int) tokens.prefix.size() ||
-                node.prefix_tokens.size() > tokens.prefix.size() ||
-                !std::equal(
-                        node.prefix_tokens.begin(), node.prefix_tokens.end(),
-                        tokens.prefix.begin())) continue;
-        prefix_variant * variant = find_variant(node, predicted_request.lora_id);
-        if (variant == nullptr) continue;
-        variant->predicted_probability = std::max(
-                variant->predicted_probability, probability);
-        variant->predicted_until_request_id = std::max(
-                variant->predicted_until_request_id, target_request_id);
-        marked++;
-    }
-    return marked;
-}
-
 static family_score_breakdown score_anchor_family(
         const prefix_node & node,
         int request_index,
@@ -2109,7 +2064,6 @@ static double family_value(
 
 static void record_family_cache_event(
         const char * action,
-        const char * reason,
         const prefix_node & node,
         int variant_lora_id,
         int request_index,
@@ -2117,7 +2071,6 @@ static void record_family_cache_event(
     family_cache_event event;
     event.request_index = request_index;
     event.action = action;
-    event.reason = reason;
     event.node_id = node.node_id;
     event.variant_lora_id = variant_lora_id;
     event.group_name = node.group_name;
@@ -2174,8 +2127,7 @@ static bool demote_predicted_delta_variant(
         for (const auto & variant : node.variants) {
             if (&variant == victim) {
                 record_family_cache_event(
-                        "tier3_delta_demote", "gpu_token_pressure",
-                        node, victim->lora_id,
+                        "tier3_delta_demote", node, victim->lora_id,
                         request_index, options);
                 break;
             }
@@ -2220,8 +2172,7 @@ static bool offload_gpu_variant_to_host(
     }
     if (victim == nullptr || victim_node == nullptr) return false;
     record_family_cache_event(
-            "gpu_full_to_host", "sequence_or_gpu_pressure",
-            *victim_node, victim->lora_id,
+            "gpu_full_to_host", *victim_node, victim->lora_id,
             request_index, options);
     if (victim->host_full_state.empty()) {
         const size_t size = llama_state_seq_get_size(context, victim->cache_seq_id);
@@ -2288,21 +2239,8 @@ static bool ensure_cache_capacity_v2(
             }
         }
         if (victim_index < 0) return false;
-        std::string pressure;
-        if (requires_free_sequence && free_sequences.empty()) pressure += "sequence+";
-        if (requires_free_sequence && count_variants(nodes) >= options.max_cache_variants) {
-            pressure += "variant+";
-        }
-        if (count_gpu_cache_tokens_v2(nodes) + additional_gpu_tokens > options.max_cache_tokens) {
-            pressure += "gpu_tokens+";
-        }
-        if (count_host_delta_bytes(nodes) + additional_host_bytes > host_limit) {
-            pressure += "host_delta+";
-        }
-        if ((int) nodes.size() > options.max_cache_nodes) pressure += "nodes+";
-        if (!pressure.empty()) pressure.pop_back();
         record_family_cache_event(
-                "family_evict", pressure.c_str(), nodes[victim_index], -1,
+                "family_evict", nodes[victim_index], -1,
                 request_index, options);
         release_node_v2(context, memory, nodes[victim_index], free_sequences);
         nodes.erase(nodes.begin() + victim_index);
@@ -2948,37 +2886,6 @@ struct delta_compress_job {
     int enqueue_index = -1;
 };
 
-static int select_delta_compress_job(
-        const std::deque<delta_compress_job> & queue,
-        const std::vector<prefix_node> & nodes,
-        int request_index,
-        const experiment_options & options) {
-    int best_index = 0;
-    double best_priority = -std::numeric_limits<double>::infinity();
-    for (int index = 0; index < (int) queue.size(); ++index) {
-        const int node_index = find_node_by_id(nodes, queue[index].node_id);
-        if (node_index < 0) continue;
-        const prefix_node & node = nodes[node_index];
-        const prefix_variant * variant = find_variant(node, queue[index].lora_id);
-        if (variant == nullptr || variant->delta_available ||
-                variant->residency != variant_residency::gpu_full) continue;
-
-        // Compression is useful only if the family is likely to survive and
-        // be reused. Family value captures decayed frequency, prediction,
-        // prefix work, fanout, recency, memory, and reconstruction cost.
-        // A small queue-age term prevents continuous arrivals from starving
-        // an older but still valuable candidate forever.
-        const int queue_age = std::max(0, request_index - queue[index].enqueue_index);
-        const double priority = family_value(node, request_index, options) +
-                0.01 * std::min(queue_age, 100);
-        if (priority > best_priority) {
-            best_priority = priority;
-            best_index = index;
-        }
-    }
-    return best_index;
-}
-
 static std::vector<online_result> run_online_system_v2(
         llama_model * model,
         const llama_vocab * vocab,
@@ -3190,8 +3097,7 @@ static std::vector<online_result> run_online_system_v2(
                 ? (double) requests[request_index + 1].arrival_ms
                 : (double) request.arrival_ms;
         const double interarrival_gap = std::max(
-                0.0, next_arrival - (double) request.arrival_ms) *
-                options.arrival_time_scale;
+                0.0, next_arrival - (double) request.arrival_ms);
         // Background work can only use the slack left after foreground
         // inference. Using the raw inter-arrival interval overestimates the
         // budget and admits jobs that cannot finish before the next request.
@@ -3230,8 +3136,6 @@ static std::vector<online_result> run_online_system_v2(
                 }
             }
             if (!duplicate) {
-                mark_existing_family_prediction(
-                        vocab, next_request, 1.0, next_request.request_id, nodes);
                 prefetch_queue.push_back({
                         next_request,
                         1.0,
@@ -3263,9 +3167,6 @@ static std::vector<online_result> run_online_system_v2(
                         }
                     }
                     if (!duplicate) {
-                        mark_existing_family_prediction(
-                                vocab, predicted_request, candidate.probability,
-                                requests[request_index + 1].request_id, nodes);
                         prefetch_queue.push_back({
                                 predicted_request,
                                 candidate.probability,
@@ -3325,10 +3226,8 @@ static std::vector<online_result> run_online_system_v2(
         int compression_attempts = (int) delta_queue.size();
         while (compression_attempts-- > 0 && !delta_queue.empty() &&
                 background_allowed(options, remaining_gap, estimated_compression_ms)) {
-            const int selected = select_delta_compress_job(
-                    delta_queue, nodes, request_index, options);
-            const delta_compress_job job = delta_queue[selected];
-            delta_queue.erase(delta_queue.begin() + selected);
+            const delta_compress_job job = delta_queue.front();
+            delta_queue.pop_front();
             result.delta_jobs_dequeued++;
             int index = find_node_by_id(nodes, job.node_id);
             if (index < 0) {
@@ -3604,7 +3503,7 @@ static void save_tree_summary(
 static void save_family_cache_events(const std::string & output_dir) {
     std::filesystem::create_directories(output_dir);
     std::ofstream output(output_dir + "/family_cache_events.csv");
-    output << "request_index,action,reason,node_id,variant_lora_id,group_name,context_id,"
+    output << "request_index,action,node_id,variant_lora_id,group_name,context_id,"
            << "segment_kind,depth_tokens,family_frequency,predicted_probability,"
            << "delta_children,age_requests,gpu_mb,host_mb,frequency_benefit,"
            << "prediction_benefit,prefix_benefit,fanout_benefit,recency_benefit,"
@@ -3613,7 +3512,6 @@ static void save_family_cache_events(const std::string & output_dir) {
     for (const auto & event : g_family_cache_events) {
         const auto & family = event.family;
         output << event.request_index << ',' << csv_escape(event.action) << ','
-               << csv_escape(event.reason) << ','
                << event.node_id << ',' << event.variant_lora_id << ','
                << csv_escape(event.group_name) << ',' << csv_escape(event.context_id) << ','
                << csv_escape(event.segment_kind) << ',' << event.depth_tokens << ','
@@ -3659,7 +3557,7 @@ static void save_system_parameters(
            << "lora_load_total_ms,lora_load_mean_ms,lora_load_max_ms,"
            << "n_ctx,n_batch,n_ubatch,max_cache_nodes,max_cache_variants,max_cache_tokens,"
            << "max_host_delta_bytes,max_host_full_bytes,system_chunk_tokens,context_chunk_tokens,background_policy,"
-           << "arrival_time_scale,background_min_gap_ms,background_safety_margin_ms,delta_validation_rate,"
+           << "background_min_gap_ms,background_safety_margin_ms,delta_validation_rate,"
            << "prefetch_min_probability,max_prefetch_chunks_per_lora,prefetch_cost_safety_factor,"
            << "family_frequency_decay,family_frequency_weight,family_prediction_weight,"
            << "family_prefix_weight,family_fanout_weight,family_recency_weight,"
@@ -3677,8 +3575,7 @@ static void save_system_parameters(
            << (unsigned long long) options.max_host_delta_mb * 1024ULL * 1024ULL << ','
            << (unsigned long long) options.max_host_full_mb * 1024ULL * 1024ULL << ','
            << options.system_chunk_tokens << ',' << options.context_chunk_tokens << ','
-           << csv_escape(options.background_policy) << ',' << options.arrival_time_scale << ','
-           << options.background_min_gap_ms << ','
+           << csv_escape(options.background_policy) << ',' << options.background_min_gap_ms << ','
            << options.background_safety_margin_ms << ',' << options.delta_validation_rate << ','
            << options.prefetch_min_probability << ','
            << options.max_prefetch_chunks_per_lora << ','
