@@ -118,6 +118,8 @@ poetry.toml
 /examples/lora-base-test/original_real_default
 /examples/lora-base-test/output_*
 
+/examples/lora-base-test2/output_*
+
 
 # Test binaries
 /tests/test-backend-ops
