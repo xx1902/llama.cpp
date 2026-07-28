@@ -54,6 +54,7 @@
 #include "ggml-cuda/wkv.cuh"
 #include "ggml-cuda/gla.cuh"
 #include "ggml-cuda/gated_delta_net.cuh"
+#include "ggml-cuda/kv-delta.cuh"
 #include "ggml-cuda/set.cuh"
 #include "ggml-cuda/set-rows.cuh"
 #include "ggml-cuda/pad_reflect_1d.cuh"
@@ -5222,6 +5223,15 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_cuda_kv_delta_submit") == 0) {
+        return (void *)ggml_backend_cuda_kv_delta_submit;
+    }
+    if (strcmp(name, "ggml_backend_cuda_kv_delta_finish") == 0) {
+        return (void *)ggml_backend_cuda_kv_delta_finish;
+    }
+    if (strcmp(name, "ggml_backend_cuda_kv_delta_cancel") == 0) {
+        return (void *)ggml_backend_cuda_kv_delta_cancel;
     }
     return nullptr;
 }

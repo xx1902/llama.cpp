@@ -76,6 +76,10 @@ struct experiment_options {
     // sync: probe and build delta before serving the request.
     // deferred: serve with full KV first, then build delta as background work.
     std::string cross_lora_policy = "off";
+    // cpu-sync: original host layer/token loop.
+    // cuda-sync: one fused CUDA launch, then wait immediately.
+    // cuda-overlap: submit fused CUDA work before suffix/decode and finish after it.
+    std::string delta_execution = "cuda-sync";
 
     bool system_v2 = false;
     int prefix_chunk_tokens = 128;
@@ -132,6 +136,7 @@ static void print_usage(const char * program) {
             "  --max-cache-variants N\n"
             "  --max-cache-tokens N\n"
             "  --cross-lora-policy off|sync|deferred\n"
+            "  --delta-execution cpu-sync|cuda-sync|cuda-overlap\n"
             "  --system-v2 0|1\n"
             "  --prefix-chunk-tokens N\n"
             "  --system-chunk-tokens N\n"
@@ -251,6 +256,16 @@ static bool parse_options(
                     options.cross_lora_policy != "sync" &&
                     options.cross_lora_policy != "deferred") {
                 fprintf(stderr, "invalid cross-LoRA policy: %s\n", value);
+                return false;
+            }
+        } else if (arg == "--delta-execution") {
+            value = require_value(i);
+            if (!value) return false;
+            options.delta_execution = value;
+            if (options.delta_execution != "cpu-sync" &&
+                    options.delta_execution != "cuda-sync" &&
+                    options.delta_execution != "cuda-overlap") {
+                fprintf(stderr, "invalid delta execution: %s\n", value);
                 return false;
             }
         } else if (arg == "--system-v2") {
@@ -650,6 +665,10 @@ struct online_result {
     double prefix_kv_l2 = 0.0;
     double delta_probe_ms = 0.0;
     double delta_build_ms = 0.0;
+    double delta_submit_ms = 0.0;
+    double delta_finish_wait_ms = 0.0;
+    double delta_overlap_window_ms = 0.0;
+    int delta_async_jobs = 0;
     double delta_background_ms = 0.0;
     int delta_build_ok = 0;
     double delta_saved_rate = 0.0;
@@ -1191,6 +1210,27 @@ static llama_context * create_context(
     return llama_init_from_model(model, params);
 }
 
+static bool build_delta_branch(
+        llama_context * context,
+        const experiment_options & options,
+        llama_seq_id anchor_seq,
+        llama_seq_id child_full_seq,
+        llama_seq_id child_delta_seq,
+        llama_pos p0,
+        llama_pos p1,
+        int32_t parent_node_id,
+        int32_t child_node_id,
+        llama_kv_delta_branch_stats * stats) {
+    if (options.delta_execution == "cpu-sync") {
+        return llama_kv_seq_delta_build_branch_cpu(
+                context, anchor_seq, child_full_seq, child_delta_seq,
+                p0, p1, parent_node_id, child_node_id, stats);
+    }
+    return llama_kv_seq_delta_build_branch(
+            context, anchor_seq, child_full_seq, child_delta_seq,
+            p0, p1, parent_node_id, child_node_id, stats);
+}
+
 static bool run_decode(
         llama_context * context,
         llama_seq_id sequence,
@@ -1222,6 +1262,7 @@ static bool run_decode(
 static void build_online_delta(
         llama_context * context,
         llama_memory_t memory,
+        const experiment_options & options,
         llama_seq_id anchor_seq,
         llama_seq_id child_seq,
         llama_seq_id scratch_seq,
@@ -1248,8 +1289,9 @@ static void build_online_delta(
     if (probe_ok && probe.can_reuse_as_delta) {
         llama_kv_delta_branch_stats branch = {};
         start = now_ms();
-        const bool build_ok = llama_kv_seq_delta_build_branch(
+        const bool build_ok = build_delta_branch(
                 context,
+                options,
                 anchor_seq,
                 child_seq,
                 scratch_seq,
@@ -1430,8 +1472,9 @@ static void run_delta_experiment(
 
             llama_kv_delta_branch_stats branch = {};
             start = now_ms();
-            const bool branch_ok = llama_kv_seq_delta_build_branch(
+            const bool branch_ok = build_delta_branch(
                     context,
+                    options,
                     anchor_seq,
                     child_seq,
                     delta_seq,
@@ -1896,6 +1939,7 @@ static std::vector<online_result> run_online_experiment(
                 build_online_delta(
                         context,
                         memory,
+                        options,
                         nodes[node_index].anchor_seq_id,
                         child_cache_seq,
                         request_seq,
@@ -1954,6 +1998,7 @@ static std::vector<online_result> run_online_experiment(
             build_online_delta(
                     context,
                     memory,
+                    options,
                     nodes[node_index].anchor_seq_id,
                     variant->cache_seq_id,
                     request_seq,
@@ -2043,6 +2088,10 @@ static unsigned long long count_host_full_bytes(const std::vector<prefix_node> &
 static void merge_delta_metrics(online_result & target, const online_result & source) {
     target.delta_probe_ms += source.delta_probe_ms;
     target.delta_build_ms += source.delta_build_ms;
+    target.delta_submit_ms += source.delta_submit_ms;
+    target.delta_finish_wait_ms += source.delta_finish_wait_ms;
+    target.delta_overlap_window_ms += source.delta_overlap_window_ms;
+    target.delta_async_jobs += source.delta_async_jobs;
     target.delta_validation_ms += source.delta_validation_ms;
     target.delta_store_loaded += source.delta_store_loaded;
     target.delta_store_saved += source.delta_store_saved;
@@ -2685,8 +2734,8 @@ static bool convert_variant_to_host_delta(
 
     llama_kv_delta_branch_stats branch = {};
     const double start = now_ms();
-    const bool build_ok = llama_kv_seq_delta_build_branch(
-            context, node.anchor_seq_id, variant.cache_seq_id, variant.cache_seq_id,
+    const bool build_ok = build_delta_branch(
+            context, options, node.anchor_seq_id, variant.cache_seq_id, variant.cache_seq_id,
             0, node.depth_tokens, node.parent_node_id, node.node_id, &branch);
     if (result) {
         result->delta_build_ms += now_ms() - start;
@@ -2719,8 +2768,13 @@ static bool submit_variant_delta_async(
     const bool submitted = llama_kv_seq_delta_build_branch_async(
             context, node.anchor_seq_id, variant.cache_seq_id, variant.cache_seq_id,
             0, node.depth_tokens, node.parent_node_id, node.node_id, &job_id);
-    if (result) result->delta_build_ms += now_ms() - start;
+    const double elapsed = now_ms() - start;
+    if (result) {
+        result->delta_build_ms += elapsed;
+        result->delta_submit_ms += elapsed;
+    }
     if (!submitted) return false;
+    if (result) result->delta_async_jobs++;
     pending.job_id = job_id;
     pending.node_id = node.node_id;
     pending.lora_id = variant.lora_id;
@@ -2755,8 +2809,10 @@ static bool finish_variant_delta_async(
     const bool build_ok = llama_kv_seq_delta_build_branch_finish(
             context, pending.job_id, pending.child_seq_id, &branch);
     pending.job_id = 0;
+    const double elapsed = now_ms() - start;
     if (result) {
-        result->delta_build_ms += now_ms() - start;
+        result->delta_build_ms += elapsed;
+        result->delta_finish_wait_ms += elapsed;
         result->delta_build_ok = build_ok ? 1 : 0;
         result->delta_saved_rate = branch.logical_saved_rate;
     }
@@ -3399,29 +3455,44 @@ static std::vector<online_result> run_online_system_v2(
         // request, otherwise old probabilities permanently bias eviction.
         expire_consumed_predictions(nodes, request.request_id);
 
-        pending_delta_async_build overlap_delta;
+        std::vector<pending_delta_async_build> overlap_deltas;
+        double overlap_start_ms = 0.0;
 
         if (options.cross_lora_policy == "sync") {
             for (int node_id : added) {
                 const int index = find_node_by_id(nodes, node_id);
                 if (index < 0) continue;
                 prefix_variant * variant = find_variant(nodes[index], request.lora_id);
-                if (variant != nullptr) {
+                if (variant != nullptr && options.delta_execution == "cuda-overlap") {
+                    pending_delta_async_build pending;
+                    if (submit_variant_delta_async(
+                                context, nodes[index], *variant, &result, pending)) {
+                        if (overlap_deltas.empty()) overlap_start_ms = now_ms();
+                        overlap_deltas.push_back(pending);
+                    } else {
+                        convert_variant_to_host_delta(
+                                context, memory, nodes[index], *variant, validation_seq,
+                                options, nodes, &result);
+                    }
+                } else if (variant != nullptr) {
                     convert_variant_to_host_delta(
                             context, memory, nodes[index], *variant, validation_seq,
                             options, nodes, &result);
                 }
             }
-        } else if (options.cross_lora_policy == "deferred") {
-            // Submit one useful delta before suffix/decode. The fused CUDA job
-            // runs on its own stream while foreground inference continues.
+        } else if (options.cross_lora_policy == "deferred" &&
+                options.delta_execution == "cuda-overlap") {
+            // Submit delta work before suffix/decode. Each fused CUDA job runs
+            // on a low-priority stream while foreground inference continues.
             for (int node_id : added) {
                 const int index = find_node_by_id(nodes, node_id);
                 if (index < 0) continue;
                 prefix_variant * variant = find_variant(nodes[index], request.lora_id);
+                pending_delta_async_build pending;
                 if (variant != nullptr && submit_variant_delta_async(
-                            context, nodes[index], *variant, &result, overlap_delta)) {
-                    break;
+                            context, nodes[index], *variant, &result, pending)) {
+                    if (overlap_deltas.empty()) overlap_start_ms = now_ms();
+                    overlap_deltas.push_back(pending);
                 }
             }
         }
@@ -3434,15 +3505,18 @@ static std::vector<online_result> run_online_system_v2(
                     (int) tokens.full.size(), options.n_predict, request_start, result);
         }
         llama_memory_seq_rm(memory, request_seq, -1, -1);
-        if (overlap_delta.job_id != 0) {
-            const double finish_start = now_ms();
+        for (auto & overlap_delta : overlap_deltas) {
             if (finish_variant_delta_async(
                         context, memory, nodes, validation_seq,
                         options, &result, overlap_delta)) {
                 result.delta_compressed_background++;
             }
-            result.delta_background_ms += now_ms() - finish_start;
         }
+        if (!overlap_deltas.empty()) {
+            result.delta_overlap_window_ms = now_ms() - overlap_start_ms;
+            result.delta_background_ms += result.delta_finish_wait_ms;
+        }
+        result.total_ms = now_ms() - request_start;
 
         const double next_arrival = request_index + 1 < limit
                 ? (double) requests[request_index + 1].arrival_ms
@@ -3776,7 +3850,8 @@ static void save_online_results(
            << "context_id,lora_id,lora_name,mode,node_id,exact_prefix_hit,"
            << "same_lora_variant_hit,cross_lora_prefix_match,prefix_tokens,suffix_tokens,"
            << "prompt_tokens,delta_candidate,prefix_kv_cos,prefix_kv_l2,delta_probe_ms,"
-           << "delta_build_ms,delta_background_ms,delta_build_ok,delta_saved_rate,lora_bind_ms,"
+           << "delta_build_ms,delta_submit_ms,delta_finish_wait_ms,delta_overlap_window_ms,"
+           << "delta_async_jobs,delta_background_ms,delta_build_ok,delta_saved_rate,lora_bind_ms,"
            << "prefix_ms,suffix_ms,ttft_ms,decode_ms,total_ms,tps,cache_nodes,"
            << "cache_variants,physical_cache_tokens,chunk_hit_tokens,materialize_ok,"
            << "materialize_ms,delta_validation_ms,reconstruction_cos,reconstruction_l2,predicted_lora_id,"
@@ -3809,6 +3884,8 @@ static void save_online_results(
                << row.prompt_tokens << ',' << row.delta_candidate << ','
                << row.prefix_kv_cos << ',' << row.prefix_kv_l2 << ','
                << row.delta_probe_ms << ',' << row.delta_build_ms << ','
+               << row.delta_submit_ms << ',' << row.delta_finish_wait_ms << ','
+               << row.delta_overlap_window_ms << ',' << row.delta_async_jobs << ','
                << row.delta_background_ms << ',' << row.delta_build_ok << ','
                << row.delta_saved_rate << ','
                << row.lora_bind_ms << ',' << row.prefix_ms << ',' << row.suffix_ms << ','
@@ -3981,7 +4058,8 @@ static void save_system_parameters(
     output << "model_bytes,lora_count,total_lora_bytes,mean_lora_bytes,min_lora_bytes,max_lora_bytes,"
            << "lora_load_total_ms,lora_load_mean_ms,lora_load_max_ms,"
            << "n_ctx,n_batch,n_ubatch,max_cache_nodes,max_cache_variants,max_cache_tokens,"
-           << "max_host_delta_bytes,max_host_full_bytes,system_chunk_tokens,context_chunk_tokens,background_policy,"
+           << "max_host_delta_bytes,max_host_full_bytes,system_chunk_tokens,context_chunk_tokens,"
+           << "cross_lora_policy,delta_execution,background_policy,"
            << "arrival_time_scale,background_min_gap_ms,background_safety_margin_ms,delta_validation_rate,"
            << "prefetch_policy,prediction_service_url,prediction_service_timeout_ms,prediction_service_reset,"
            << "prefetch_min_probability,max_prefetch_chunks_per_lora,prefetch_cost_safety_factor,"
@@ -4001,6 +4079,8 @@ static void save_system_parameters(
            << (unsigned long long) options.max_host_delta_mb * 1024ULL * 1024ULL << ','
            << (unsigned long long) options.max_host_full_mb * 1024ULL * 1024ULL << ','
            << options.system_chunk_tokens << ',' << options.context_chunk_tokens << ','
+           << csv_escape(options.cross_lora_policy) << ','
+           << csv_escape(options.delta_execution) << ','
            << csv_escape(options.background_policy) << ',' << options.arrival_time_scale << ','
            << options.background_min_gap_ms << ','
            << options.background_safety_margin_ms << ',' << options.delta_validation_rate << ','

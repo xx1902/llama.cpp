@@ -906,6 +906,42 @@ extern "C" {
             int32_t child_node_id,
             struct llama_kv_delta_branch_stats * stats);
 
+    // Ablation/debug entry point that always uses the original CPU
+    // layer/token loop and never dispatches the fused CUDA implementation.
+    LLAMA_API bool llama_kv_seq_delta_build_branch_cpu(
+            struct llama_context * ctx,
+            llama_seq_id seq_anchor,
+            llama_seq_id seq_child_full,
+            llama_seq_id seq_child_delta,
+            llama_pos p0,
+            llama_pos p1,
+            int32_t parent_node_id,
+            int32_t child_node_id,
+            struct llama_kv_delta_branch_stats * stats);
+
+    // Submit the fused CUDA Q8 delta build without waiting for it. The job can
+    // overlap with subsequent foreground inference on a separate CUDA stream.
+    // Returns false when the active KV backend cannot run the fused path; the
+    // caller may then use llama_kv_seq_delta_build_branch() as a fallback.
+    LLAMA_API bool llama_kv_seq_delta_build_branch_async(
+            struct llama_context * ctx,
+            llama_seq_id seq_anchor,
+            llama_seq_id seq_child_full,
+            llama_seq_id seq_child_delta,
+            llama_pos p0,
+            llama_pos p1,
+            int32_t parent_node_id,
+            int32_t child_node_id,
+            uint64_t * job_id);
+    LLAMA_API bool llama_kv_seq_delta_build_branch_finish(
+            struct llama_context * ctx,
+            uint64_t job_id,
+            llama_seq_id seq_child_delta,
+            struct llama_kv_delta_branch_stats * stats);
+    LLAMA_API bool llama_kv_seq_delta_build_branch_cancel(
+            struct llama_context * ctx,
+            uint64_t job_id);
+
     // Removes all tokens that belong to the specified sequence and have positions in [p0, p1)
     // Returns false if a partial sequence cannot be removed. Removing a whole sequence never fails
     // seq_id < 0 : match any sequence

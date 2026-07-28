@@ -40,6 +40,29 @@ GGML_BACKEND_API void ggml_backend_cuda_get_device_memory(int device, size_t * f
 GGML_BACKEND_API bool ggml_backend_cuda_register_host_buffer(void * buffer, size_t size);
 GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 
+// Optional CUDA backend procedure used by llama.cpp's KV-delta cache.  The
+// procedure is resolved through ggml_backend_reg_get_proc_address(), so the
+// core library keeps working when the CUDA backend is not loaded.
+struct ggml_backend_cuda_kv_delta_input {
+    const struct ggml_tensor * anchor;
+    const struct ggml_tensor * child;
+    const uint32_t * anchor_cells;
+    const uint32_t * child_cells;
+    int32_t n_tokens;
+    int32_t n_embd;
+    int32_t transposed;
+    int32_t anchor_stride;
+    int32_t child_stride;
+    int8_t * q8;
+    float * scales;
+};
+
+typedef void * (*ggml_backend_cuda_kv_delta_submit_t)(
+        const struct ggml_backend_cuda_kv_delta_input * inputs,
+        size_t n_inputs);
+typedef bool (*ggml_backend_cuda_kv_delta_finish_t)(void * job);
+typedef void (*ggml_backend_cuda_kv_delta_cancel_t)(void * job);
+
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
 
 #ifdef  __cplusplus

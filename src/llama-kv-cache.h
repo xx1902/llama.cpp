@@ -125,7 +125,7 @@ public:
                         bool   physical_paged = false,
                     uint32_t   physical_page_size = 16);
 
-    ~llama_kv_cache() = default;
+    ~llama_kv_cache();
 
     //
     // llama_memory_i
@@ -281,6 +281,26 @@ public:
         uint64_t full_kv_bytes_equivalent = 0;
     };
     std::vector<kv_delta_branch> delta_branches;
+    struct kv_delta_async_build {
+        kv_delta_branch branch;
+        void * backend_job = nullptr;
+        bool (*finish)(void *) = nullptr;
+        void (*cancel)(void *) = nullptr;
+    };
+    std::unordered_map<uint64_t, kv_delta_async_build> delta_async_builds;
+    uint64_t next_delta_async_id = 1;
+
+    bool seq_delta_build_branch_async(
+            llama_seq_id seq_anchor,
+            llama_seq_id seq_child_full,
+            llama_seq_id seq_child_delta,
+            llama_pos p0,
+            llama_pos p1,
+            int32_t parent_node_id,
+            int32_t child_node_id,
+            uint64_t & job_id);
+    bool seq_delta_build_branch_finish(uint64_t job_id);
+    bool seq_delta_build_branch_cancel(uint64_t job_id);
     bool seq_delta_build_branch(
             llama_seq_id seq_anchor,
             llama_seq_id seq_child_full,
@@ -289,6 +309,23 @@ public:
             llama_pos p1,
             int32_t parent_node_id,
             int32_t child_node_id);
+    bool seq_delta_build_branch_cpu(
+            llama_seq_id seq_anchor,
+            llama_seq_id seq_child_full,
+            llama_seq_id seq_child_delta,
+            llama_pos p0,
+            llama_pos p1,
+            int32_t parent_node_id,
+            int32_t child_node_id);
+    bool seq_delta_build_branch_impl(
+            llama_seq_id seq_anchor,
+            llama_seq_id seq_child_full,
+            llama_seq_id seq_child_delta,
+            llama_pos p0,
+            llama_pos p1,
+            int32_t parent_node_id,
+            int32_t child_node_id,
+            bool try_fused_cuda);
 
     bool seq_delta_has_branch(llama_seq_id seq_id) const;
     const kv_delta_branch * seq_delta_find_branch(llama_seq_id seq_id) const;

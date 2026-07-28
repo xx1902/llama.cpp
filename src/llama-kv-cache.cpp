@@ -5,6 +5,8 @@
 #include "llama-model.h"
 #include "llama-context.h"
 
+#include "ggml-cuda.h"
+
 #include <algorithm>
 #include <cassert>
 #include <cmath>
@@ -244,6 +246,15 @@ llama_kv_cache::llama_kv_cache(
 
     const char * LLAMA_KV_CACHE_DEBUG = getenv("LLAMA_KV_CACHE_DEBUG");
     debug = LLAMA_KV_CACHE_DEBUG ? atoi(LLAMA_KV_CACHE_DEBUG) : 0;
+}
+
+llama_kv_cache::~llama_kv_cache() {
+    for (auto & item : delta_async_builds) {
+        auto & build = item.second;
+        if (build.backend_job != nullptr && build.cancel != nullptr) {
+            build.cancel(build.backend_job);
+        }
+    }
 }
 
 // 新增分页
@@ -1751,6 +1762,179 @@ const llama_kv_cache::kv_delta_branch * llama_kv_cache::seq_delta_find_branch(
 
     return nullptr;
 }
+
+bool llama_kv_cache::seq_delta_build_branch_async(
+        llama_seq_id seq_anchor,
+        llama_seq_id seq_child_full,
+        llama_seq_id seq_child_delta,
+        llama_pos p0,
+        llama_pos p1,
+        int32_t parent_node_id,
+        int32_t child_node_id,
+        uint64_t & job_id) {
+    job_id = 0;
+    if (seq_anchor < 0 || seq_child_full < 0 || seq_child_delta < 0 || p1 <= p0 ||
+            (size_t) seq_anchor >= seq_to_stream.size() ||
+            (size_t) seq_child_full >= seq_to_stream.size() ||
+            (size_t) seq_child_delta >= seq_to_stream.size()) {
+        return false;
+    }
+    p0 = std::max<llama_pos>(0, p0);
+
+    const uint32_t stream_anchor = seq_to_stream[seq_anchor];
+    const uint32_t stream_child = seq_to_stream[seq_child_full];
+    const auto & cells_anchor = v_cells[stream_anchor];
+    const auto & cells_child = v_cells[stream_child];
+    const int32_t n_tokens = (int32_t) (p1 - p0);
+
+    auto find_cell = [](
+            const llama_kv_cells & cells,
+            llama_seq_id seq_id,
+            llama_pos pos,
+            uint32_t & cell_id) -> bool {
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (cells.seq_has(i, seq_id) && cells.pos_get(i) == pos) {
+                cell_id = i;
+                return true;
+            }
+        }
+        return false;
+    };
+
+    std::vector<uint32_t> anchor_cells(n_tokens);
+    std::vector<uint32_t> child_cells(n_tokens);
+    for (int32_t token = 0; token < n_tokens; ++token) {
+        const llama_pos pos = p0 + token;
+        if (!find_cell(cells_anchor, seq_anchor, pos, anchor_cells[token]) ||
+                !find_cell(cells_child, seq_child_full, pos, child_cells[token])) {
+            return false;
+        }
+    }
+
+    kv_delta_async_build build;
+    build.branch.anchor_seq_id = seq_anchor;
+    build.branch.child_seq_id = seq_child_delta;
+    build.branch.p0 = p0;
+    build.branch.p1 = p1;
+    build.branch.parent_node_id = parent_node_id;
+    build.branch.child_node_id = child_node_id;
+    build.branch.enabled = true;
+
+    std::vector<ggml_backend_cuda_kv_delta_input> inputs;
+    inputs.reserve(layers.size() * 2);
+    ggml_tensor * first_tensor = nullptr;
+
+    auto add_input = [&](ggml_tensor * anchor, ggml_tensor * child,
+                         uint32_t layer_id, bool is_k, uint32_t n_embd,
+                         bool transposed) {
+        if (anchor == nullptr || child == nullptr || anchor->buffer == nullptr ||
+                child->buffer == nullptr) {
+            return;
+        }
+        kv_delta_tensor delta;
+        delta.layer_id = (int32_t) layer_id;
+        delta.is_k = is_k;
+        delta.p0 = p0;
+        delta.p1 = p1;
+        delta.n_embd = (int32_t) n_embd;
+        delta.dtype = kv_delta_dtype::Q8;
+        delta.q8.resize((size_t) n_tokens * n_embd);
+        delta.scales.resize(n_tokens, 1.0f);
+        build.branch.layer_deltas.push_back(std::move(delta));
+
+        kv_delta_tensor & output = build.branch.layer_deltas.back();
+        inputs.push_back({
+                anchor,
+                child,
+                anchor_cells.data(),
+                child_cells.data(),
+                n_tokens,
+                (int32_t) n_embd,
+                transposed ? 1 : 0,
+                (int32_t) cells_anchor.size(),
+                (int32_t) cells_child.size(),
+                output.q8.data(),
+                output.scales.data()});
+        build.branch.delta_q8_bytes += output.q8.size() * sizeof(int8_t);
+        build.branch.delta_scale_bytes += output.scales.size() * sizeof(float);
+        build.branch.full_kv_bytes_equivalent +=
+                (uint64_t) n_tokens * n_embd * ggml_type_size(anchor->type);
+        if (first_tensor == nullptr) {
+            first_tensor = anchor;
+        }
+    };
+
+    for (const auto & layer : layers) {
+        const uint32_t il = layer.il;
+        add_input(
+                layer.k_stream[stream_anchor], layer.k_stream[stream_child],
+                il, true, hparams.n_embd_k_gqa(il), false);
+        add_input(
+                layer.v_stream[stream_anchor], layer.v_stream[stream_child],
+                il, false, hparams.n_embd_v_gqa(il), v_trans);
+    }
+    if (inputs.empty() || first_tensor == nullptr) {
+        return false;
+    }
+
+    ggml_backend_buffer_type_t buft = ggml_backend_buffer_get_type(first_tensor->buffer);
+    ggml_backend_dev_t device = ggml_backend_buft_get_device(buft);
+    if (device == nullptr) {
+        return false;
+    }
+    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
+    auto submit = (ggml_backend_cuda_kv_delta_submit_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_kv_delta_submit");
+    build.finish = (ggml_backend_cuda_kv_delta_finish_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_kv_delta_finish");
+    build.cancel = (ggml_backend_cuda_kv_delta_cancel_t)
+            ggml_backend_reg_get_proc_address(reg, "ggml_backend_cuda_kv_delta_cancel");
+    if (submit == nullptr || build.finish == nullptr || build.cancel == nullptr) {
+        return false;
+    }
+
+    build.backend_job = submit(inputs.data(), inputs.size());
+    if (build.backend_job == nullptr) {
+        return false;
+    }
+
+    job_id = next_delta_async_id++;
+    if (job_id == 0) {
+        job_id = next_delta_async_id++;
+    }
+    delta_async_builds.emplace(job_id, std::move(build));
+    return true;
+}
+
+bool llama_kv_cache::seq_delta_build_branch_finish(uint64_t job_id) {
+    auto it = delta_async_builds.find(job_id);
+    if (it == delta_async_builds.end()) {
+        return false;
+    }
+    kv_delta_async_build build = std::move(it->second);
+    delta_async_builds.erase(it);
+    const bool ok = build.backend_job != nullptr && build.finish != nullptr &&
+            build.finish(build.backend_job);
+    if (!ok) {
+        return false;
+    }
+    delta_branches.push_back(std::move(build.branch));
+    return true;
+}
+
+bool llama_kv_cache::seq_delta_build_branch_cancel(uint64_t job_id) {
+    auto it = delta_async_builds.find(job_id);
+    if (it == delta_async_builds.end()) {
+        return false;
+    }
+    kv_delta_async_build build = std::move(it->second);
+    delta_async_builds.erase(it);
+    if (build.backend_job != nullptr && build.cancel != nullptr) {
+        build.cancel(build.backend_job);
+    }
+    return true;
+}
+
 bool llama_kv_cache::seq_delta_build_branch(
         llama_seq_id seq_anchor,
         llama_seq_id seq_child_full,
@@ -1759,6 +1943,41 @@ bool llama_kv_cache::seq_delta_build_branch(
         llama_pos p1,
         int32_t parent_node_id,
         int32_t child_node_id) {
+    return seq_delta_build_branch_impl(
+            seq_anchor, seq_child_full, seq_child_delta, p0, p1,
+            parent_node_id, child_node_id, true);
+}
+
+bool llama_kv_cache::seq_delta_build_branch_cpu(
+        llama_seq_id seq_anchor,
+        llama_seq_id seq_child_full,
+        llama_seq_id seq_child_delta,
+        llama_pos p0,
+        llama_pos p1,
+        int32_t parent_node_id,
+        int32_t child_node_id) {
+    return seq_delta_build_branch_impl(
+            seq_anchor, seq_child_full, seq_child_delta, p0, p1,
+            parent_node_id, child_node_id, false);
+}
+
+bool llama_kv_cache::seq_delta_build_branch_impl(
+        llama_seq_id seq_anchor,
+        llama_seq_id seq_child_full,
+        llama_seq_id seq_child_delta,
+        llama_pos p0,
+        llama_pos p1,
+        int32_t parent_node_id,
+        int32_t child_node_id,
+        bool try_fused_cuda) {
+    uint64_t async_job_id = 0;
+    if (try_fused_cuda && seq_delta_build_branch_async(
+                seq_anchor, seq_child_full, seq_child_delta, p0, p1,
+                parent_node_id, child_node_id, async_job_id)) {
+        if (seq_delta_build_branch_finish(async_job_id)) {
+            return true;
+        }
+    }
     if (seq_anchor < 0 || seq_child_full < 0 || seq_child_delta < 0) {
         return false;
     }
