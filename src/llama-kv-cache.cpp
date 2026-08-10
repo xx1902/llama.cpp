@@ -10,11 +10,13 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <limits>
 #include <map>
 #include <stdexcept>
+#include <cstdlib>
 
 //
 // llama_kv_cache
@@ -1749,6 +1751,115 @@ static int8_t kv_delta_quant_q8(float x, float scale) {
 static float kv_delta_dequant_q8(int8_t x, float scale) {
     return (float) x * scale;
 }
+
+// Debug-only dump for comparing the raw anchor/child KV values before Q8
+// encoding. It is intentionally sampled because tensor_get can synchronize a
+// GPU buffer and printing every element would dominate the experiment.
+static bool kv_delta_debug_take_dump_slot() {
+    const char * enabled = std::getenv("LLAMA_KV_DELTA_DEBUG");
+    if (enabled == nullptr || std::atoi(enabled) == 0) {
+        return false;
+    }
+
+    const char * limit_text = std::getenv("LLAMA_KV_DELTA_DEBUG_LIMIT");
+    const int limit = limit_text == nullptr ? 1 : std::atoi(limit_text);
+    if (limit <= 0) {
+        return false;
+    }
+
+    static int dump_count = 0;
+    if (dump_count >= limit) {
+        return false;
+    }
+    ++dump_count;
+    return true;
+}
+
+static void kv_delta_debug_dump_tensor(
+        const char * kind,
+        uint32_t layer_id,
+        const ggml_tensor * anchor,
+        const ggml_tensor * child,
+        const llama_kv_cells & cells_anchor,
+        const llama_kv_cells & cells_child,
+        const std::vector<uint32_t> & anchor_cells,
+        const std::vector<uint32_t> & child_cells,
+        uint32_t n_embd,
+        bool transposed,
+        llama_pos p0,
+        llama_pos p1) {
+    if (anchor == nullptr || child == nullptr || n_embd == 0 || p1 <= p0) {
+        return;
+    }
+
+    const uint32_t rows = std::min<uint32_t>(2, (uint32_t) (p1 - p0));
+    const uint32_t cols = std::min<uint32_t>(8, n_embd);
+    const size_t element_size = ggml_type_size(anchor->type);
+    const size_t row_size = ggml_row_size(anchor->type, n_embd);
+
+    fprintf(stderr,
+            "[KV_DELTA_DEBUG] layer=%u kind=%s rows=%u cols=%u transposed=%d type=%d\n",
+            layer_id, kind, rows, cols, transposed ? 1 : 0, (int) anchor->type);
+
+    for (uint32_t row = 0; row < rows; ++row) {
+        const uint32_t cell_a = anchor_cells[row];
+        const uint32_t cell_b = child_cells[row];
+        std::vector<uint8_t> raw_a(transposed ? element_size : row_size);
+        std::vector<uint8_t> raw_b(transposed ? element_size : row_size);
+        if (!transposed) {
+            ggml_backend_tensor_get(anchor, raw_a.data(), cell_a * row_size, row_size);
+            ggml_backend_tensor_get(child, raw_b.data(), cell_b * row_size, row_size);
+        }
+
+        std::vector<float> values_a(cols);
+        std::vector<float> values_b(cols);
+        std::vector<float> values_delta(cols);
+        float max_abs = 0.0f;
+        for (uint32_t col = 0; col < n_embd; ++col) {
+            if (transposed) {
+                ggml_backend_tensor_get(
+                        anchor, raw_a.data(),
+                        (cell_a + col * cells_anchor.size()) * element_size,
+                        element_size);
+                ggml_backend_tensor_get(
+                        child, raw_b.data(),
+                        (cell_b + col * cells_child.size()) * element_size,
+                        element_size);
+            }
+            const float value_a = kv_probe_read_scalar(
+                    raw_a, anchor->type, transposed ? 0 : col);
+            const float value_b = kv_probe_read_scalar(
+                    raw_b, child->type, transposed ? 0 : col);
+            const float value_delta = value_b - value_a;
+            max_abs = std::max(max_abs, std::fabs(value_delta));
+            if (col < cols) {
+                values_a[col] = value_a;
+                values_b[col] = value_b;
+                values_delta[col] = value_delta;
+            }
+        }
+
+        const float scale = max_abs > 0.0f ? max_abs / 127.0f : 1.0f;
+        fprintf(stderr, "  token=%lld anchor=[", (long long) (p0 + row));
+        for (uint32_t col = 0; col < cols; ++col) {
+            fprintf(stderr, "%s%.7g", col == 0 ? "" : ", ", values_a[col]);
+        }
+        fprintf(stderr, "] child=[");
+        for (uint32_t col = 0; col < cols; ++col) {
+            fprintf(stderr, "%s%.7g", col == 0 ? "" : ", ", values_b[col]);
+        }
+        fprintf(stderr, "] delta=[");
+        for (uint32_t col = 0; col < cols; ++col) {
+            fprintf(stderr, "%s%.7g", col == 0 ? "" : ", ", values_delta[col]);
+        }
+        fprintf(stderr, "] full_max_abs=%.7g scale=%.7g q8=[", max_abs, scale);
+        for (uint32_t col = 0; col < cols; ++col) {
+            fprintf(stderr, "%s%d", col == 0 ? "" : ", ",
+                    (int) kv_delta_quant_q8(values_delta[col], scale));
+        }
+        fprintf(stderr, "]\n");
+    }
+}
 bool llama_kv_cache::seq_delta_has_branch(llama_seq_id seq_id) const {
     return seq_delta_find_branch(seq_id) != nullptr;
 }
@@ -1819,6 +1930,27 @@ bool llama_kv_cache::seq_delta_build_branch_async(
     build.branch.parent_node_id = parent_node_id;
     build.branch.child_node_id = child_node_id;
     build.branch.enabled = true;
+
+    const bool dump_debug = kv_delta_debug_take_dump_slot();
+    if (dump_debug) {
+        std::vector<size_t> debug_layers = { 0, layers.size() / 2, layers.size() - 1 };
+        std::sort(debug_layers.begin(), debug_layers.end());
+        debug_layers.erase(
+                std::unique(debug_layers.begin(), debug_layers.end()), debug_layers.end());
+        for (const size_t layer_index : debug_layers) {
+            const auto & layer = layers[layer_index];
+            kv_delta_debug_dump_tensor(
+                    "K", layer.il,
+                    layer.k_stream[stream_anchor], layer.k_stream[stream_child],
+                    cells_anchor, cells_child, anchor_cells, child_cells,
+                    hparams.n_embd_k_gqa(layer.il), false, p0, p1);
+            kv_delta_debug_dump_tensor(
+                    "V", layer.il,
+                    layer.v_stream[stream_anchor], layer.v_stream[stream_child],
+                    cells_anchor, cells_child, anchor_cells, child_cells,
+                    hparams.n_embd_v_gqa(layer.il), v_trans, p0, p1);
+        }
+    }
 
     std::vector<ggml_backend_cuda_kv_delta_input> inputs;
     inputs.reserve(layers.size() * 2);
