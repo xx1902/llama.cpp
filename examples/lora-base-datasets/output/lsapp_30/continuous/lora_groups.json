@@ -1,0 +1,112 @@
+{
+  "lsapp_trace_u217_s23212": [
+    {
+      "lora_id": 6,
+      "logical_name": "yeok__qwen-2.5-1.5B-instruct-sft-lora-countdown-search-react-1k",
+      "actual_adapter_path": "D:\\ecnu_experiment\\gguf-qwen2.5_1.5B\\countdown-search-react.gguf",
+      "task": "Reason step by step and give the final answer. Adapter: qwen-2.5-1.5B-instruct-sft-lora-countdown-search-react-1k.",
+      "is_anchor": false,
+      "app_name": "Google Chrome",
+      "app_family": "information",
+      "adapter_family": "reasoning",
+      "repo_id": "yeok/qwen-2.5-1.5B-instruct-sft-lora-countdown-search-react-1k",
+      "source_group_name": "group_00_code"
+    },
+    {
+      "lora_id": 18,
+      "logical_name": "yeok__qwen-2.5-1.5B-instruct-sft-lora-countdown-deepseek-1kx2",
+      "actual_adapter_path": "D:\\ecnu_experiment\\gguf-qwen2.5_1.5B\\lora-018-yeok__qwen-2.5-1.5B-instruct-sft-lora-countdown-deepseek-1kx2-f16.gguf",
+      "task": "Reason step by step and give the final answer. Adapter: qwen-2.5-1.5B-instruct-sft-lora-countdown-deepseek-1kx2.",
+      "is_anchor": false,
+      "app_name": "Google Play Store",
+      "app_family": "information",
+      "adapter_family": "reasoning",
+      "repo_id": "yeok/qwen-2.5-1.5B-instruct-sft-lora-countdown-deepseek-1kx2",
+      "source_group_name": "group_06_reasoning"
+    },
+    {
+      "lora_id": 21,
+      "logical_name": "yeok__qwen-2.5-1.5B-instruct-sft-lora-countdown-deepseek-correct-5k",
+      "actual_adapter_path": "D:\\ecnu_experiment\\gguf-qwen2.5_1.5B\\lora-021-yeok__qwen-2.5-1.5B-instruct-sft-lora-countdown-deepseek-correct-5k-f16.gguf",
+      "task": "Reason step by step and give the final answer. Adapter: qwen-2.5-1.5B-instruct-sft-lora-countdown-deepseek-correct-5k.",
+      "is_anchor": false,
+      "app_name": "Google Photos",
+      "app_family": "information",
+      "adapter_family": "reasoning",
+      "repo_id": "yeok/qwen-2.5-1.5B-instruct-sft-lora-countdown-deepseek-correct-5k",
+      "source_group_name": "group_06_reasoning"
+    },
+    {
+      "lora_id": 24,
+      "logical_name": "ivnle__qwen2.5-1.5b-instruct_codex-whole-v3_lora_r32-a128_sft",
+      "actual_adapter_path": "D:\\ecnu_experiment\\gguf-qwen2.5_1.5B\\lora-024-ivnle__qwen2.5-1.5b-instruct_codex-whole-v3_lora_r32-a128_sft-f16.gguf",
+      "task": "Analyze the content and provide a concise technical solution. Adapter: qwen2.5-1.5b-instruct_codex-whole-v3_lora_r32-a128_sft.",
+      "is_anchor": false,
+      "app_name": "Gmail",
+      "app_family": "productivity",
+      "adapter_family": "code",
+      "repo_id": "ivnle/qwen2.5-1.5b-instruct_codex-whole-v3_lora_r32-a128_sft",
+      "source_group_name": "group_03_mobile_context"
+    },
+    {
+      "lora_id": 31,
+      "logical_name": "lethxlity__Qwen2.5-1.5B-Instruct-RU-Jokes-Lora",
+      "actual_adapter_path": "D:\\ecnu_experiment\\gguf-qwen2.5_1.5B\\lora-031-lethxlity__Qwen2.5-1.5B-Instruct-RU-Jokes-Lora-f16.gguf",
+      "task": "Correct and rewrite the user content clearly. Adapter: Qwen2.5-1.5B-Instruct-RU-Jokes-Lora.",
+      "is_anchor": false,
+      "app_name": "Contacts",
+      "app_family": "communication",
+      "adapter_family": "writing",
+      "repo_id": "lethxlity/Qwen2.5-1.5B-Instruct-RU-Jokes-Lora",
+      "source_group_name": "group_03_mobile_context"
+    },
+    {
+      "lora_id": 54,
+      "logical_name": "xw17__Qwen2.5-1.5B-Instruct_finetuned_3_optimal_lora",
+      "actual_adapter_path": "D:\\ecnu_experiment\\gguf-qwen2.5_1.5B\\lora-054-xw17__Qwen2.5-1.5B-Instruct_finetuned_3_optimal_lora-f16.gguf",
+      "task": "Infer the user's current activity or context and provide assistance. Adapter: Qwen2.5-1.5B-Instruct_finetuned_3_optimal_lora.",
+      "is_anchor": false,
+      "app_name": "Facebook Messenger",
+      "app_family": "communication",
+      "adapter_family": "mobile_context",
+      "repo_id": "xw17/Qwen2.5-1.5B-Instruct_finetuned_3_optimal_lora",
+      "source_group_name": "group_03_mobile_context"
+    },
+    {
+      "lora_id": 60,
+      "logical_name": "xw17__Qwen2.5-1.5B-Instruct_finetuned_1_def_lora2",
+      "actual_adapter_path": "D:\\ecnu_experiment\\gguf-qwen2.5_1.5B\\lora-060-xw17__Qwen2.5-1.5B-Instruct_finetuned_1_def_lora2-f16.gguf",
+      "task": "Infer the user's current activity or context and provide assistance. Adapter: Qwen2.5-1.5B-Instruct_finetuned_1_def_lora2.",
+      "is_anchor": true,
+      "app_name": "Facebook",
+      "app_family": "general",
+      "adapter_family": "mobile_context",
+      "repo_id": "xw17/Qwen2.5-1.5B-Instruct_finetuned_1_def_lora2",
+      "source_group_name": "group_03_mobile_context"
+    },
+    {
+      "lora_id": 66,
+      "logical_name": "xw17__Qwen2.5-1.5B-Instruct_finetuned_3_def_lora3",
+      "actual_adapter_path": "D:\\ecnu_experiment\\gguf-qwen2.5_1.5B\\lora-066-xw17__Qwen2.5-1.5B-Instruct_finetuned_3_def_lora3-f16.gguf",
+      "task": "Infer the user's current activity or context and provide assistance. Adapter: Qwen2.5-1.5B-Instruct_finetuned_3_def_lora3.",
+      "is_anchor": false,
+      "app_name": "Hangouts",
+      "app_family": "communication",
+      "adapter_family": "mobile_context",
+      "repo_id": "xw17/Qwen2.5-1.5B-Instruct_finetuned_3_def_lora3",
+      "source_group_name": "group_04_mobile_context"
+    },
+    {
+      "lora_id": 74,
+      "logical_name": "xw17__Qwen2.5-1.5B-Instruct_finetuned_3_optimized_lora",
+      "actual_adapter_path": "D:\\ecnu_experiment\\gguf-qwen2.5_1.5B\\lora-074-xw17__Qwen2.5-1.5B-Instruct_finetuned_3_optimized_lora-f16.gguf",
+      "task": "Infer the user's current activity or context and provide assistance. Adapter: Qwen2.5-1.5B-Instruct_finetuned_3_optimized_lora.",
+      "is_anchor": false,
+      "app_name": "Settings",
+      "app_family": "system",
+      "adapter_family": "mobile_context",
+      "repo_id": "xw17/Qwen2.5-1.5B-Instruct_finetuned_3_optimized_lora",
+      "source_group_name": "group_07_mobile_context"
+    }
+  ]
+}

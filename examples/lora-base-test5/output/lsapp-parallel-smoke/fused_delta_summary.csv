@@ -1,0 +1,2 @@
+mode,count,ok_count,mean_delta_ms,mean_ttft_ms,mean_total_ms,mean_saved_rate,mean_reconstruction_cos,mean_reconstruction_l2
+inference-only,1,1,0,44.417,44.417,0,0,0

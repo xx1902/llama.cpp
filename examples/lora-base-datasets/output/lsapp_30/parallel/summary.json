@@ -1,0 +1,10 @@
+{
+  "construction": "parallel_two_loras_same_prefix",
+  "requests": 30,
+  "pairs": 15,
+  "contexts": 15,
+  "context_reuses": 15,
+  "request_level_context_reuse_rate": 0.5,
+  "different_lora_pairs": 15,
+  "direct_lora_base_test5_compatible": true
+}

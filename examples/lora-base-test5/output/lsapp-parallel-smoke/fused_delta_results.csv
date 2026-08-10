@@ -1,0 +1,2 @@
+mode,repeat,pair_name,group_name,anchor_lora_id,child_lora_id,prefix_tokens,suffix_tokens,anchor_eval_ms,child_eval_ms,probe_ms,delta_submit_ms,delta_build_ms,delta_finish_wait_ms,foreground_ms,ttft_ms,total_ms,overlap_window_ms,saved_rate,reconstruction_cos,reconstruction_l2,full_kv_bytes,delta_bytes,delta_build_ok,reconstruction_ok,status
+inference-only,0,lsapp_u217_s23212_parallel_00_lora_31_vs_60,lsapp_trace_u217_s23212,31,60,103,16,109.206,53.245,0,0,0,0,44.417,44.417,44.417,0,0,0,0,0,0,0,0,ok

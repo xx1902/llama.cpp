@@ -1,0 +1,10 @@
+{
+  "construction": "continuous_dialogue_growing_prefix",
+  "requests": 30,
+  "contexts": 1,
+  "lora_transitions": 29,
+  "same_lora_transitions": 9,
+  "same_lora_transition_rate": 0.3103448275862069,
+  "direct_lora_base_test5_compatible": false,
+  "compatibility_note": "The common prefix grows after every turn, while lora-base-test5 currently requires an anchor and child with identical common_prefix_text."
+}
