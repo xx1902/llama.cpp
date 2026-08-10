@@ -1,0 +1,4 @@
+mode,repeat,pair_name,group_name,anchor_lora_id,child_lora_id,prefix_tokens,suffix_tokens,anchor_eval_ms,child_eval_ms,probe_ms,delta_submit_ms,delta_build_ms,delta_finish_wait_ms,foreground_ms,ttft_ms,total_ms,overlap_window_ms,saved_rate,reconstruction_cos,reconstruction_l2,full_kv_bytes,delta_bytes,delta_build_ok,reconstruction_ok,status
+cpu-sync,0,group_00_code_context_0000_lora_6_vs_1,group_00_code,6,1,508,4,485.873,346.017,552.979,0,612.51,0,37.633,650.143,650.143,0,0.4921875,0.9999984934,0.001701297278,14565376,7396480,1,1,ok
+cuda-sync,0,group_00_code_context_0000_lora_6_vs_1,group_00_code,6,1,508,4,400.795,341.121,555.488,0,6.058,0,20.934,26.992,26.992,0,0.4921875,0.9999984934,0.001701297635,14565376,7396480,1,1,ok
+cuda-overlap,0,group_00_code_context_0000_lora_6_vs_1,group_00_code,6,1,508,4,401.206,332.501,528.345,3.576,0,7.496,20.587,24.164,31.66,20.587,0.4921875,0.9999984934,0.001701297635,14565376,7396480,1,1,ok

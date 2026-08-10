@@ -1,0 +1,2 @@
+mode,count,ok_count,mean_delta_ms,mean_ttft_ms,mean_total_ms,mean_saved_rate,mean_reconstruction_cos,mean_reconstruction_l2
+cuda-overlap,1,1,8.251,47.531,50.019,0.4921875,0.9999984934,0.001701297635

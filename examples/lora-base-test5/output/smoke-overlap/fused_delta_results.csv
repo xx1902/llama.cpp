@@ -1,0 +1,2 @@
+mode,repeat,pair_name,group_name,anchor_lora_id,child_lora_id,prefix_tokens,suffix_tokens,anchor_eval_ms,child_eval_ms,probe_ms,delta_submit_ms,delta_build_ms,delta_finish_wait_ms,foreground_ms,ttft_ms,total_ms,overlap_window_ms,saved_rate,reconstruction_cos,reconstruction_l2,full_kv_bytes,delta_bytes,delta_build_ok,reconstruction_ok,status
+cuda-overlap,0,group_00_code_context_0000_lora_6_vs_1,group_00_code,6,1,508,4,487.433,358.46,557.036,5.763,0,2.488,41.768,47.531,50.019,41.768,0.4921875,0.9999984934,0.001701297635,14565376,7396480,1,1,ok

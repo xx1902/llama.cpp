@@ -1,0 +1,4 @@
+mode,count,ok_count,mean_delta_ms,mean_ttft_ms,mean_total_ms,mean_saved_rate,mean_reconstruction_cos,mean_reconstruction_l2
+cpu-sync,1,1,612.51,650.143,650.143,0.4921875,0.9999984934,0.001701297278
+cuda-overlap,1,1,11.072,24.164,31.66,0.4921875,0.9999984934,0.001701297635
+cuda-sync,1,1,6.058,26.992,26.992,0.4921875,0.9999984934,0.001701297635
