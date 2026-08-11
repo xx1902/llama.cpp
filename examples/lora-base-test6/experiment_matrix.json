@@ -1,0 +1,212 @@
+{
+  "schema_version": 1,
+  "description": "Real-dataset prefix splitting and three-level KV storage ablation",
+  "datasets": [
+    "msc_continuous",
+    "taskmaster_continuous",
+    "lmsys_continuous",
+    "opus100_parallel",
+    "xsum_parallel"
+  ],
+  "common_options": {
+    "n-predict": 1,
+    "n-ctx": 65536,
+    "max-online-requests": 30,
+    "max-cache-nodes": 64,
+    "max-cache-variants": 64,
+    "max-cache-tokens": 61440,
+    "delta-execution": "cuda-overlap",
+    "arrival-time-scale": 1.0,
+    "background-min-gap-ms": 0,
+    "background-safety-margin-ms": 0,
+    "delta-validation-rate": 0.1,
+    "prediction-top-k": 1,
+    "max-prefetch-chunks-per-lora": 2
+  },
+  "strategies": [
+    {
+      "id": "legacy_exact",
+      "label": "Legacy exact prefix",
+      "category": "baseline",
+      "measure_delta_pairs": true,
+      "options": {
+        "system-v2": 0,
+        "prefix-chunk-tokens": 128,
+        "system-chunk-tokens": 128,
+        "context-chunk-tokens": 128,
+        "cross-lora-policy": "off",
+        "max-host-delta-mb": 0,
+        "max-host-full-mb": 0,
+        "prefetch-policy": "none",
+        "delta-store-policy": "none",
+        "background-policy": "none"
+      }
+    },
+    {
+      "id": "gpu_only_128",
+      "label": "GPU only / 128",
+      "category": "storage",
+      "options": {
+        "system-v2": 1,
+        "prefix-chunk-tokens": 128,
+        "system-chunk-tokens": 128,
+        "context-chunk-tokens": 128,
+        "cross-lora-policy": "off",
+        "max-host-delta-mb": 0,
+        "max-host-full-mb": 0,
+        "prefetch-policy": "none",
+        "delta-store-policy": "none",
+        "background-policy": "none"
+      }
+    },
+    {
+      "id": "gpu_host_full_128",
+      "label": "GPU + host full / 128",
+      "category": "storage",
+      "options": {
+        "system-v2": 1,
+        "prefix-chunk-tokens": 128,
+        "system-chunk-tokens": 128,
+        "context-chunk-tokens": 128,
+        "cross-lora-policy": "off",
+        "max-host-delta-mb": 0,
+        "max-host-full-mb": 512,
+        "prefetch-policy": "none",
+        "delta-store-policy": "none",
+        "background-policy": "none"
+      }
+    },
+    {
+      "id": "tiered_no_prefetch_128",
+      "label": "Tiered, no prefetch / 128",
+      "category": "storage",
+      "options": {
+        "system-v2": 1,
+        "prefix-chunk-tokens": 128,
+        "system-chunk-tokens": 128,
+        "context-chunk-tokens": 128,
+        "cross-lora-policy": "deferred",
+        "max-host-delta-mb": 256,
+        "max-host-full-mb": 512,
+        "prefetch-policy": "none",
+        "delta-store-policy": "none",
+        "background-policy": "unlimited"
+      }
+    },
+    {
+      "id": "tiered_oracle_32",
+      "label": "Tiered oracle / 32",
+      "category": "chunk",
+      "chunk_tokens": 32,
+      "options": {
+        "system-v2": 1,
+        "prefix-chunk-tokens": 32,
+        "system-chunk-tokens": 32,
+        "context-chunk-tokens": 32,
+        "cross-lora-policy": "deferred",
+        "max-host-delta-mb": 256,
+        "max-host-full-mb": 512,
+        "prefetch-policy": "oracle",
+        "prefetch-storage": "auto",
+        "delta-store-policy": "none",
+        "background-policy": "unlimited"
+      }
+    },
+    {
+      "id": "tiered_oracle_64",
+      "label": "Tiered oracle / 64",
+      "category": "chunk",
+      "chunk_tokens": 64,
+      "options": {
+        "system-v2": 1,
+        "prefix-chunk-tokens": 64,
+        "system-chunk-tokens": 64,
+        "context-chunk-tokens": 64,
+        "cross-lora-policy": "deferred",
+        "max-host-delta-mb": 256,
+        "max-host-full-mb": 512,
+        "prefetch-policy": "oracle",
+        "prefetch-storage": "auto",
+        "delta-store-policy": "none",
+        "background-policy": "unlimited"
+      }
+    },
+    {
+      "id": "tiered_oracle_128",
+      "label": "Tiered oracle / 128",
+      "category": "chunk",
+      "chunk_tokens": 128,
+      "options": {
+        "system-v2": 1,
+        "prefix-chunk-tokens": 128,
+        "system-chunk-tokens": 128,
+        "context-chunk-tokens": 128,
+        "cross-lora-policy": "deferred",
+        "max-host-delta-mb": 256,
+        "max-host-full-mb": 512,
+        "prefetch-policy": "oracle",
+        "prefetch-storage": "auto",
+        "delta-store-policy": "none",
+        "background-policy": "unlimited"
+      }
+    },
+    {
+      "id": "tiered_oracle_256",
+      "label": "Tiered oracle / 256",
+      "category": "chunk",
+      "chunk_tokens": 256,
+      "options": {
+        "system-v2": 1,
+        "prefix-chunk-tokens": 256,
+        "system-chunk-tokens": 256,
+        "context-chunk-tokens": 256,
+        "cross-lora-policy": "deferred",
+        "max-host-delta-mb": 256,
+        "max-host-full-mb": 512,
+        "prefetch-policy": "oracle",
+        "prefetch-storage": "auto",
+        "delta-store-policy": "none",
+        "background-policy": "unlimited"
+      }
+    },
+    {
+      "id": "tiered_disk_build_128",
+      "label": "Tiered disk cold-build / 128",
+      "category": "disk",
+      "delta_store_key": "tiered_disk_128_ctx64k",
+      "options": {
+        "system-v2": 1,
+        "prefix-chunk-tokens": 128,
+        "system-chunk-tokens": 128,
+        "context-chunk-tokens": 128,
+        "cross-lora-policy": "deferred",
+        "max-host-delta-mb": 256,
+        "max-host-full-mb": 512,
+        "prefetch-policy": "oracle",
+        "prefetch-storage": "auto",
+        "delta-store-policy": "build",
+        "background-policy": "unlimited"
+      }
+    },
+    {
+      "id": "tiered_disk_warm_128",
+      "label": "Tiered disk warm-load / 128",
+      "category": "disk",
+      "delta_store_key": "tiered_disk_128_ctx64k",
+      "requires_strategy": "tiered_disk_build_128",
+      "options": {
+        "system-v2": 1,
+        "prefix-chunk-tokens": 128,
+        "system-chunk-tokens": 128,
+        "context-chunk-tokens": 128,
+        "cross-lora-policy": "deferred",
+        "max-host-delta-mb": 256,
+        "max-host-full-mb": 512,
+        "prefetch-policy": "oracle",
+        "prefetch-storage": "auto",
+        "delta-store-policy": "load",
+        "background-policy": "unlimited"
+      }
+    }
+  ]
+}

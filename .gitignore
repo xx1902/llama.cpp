@@ -112,6 +112,11 @@ poetry.toml
 /examples/simple-lora-predict/output
 /examples/simple-lora-sys/output
 /examples/simple-lora-kv/output
+/examples/lora-base-datasets/datasets/
+/examples/lora-base-datasets/output/
+/examples/lora-base-test6/output/
+/examples/lora-base-test5/output/
+/examples/lora-base-test4/output/
 
 /examples/lora-base/output
 /examples/lora-base-test/output
