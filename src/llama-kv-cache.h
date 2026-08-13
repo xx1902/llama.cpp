@@ -298,7 +298,8 @@ public:
             llama_pos p1,
             int32_t parent_node_id,
             int32_t child_node_id,
-            uint64_t & job_id);
+            uint64_t & job_id,
+            int32_t layer_id = -1);
     bool seq_delta_build_branch_finish(uint64_t job_id);
     bool seq_delta_build_branch_cancel(uint64_t job_id);
     bool seq_delta_build_branch(

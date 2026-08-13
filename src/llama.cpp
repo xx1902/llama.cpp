@@ -1545,6 +1545,33 @@ bool llama_kv_seq_delta_build_branch_async(
             parent_node_id, child_node_id, *job_id);
 }
 
+bool llama_kv_seq_delta_build_layer_async(
+        llama_context * ctx,
+        llama_seq_id seq_anchor,
+        llama_seq_id seq_child_full,
+        llama_seq_id seq_child_delta,
+        llama_pos p0,
+        llama_pos p1,
+        int32_t parent_node_id,
+        int32_t child_node_id,
+        int32_t layer_id,
+        uint64_t * job_id) {
+    if (ctx == nullptr || job_id == nullptr || layer_id < 0) {
+        return false;
+    }
+    *job_id = 0;
+    llama_memory_t mem = ctx->get_memory();
+    llama_kv_cache * kv = nullptr;
+    if (auto * pure = dynamic_cast<llama_kv_cache *>(mem)) {
+        kv = pure;
+    } else if (auto * hybrid = dynamic_cast<llama_memory_hybrid *>(mem)) {
+        kv = hybrid->get_mem_attn();
+    }
+    return kv != nullptr && kv->seq_delta_build_branch_async(
+            seq_anchor, seq_child_full, seq_child_delta, p0, p1,
+            parent_node_id, child_node_id, *job_id, layer_id);
+}
+
 bool llama_kv_seq_delta_build_branch_finish(
         llama_context * ctx,
         uint64_t job_id,

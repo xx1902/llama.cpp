@@ -933,6 +933,21 @@ extern "C" {
             int32_t parent_node_id,
             int32_t child_node_id,
             uint64_t * job_id);
+
+    // Experimental layer-pipeline entry point. The selected layer is submitted
+    // after its KV cache write completes; multiple jobs for the same branch are
+    // merged when they are finished.
+    LLAMA_API bool llama_kv_seq_delta_build_layer_async(
+            struct llama_context * ctx,
+            llama_seq_id seq_anchor,
+            llama_seq_id seq_child_full,
+            llama_seq_id seq_child_delta,
+            llama_pos p0,
+            llama_pos p1,
+            int32_t parent_node_id,
+            int32_t child_node_id,
+            int32_t layer_id,
+            uint64_t * job_id);
     LLAMA_API bool llama_kv_seq_delta_build_branch_finish(
             struct llama_context * ctx,
             uint64_t job_id,

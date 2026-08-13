@@ -1,5 +1,7 @@
 # 前缀切分与 KV 缓存评分整理
 
+> **实验结果更新（2026-08-12）：** 本文后半部分原有的 test5 延迟表使用了不完整的异步计时边界，已被[四种 KV delta 调度方案的新实验报告](./output/four-schemes-fair-timing-4pairs-3repeats/experiment_summary.md)取代。新报告包含 `traditional / layer-wise / cuda-sync / cuda-overlap` 四组、真实端到端 TTFT、配对统计和可视化。本文其余 test4 前缀切分与评分分析继续保留。
+
 本文是 `lora-base-test4` 当前实现的内部实验整理，并说明 `lora-base-test5` 与前缀切分的关系。文档用于后续人工复核和实验设计，不代表已经完成的实现。
 
 ## 结论先行

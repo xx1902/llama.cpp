@@ -1,12 +1,10 @@
 // Focused KV-delta scheduling experiment.
 //
 // The implementation reuses the data/model helpers from test4, but keeps the
-// measured region small and explicit.  "cuda-overlap" is a real overlap
-// experiment: the fused delta-Q8 CUDA kernel is submitted on a low-priority
-// stream while child suffix inference runs on the foreground stream.  It is
-// deliberately not called a single inference+delta kernel because llama's
-// inference graph contains multiple independent CUDA/cuBLAS kernels.  The
-// "inference-only" mode is the no-delta baseline for the same child suffix.
+// measured region starts at child-prefix processing and ends at the first
+// token. "layer-wise" submits each layer's delta after that layer completes;
+// "cuda-sync" and "cuda-overlap" submit one all-layer CUDA job after the full
+// prefix. None of these modes is a single inference+delta CUDA kernel.
 
 #define main llama_lora_base_test4_embedded_main
 #include "../lora-base-test4/lora-base-test4.cpp"
@@ -56,6 +54,7 @@ struct test5_row {
     double ttft_ms = 0.0;
     double total_ms = 0.0;
     double overlap_window_ms = 0.0;
+    int delta_jobs = 0;
     double saved_rate = 0.0;
     double reconstruction_cos = 0.0;
     double reconstruction_l2 = 0.0;
@@ -84,7 +83,7 @@ static bool parse_test5_options(int argc, char ** argv, test5_options & options)
                     "  [--output-dir DIR] [--max-pairs N] [--repeats N]\n"
                     "  [--prefix-chunk N] [--suffix-tokens N] [--n-ctx N]\n"
                     "  [--n-batch N] [--n-ubatch N] [--n-gpu-layers N]\n"
-                    "  [--mode all|inference-only|cpu-sync|cuda-sync|cuda-overlap]\n",
+                    "  [--mode all|traditional|layer-wise|cuda-sync|cuda-overlap]\n",
                     argv[0]);
             return false;
         }
@@ -118,8 +117,8 @@ static bool parse_test5_options(int argc, char ** argv, test5_options & options)
     if (options.max_pairs <= 0 || options.repeats <= 0 || options.prefix_chunk <= 0 ||
             options.suffix_tokens < 0 || options.n_ctx <= 0 || options.n_batch <= 0 ||
             options.n_ubatch <= 0 || (options.mode != "all" &&
-            options.mode != "inference-only" &&
-            options.mode != "cpu-sync" && options.mode != "cuda-sync" &&
+            options.mode != "traditional" &&
+            options.mode != "layer-wise" && options.mode != "cuda-sync" &&
             options.mode != "cuda-overlap")) {
         fprintf(stderr, "invalid test5 options\n");
         return false;
@@ -144,8 +143,99 @@ static experiment_options make_experiment_options(const test5_options & options,
 }
 
 static std::vector<std::string> test5_modes(const std::string & mode) {
-    if (mode == "all") return { "inference-only", "cpu-sync", "cuda-sync", "cuda-overlap" };
+    if (mode == "all") return { "traditional", "layer-wise", "cuda-sync", "cuda-overlap" };
     return { mode };
+}
+
+struct layer_pipeline_state {
+    llama_context * context = nullptr;
+    bool active = false;
+    bool submit_failed = false;
+    llama_seq_id anchor_seq = 0;
+    llama_seq_id child_seq = 1;
+    llama_seq_id delta_seq = 2;
+    llama_pos p0 = 0;
+    llama_pos p1 = 0;
+    int32_t parent_node_id = -1;
+    int32_t child_node_id = -1;
+    double submit_ms = 0.0;
+    std::vector<uint64_t> jobs;
+};
+
+static bool layer_pipeline_callback(ggml_tensor * tensor, bool ask, void * user_data) {
+    auto * state = static_cast<layer_pipeline_state *>(user_data);
+    if (state == nullptr || !state->active) return false;
+
+    int layer_id = -1;
+    int parsed = 0;
+    const bool is_layer_end = std::sscanf(
+            tensor->name, "l_out-%d%n", &layer_id, &parsed) == 1 &&
+            parsed == (int) std::strlen(tensor->name);
+    if (ask) return is_layer_end;
+    if (!is_layer_end || state->context == nullptr || state->submit_failed) return true;
+
+    uint64_t job = 0;
+    const double start = now_ms();
+    const bool ok = llama_kv_seq_delta_build_layer_async(
+            state->context, state->anchor_seq, state->child_seq, state->delta_seq,
+            state->p0, state->p1, state->parent_node_id, state->child_node_id,
+            layer_id, &job);
+    state->submit_ms += now_ms() - start;
+    if (!ok || job == 0) {
+        state->submit_failed = true;
+    } else {
+        state->jobs.push_back(job);
+    }
+    return true;
+}
+
+static llama_context * create_test5_context(
+        llama_model * model,
+        const experiment_options & options,
+        int sequence_count,
+        layer_pipeline_state * pipeline) {
+    llama_context_params params = llama_context_default_params();
+    params.n_ctx = options.n_ctx;
+    params.n_batch = options.n_batch;
+    params.n_ubatch = options.n_ubatch;
+    params.n_seq_max = (uint32_t) std::max(1, sequence_count);
+    params.no_perf = true;
+    params.kv_unified = true;
+    if (pipeline != nullptr) {
+        params.cb_eval = layer_pipeline_callback;
+        params.cb_eval_user_data = pipeline;
+    }
+    llama_context * context = llama_init_from_model(model, params);
+    if (pipeline != nullptr) pipeline->context = context;
+    return context;
+}
+
+static bool eval_tokens_layer_pipeline(
+        llama_context * context,
+        const std::vector<llama_token> & tokens,
+        llama_seq_id sequence,
+        int start_position,
+        int chunk_size,
+        int n_ubatch,
+        layer_pipeline_state & pipeline) {
+    int offset = 0;
+    const int physical_chunk = std::max(1, std::min(chunk_size, n_ubatch));
+    while (offset < (int) tokens.size()) {
+        const int count = std::min(physical_chunk, (int) tokens.size() - offset);
+        llama_batch batch = llama_batch_init(count, 0, 1);
+        for (int i = 0; i < count; ++i) {
+            batch_add(batch, tokens[offset + i], start_position + offset + i, sequence, false);
+        }
+        pipeline.p0 = start_position + offset;
+        pipeline.p1 = pipeline.p0 + count;
+        pipeline.active = true;
+        const int result = llama_decode(context, batch);
+        pipeline.active = false;
+        llama_batch_free(batch);
+        if (result != 0 || pipeline.submit_failed) return false;
+        offset += count;
+    }
+    return true;
 }
 
 static std::vector<llama_token> make_suffix(const tokenized_request & tokens, int count) {
@@ -205,7 +295,11 @@ static test5_row run_test5_trial(
     row.status = "started";
 
     experiment_options run_options = make_experiment_options(options, mode);
-    llama_context * context = create_context(model, run_options, 4);
+    layer_pipeline_state pipeline;
+    pipeline.parent_node_id = pair.anchor_request_id;
+    pipeline.child_node_id = pair.child_request_id;
+    llama_context * context = create_test5_context(
+            model, run_options, 4, mode == "layer-wise" ? &pipeline : nullptr);
     if (context == nullptr) {
         row.status = "context_failed";
         return row;
@@ -239,93 +333,111 @@ static test5_row run_test5_trial(
     row.anchor_eval_ms = now_ms() - start;
 
     bind_lora(context, child_lora);
+    const double measured_start = now_ms();
     start = now_ms();
-    if (!eval_tokens(context, child_tokens.prefix, 1, 0, options.prefix_chunk)) {
+    const bool child_ok = mode == "layer-wise"
+            ? eval_tokens_layer_pipeline(
+                    context, child_tokens.prefix, 1, 0, options.prefix_chunk,
+                    options.n_ubatch, pipeline)
+            : eval_tokens(context, child_tokens.prefix, 1, 0, options.prefix_chunk);
+    if (!child_ok) {
         row.status = "child_eval_failed";
         llama_free(context);
         return row;
     }
+    // llama_decode() submits asynchronously. All modes use the same completed
+    // prefix boundary, and the external delta stream must not read KV earlier.
+    llama_synchronize(context);
     row.child_eval_ms = now_ms() - start;
-
-    // Keep the original probe as an explicit synchronization/validation point
-    // for delta modes. The no-delta baseline omits it so its measured region
-    // contains only child suffix inference.
-    if (mode != "inference-only") {
-        llama_kv_delta_probe_stats probe = {};
-        start = now_ms();
-        const bool probe_ok = llama_kv_seq_delta_probe(
-                context, 0, 1, 0, row.prefix_tokens, &probe);
-        row.probe_ms = now_ms() - start;
-        if (!probe_ok) {
-            row.status = "probe_failed";
-            llama_free(context);
-            return row;
-        }
-    }
 
     const llama_seq_id delta_seq = 2;
     const llama_seq_id recon_seq = 3;
     llama_kv_delta_branch_stats branch = {};
-    const double measured_start = now_ms();
     uint64_t async_job = 0;
     bool build_ok = false;
 
-    if (mode == "inference-only") {
+    auto run_suffix_and_decode = [&]() {
         const double foreground_start = now_ms();
         if (!suffix.empty() && !eval_tokens(
                 context, suffix, 1, row.prefix_tokens, options.prefix_chunk)) {
             row.status = "suffix_eval_failed";
-            llama_free(context);
-            return row;
+            return false;
         }
         if (!decode_one(context, suffix.empty() ? child_tokens.prefix.back() : suffix.back(),
                 1, row.prefix_tokens + row.suffix_tokens)) {
             row.status = "decode_failed";
+            return false;
+        }
+        // TTFT ends only when the first-token computation is actually complete.
+        llama_synchronize(context);
+        row.foreground_ms = now_ms() - foreground_start;
+        return true;
+    };
+
+    if (mode == "traditional") {
+        if (!run_suffix_and_decode()) {
             llama_free(context);
             return row;
         }
-        row.foreground_ms = now_ms() - foreground_start;
         row.ttft_ms = now_ms() - measured_start;
-        row.total_ms = now_ms() - measured_start;
+        row.total_ms = row.ttft_ms;
         row.status = "ok";
-
-        // This baseline intentionally has no delta payload or reconstruction
-        // result.  Zero values keep the CSV schema stable; consumers should
-        // use the mode name to interpret them as not applicable.
         row.delta_build_ok = 0;
         row.reconstruction_ok = 0;
         llama_free(context);
         return row;
     }
 
-    if (mode == "cuda-overlap") {
+    if (mode == "layer-wise") {
+        row.delta_submit_ms = pipeline.submit_ms;
+        row.delta_jobs = (int) pipeline.jobs.size();
+        if (pipeline.submit_failed || pipeline.jobs.empty()) {
+            row.status = "layer_submit_failed";
+            llama_free(context);
+            return row;
+        }
+        const double finish_start = now_ms();
+        build_ok = true;
+        for (size_t i = 0; i < pipeline.jobs.size(); ++i) {
+            if (!llama_kv_seq_delta_build_branch_finish(
+                    context, pipeline.jobs[i], delta_seq, &branch)) {
+                build_ok = false;
+                for (size_t j = i + 1; j < pipeline.jobs.size(); ++j) {
+                    llama_kv_seq_delta_build_branch_cancel(context, pipeline.jobs[j]);
+                }
+                break;
+            }
+        }
+        row.delta_finish_wait_ms = now_ms() - finish_start;
+        if (!build_ok) {
+            row.status = "layer_finish_failed";
+            llama_free(context);
+            return row;
+        }
+        if (!run_suffix_and_decode()) {
+            llama_free(context);
+            return row;
+        }
+        row.ttft_ms = now_ms() - measured_start;
+        row.total_ms = row.ttft_ms;
+    } else if (mode == "cuda-overlap") {
         const double submit_start = now_ms();
         build_ok = llama_kv_seq_delta_build_branch_async(
                 context, 0, 1, delta_seq, 0, row.prefix_tokens,
                 pair.anchor_request_id, pair.child_request_id, &async_job);
         row.delta_submit_ms = now_ms() - submit_start;
+        row.delta_jobs = build_ok ? 1 : 0;
         if (!build_ok) {
             row.status = "async_submit_failed";
             llama_free(context);
             return row;
         }
 
-        const double foreground_start = now_ms();
-        if (!suffix.empty() && !eval_tokens(
-                context, suffix, 1, row.prefix_tokens, options.prefix_chunk)) {
+        if (!run_suffix_and_decode()) {
             llama_kv_seq_delta_build_branch_cancel(context, async_job);
-            row.status = "suffix_eval_failed";
             llama_free(context);
             return row;
         }
-        if (!decode_one(context, suffix.empty() ? child_tokens.prefix.back() : suffix.back(),
-                1, row.prefix_tokens + row.suffix_tokens)) {
-            llama_kv_seq_delta_build_branch_cancel(context, async_job);
-            row.status = "decode_failed";
-            llama_free(context);
-            return row;
-        }
-        row.foreground_ms = now_ms() - foreground_start;
         row.ttft_ms = now_ms() - measured_start;
 
         const double finish_start = now_ms();
@@ -335,34 +447,21 @@ static test5_row run_test5_trial(
         row.overlap_window_ms = row.foreground_ms;
     } else {
         const double delta_start = now_ms();
-        build_ok = mode == "cpu-sync"
-                ? llama_kv_seq_delta_build_branch_cpu(
-                        context, 0, 1, delta_seq, 0, row.prefix_tokens,
-                        pair.anchor_request_id, pair.child_request_id, &branch)
-                : llama_kv_seq_delta_build_branch(
-                        context, 0, 1, delta_seq, 0, row.prefix_tokens,
-                        pair.anchor_request_id, pair.child_request_id, &branch);
+        build_ok = llama_kv_seq_delta_build_branch(
+                context, 0, 1, delta_seq, 0, row.prefix_tokens,
+                pair.anchor_request_id, pair.child_request_id, &branch);
         row.delta_build_ms = now_ms() - delta_start;
+        row.delta_jobs = build_ok ? 1 : 0;
         if (!build_ok) {
             row.status = "delta_build_failed";
             llama_free(context);
             return row;
         }
 
-        const double foreground_start = now_ms();
-        if (!suffix.empty() && !eval_tokens(
-                context, suffix, 1, row.prefix_tokens, options.prefix_chunk)) {
-            row.status = "suffix_eval_failed";
+        if (!run_suffix_and_decode()) {
             llama_free(context);
             return row;
         }
-        if (!decode_one(context, suffix.empty() ? child_tokens.prefix.back() : suffix.back(),
-                1, row.prefix_tokens + row.suffix_tokens)) {
-            row.status = "decode_failed";
-            llama_free(context);
-            return row;
-        }
-        row.foreground_ms = now_ms() - foreground_start;
         row.ttft_ms = now_ms() - measured_start;
     }
 
@@ -373,14 +472,21 @@ static test5_row run_test5_trial(
     row.saved_rate = branch.logical_saved_rate;
     row.status = build_ok ? "ok" : "delta_finish_failed";
 
-    // Allocate an independent destination sequence for validation. This is
-    // intentionally outside the measured interval because the materializer is
-    // the old host-side path, not the scheduling path being compared.
+    // Similarity probing and reconstruction are validation-only and stay
+    // outside the request timing window for every mode.
+    llama_kv_delta_probe_stats source_probe = {};
+    start = now_ms();
+    const bool source_probe_ok = llama_kv_seq_delta_probe(
+            context, 0, 1, 0, row.prefix_tokens, &source_probe);
+    row.probe_ms = now_ms() - start;
+    if (!source_probe_ok) row.status = "probe_failed";
+
     bind_lora(context, child_lora);
-    if (eval_tokens(context, child_tokens.prefix, recon_seq, 0, options.prefix_chunk)) {
+    if (source_probe_ok && eval_tokens(
+            context, child_tokens.prefix, recon_seq, 0, options.prefix_chunk)) {
         finish_and_validate_delta(
                 context, 0, 1, delta_seq, recon_seq, row.prefix_tokens, row);
-    } else {
+    } else if (source_probe_ok) {
         row.status = "reconstruction_context_failed";
     }
     llama_kv_seq_delta_remove_branch(context, delta_seq);
@@ -393,7 +499,7 @@ static void write_test5_csv(const std::string & path, const std::vector<test5_ro
     std::ofstream output(path, std::ios::trunc);
     output << "mode,repeat,pair_name,group_name,anchor_lora_id,child_lora_id,prefix_tokens,suffix_tokens,"
               "anchor_eval_ms,child_eval_ms,probe_ms,delta_submit_ms,delta_build_ms,delta_finish_wait_ms,"
-              "foreground_ms,ttft_ms,total_ms,overlap_window_ms,saved_rate,reconstruction_cos,reconstruction_l2,"
+              "foreground_ms,ttft_ms,total_ms,overlap_window_ms,delta_jobs,saved_rate,reconstruction_cos,reconstruction_l2,"
               "full_kv_bytes,delta_bytes,delta_build_ok,reconstruction_ok,status\n";
     output << std::setprecision(10);
     for (const auto & row : rows) {
@@ -402,7 +508,7 @@ static void write_test5_csv(const std::string & path, const std::vector<test5_ro
                << row.prefix_tokens << ',' << row.suffix_tokens << ',' << row.anchor_eval_ms << ','
                << row.child_eval_ms << ',' << row.probe_ms << ',' << row.delta_submit_ms << ','
                << row.delta_build_ms << ',' << row.delta_finish_wait_ms << ',' << row.foreground_ms << ','
-               << row.ttft_ms << ',' << row.total_ms << ',' << row.overlap_window_ms << ','
+               << row.ttft_ms << ',' << row.total_ms << ',' << row.overlap_window_ms << ',' << row.delta_jobs << ','
                << row.saved_rate << ',' << row.reconstruction_cos << ',' << row.reconstruction_l2 << ','
                << row.full_kv_bytes << ',' << row.delta_bytes << ',' << row.delta_build_ok << ','
                << row.reconstruction_ok << ',' << csv_escape(row.status) << '\n';
@@ -414,29 +520,54 @@ static void write_test5_summary(const std::string & path, const std::vector<test
     std::map<std::string, std::vector<const test5_row *>> grouped;
     for (const auto & row : rows) grouped[row.mode].push_back(&row);
     std::ofstream output(path, std::ios::trunc);
-    output << "mode,count,ok_count,mean_delta_ms,mean_ttft_ms,mean_total_ms,mean_saved_rate,"
+    output << "mode,count,ok_count,mean_child_eval_ms,mean_foreground_ms,mean_delta_ms,"
+              "mean_ttft_ms,stddev_ttft_ms,p50_ttft_ms,p95_ttft_ms,mean_total_ms,mean_saved_rate,"
               "mean_reconstruction_cos,mean_reconstruction_l2\n";
     output << std::setprecision(10);
     for (const auto & [mode, items] : grouped) {
         int ok_count = 0;
+        double child_eval_ms = 0.0;
+        double foreground_ms = 0.0;
         double delta_ms = 0.0;
         double ttft_ms = 0.0;
         double total_ms = 0.0;
         double saved_rate = 0.0;
         double recon_cos = 0.0;
         double recon_l2 = 0.0;
+        std::vector<double> ttft_values;
         for (const test5_row * row : items) {
-            ok_count += row->status == "ok" ? 1 : 0;
+            if (row->status != "ok") continue;
+            ++ok_count;
+            child_eval_ms += row->child_eval_ms;
+            foreground_ms += row->foreground_ms;
             delta_ms += row->delta_build_ms + row->delta_submit_ms + row->delta_finish_wait_ms;
             ttft_ms += row->ttft_ms;
+            ttft_values.push_back(row->ttft_ms);
             total_ms += row->total_ms;
             saved_rate += row->saved_rate;
             recon_cos += row->reconstruction_cos;
             recon_l2 += row->reconstruction_l2;
         }
-        const double count = std::max<size_t>(1, items.size());
+        const double count = std::max(1, ok_count);
+        const double mean_ttft = ttft_ms / count;
+        double ttft_variance = 0.0;
+        for (const double value : ttft_values) {
+            const double difference = value - mean_ttft;
+            ttft_variance += difference * difference;
+        }
+        const double ttft_stddev = std::sqrt(ttft_variance / count);
+        std::sort(ttft_values.begin(), ttft_values.end());
+        auto percentile = [&](double q) {
+            if (ttft_values.empty()) return 0.0;
+            const size_t index = std::min(
+                    ttft_values.size() - 1,
+                    (size_t) std::ceil(q * ttft_values.size()) - 1);
+            return ttft_values[index];
+        };
         output << csv_escape(mode) << ',' << items.size() << ',' << ok_count << ','
-               << delta_ms / count << ',' << ttft_ms / count << ',' << total_ms / count << ','
+               << child_eval_ms / count << ',' << foreground_ms / count << ',' << delta_ms / count << ','
+               << mean_ttft << ',' << ttft_stddev << ',' << percentile(0.50) << ',' << percentile(0.95) << ','
+               << total_ms / count << ','
                << saved_rate / count << ',' << recon_cos / count << ',' << recon_l2 / count << '\n';
     }
 }
@@ -503,10 +634,16 @@ int main(int argc, char ** argv) {
     }
 
     std::vector<test5_row> rows;
-    const std::vector<std::string> modes = test5_modes(options.mode);
-    for (const std::string & mode : modes) {
-        for (int repeat = 0; repeat < options.repeats; ++repeat) {
-            for (const auto & pair : pairs) {
+    const std::vector<std::string> base_modes = test5_modes(options.mode);
+    for (int repeat = 0; repeat < options.repeats; ++repeat) {
+        for (size_t pair_index = 0; pair_index < pairs.size(); ++pair_index) {
+            const auto & pair = pairs[pair_index];
+            std::vector<std::string> modes = base_modes;
+            if (modes.size() > 1) {
+                const size_t offset = (pair_index + (size_t) repeat) % modes.size();
+                std::rotate(modes.begin(), modes.begin() + offset, modes.end());
+            }
+            for (const std::string & mode : modes) {
                 const auto anchor_request = requests.find(pair.anchor_request_id);
                 const auto child_request = requests.find(pair.child_request_id);
                 const auto anchor_lora = loras.find(pair.anchor_lora_id);
@@ -521,8 +658,9 @@ int main(int argc, char ** argv) {
                         anchor_request->second, child_request->second,
                         *anchor_lora->second, *child_lora->second, mode, repeat);
                 fprintf(stderr,
-                        "test5 mode=%s repeat=%d pair=%s prefix=%d delta=%.3fms ttft=%.3fms total=%.3fms status=%s\n",
+                        "test5 mode=%s repeat=%d pair=%s prefix=%d jobs=%d delta=%.3fms ttft=%.3fms total=%.3fms status=%s\n",
                         mode.c_str(), repeat, pair.pair_name.c_str(), row.prefix_tokens,
+                        row.delta_jobs,
                         row.delta_build_ms + row.delta_submit_ms + row.delta_finish_wait_ms,
                         row.ttft_ms, row.total_ms, row.status.c_str());
                 rows.push_back(std::move(row));
@@ -530,8 +668,8 @@ int main(int argc, char ** argv) {
         }
     }
 
-    write_test5_csv(options.output_dir + "/fused_delta_results.csv", rows);
-    write_test5_summary(options.output_dir + "/fused_delta_summary.csv", rows);
+    write_test5_csv(options.output_dir + "/kv_delta_results.csv", rows);
+    write_test5_summary(options.output_dir + "/kv_delta_summary.csv", rows);
     for (auto & lora : lora_list) {
         if (lora.adapter != nullptr) llama_adapter_lora_free(lora.adapter);
     }

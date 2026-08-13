@@ -1882,7 +1882,8 @@ bool llama_kv_cache::seq_delta_build_branch_async(
         llama_pos p1,
         int32_t parent_node_id,
         int32_t child_node_id,
-        uint64_t & job_id) {
+        uint64_t & job_id,
+        int32_t layer_id) {
     job_id = 0;
     if (seq_anchor < 0 || seq_child_full < 0 || seq_child_delta < 0 || p1 <= p0 ||
             (size_t) seq_anchor >= seq_to_stream.size() ||
@@ -1997,6 +1998,9 @@ bool llama_kv_cache::seq_delta_build_branch_async(
     };
 
     for (const auto & layer : layers) {
+        if (layer_id >= 0 && (int32_t) layer.il != layer_id) {
+            continue;
+        }
         const uint32_t il = layer.il;
         add_input(
                 layer.k_stream[stream_anchor], layer.k_stream[stream_child],
@@ -2050,7 +2054,51 @@ bool llama_kv_cache::seq_delta_build_branch_finish(uint64_t job_id) {
     if (!ok) {
         return false;
     }
-    delta_branches.push_back(std::move(build.branch));
+    auto existing = std::find_if(
+            delta_branches.begin(), delta_branches.end(),
+            [&](const kv_delta_branch & branch) {
+                return branch.anchor_seq_id == build.branch.anchor_seq_id &&
+                        branch.child_seq_id == build.branch.child_seq_id &&
+                        branch.parent_node_id == build.branch.parent_node_id &&
+                        branch.child_node_id == build.branch.child_node_id;
+            });
+    if (existing == delta_branches.end()) {
+        delta_branches.push_back(std::move(build.branch));
+        return true;
+    }
+
+    for (auto & source : build.branch.layer_deltas) {
+        auto destination = std::find_if(
+                existing->layer_deltas.begin(), existing->layer_deltas.end(),
+                [&](const kv_delta_tensor & tensor) {
+                    return tensor.layer_id == source.layer_id &&
+                            tensor.is_k == source.is_k && tensor.n_embd == source.n_embd;
+                });
+        if (destination == existing->layer_deltas.end()) {
+            existing->layer_deltas.push_back(std::move(source));
+        } else if (destination->p1 == source.p0) {
+            destination->q8.insert(
+                    destination->q8.end(), source.q8.begin(), source.q8.end());
+            destination->scales.insert(
+                    destination->scales.end(), source.scales.begin(), source.scales.end());
+            destination->p1 = source.p1;
+        } else if (source.p1 == destination->p0) {
+            source.q8.insert(source.q8.end(),
+                    destination->q8.begin(), destination->q8.end());
+            source.scales.insert(source.scales.end(),
+                    destination->scales.begin(), destination->scales.end());
+            source.p1 = destination->p1;
+            *destination = std::move(source);
+        } else {
+            return false;
+        }
+    }
+    existing->p0 = std::min(existing->p0, build.branch.p0);
+    existing->p1 = std::max(existing->p1, build.branch.p1);
+    existing->anchor_ref_bytes += build.branch.anchor_ref_bytes;
+    existing->delta_q8_bytes += build.branch.delta_q8_bytes;
+    existing->delta_scale_bytes += build.branch.delta_scale_bytes;
+    existing->full_kv_bytes_equivalent += build.branch.full_kv_bytes_equivalent;
     return true;
 }
 

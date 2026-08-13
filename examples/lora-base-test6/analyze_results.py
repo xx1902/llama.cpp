@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import math
+import re
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
@@ -31,9 +32,56 @@ DATASET_LABELS = {
     "xsum_parallel": "XSum",
 }
 
+PREFIX_METHODS = [
+    ("fixed_64_128", "Fixed 64/128"),
+    ("fixed_192_384", "Fixed 192/384"),
+    ("sentence", "Sentence"),
+    ("keyword", "Keyword"),
+    ("reuse_aware", "Reuse-aware"),
+]
+
+STORAGE_STRATEGY_IDS = [
+    "full_prefill",
+    "legacy_exact",
+    "gpu_only_128",
+    "gpu_host_full_128",
+    "tiered_no_prefetch_128",
+    "tiered_oracle_128",
+    "tiered_oracle_full",
+    "tiered_disk_build_128",
+    "tiered_disk_warm_128",
+]
+
+PREFIX_RUNTIME_COLUMNS = [
+    "runtime_requests",
+    "runtime_request_hit_rate",
+    "runtime_token_hit_rate",
+    "runtime_ttft_speedup_percent",
+    "runtime_ttft_ci95_low_percent",
+    "runtime_ttft_ci95_high_percent",
+    "runtime_ttft_ci95_half_percent",
+    "runtime_host_peak_mb",
+    "runtime_peak_nodes",
+    "runtime_family_evictions",
+    "runtime_reusable_prefix_tokens",
+    "run_elapsed_seconds",
+    "ttft_change_display",
+]
+
 
 def read_json(path: Path) -> Any:
     return json.loads(path.read_text(encoding="utf-8"))
+
+
+def read_jsonl(path: Path) -> list[dict[str, Any]]:
+    with path.open(encoding="utf-8") as file:
+        return [json.loads(line) for line in file if line.strip()]
+
+
+def estimated_tokens(text: str) -> int:
+    """Use the same lightweight estimator as build_real_workloads.py."""
+    ascii_count = sum(ord(char) < 128 for char in text)
+    return max(1, math.ceil(ascii_count / 4 + (len(text) - ascii_count) / 1.5))
 
 
 def numeric(frame: pd.DataFrame, column: str) -> pd.Series:
@@ -304,6 +352,239 @@ def collect_delta_quality(manifests: list[dict[str, Any]]) -> pd.DataFrame:
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
 
 
+def split_at_positions(text: str, positions: list[int]) -> list[str]:
+    boundaries = [0, *sorted({item for item in positions if 0 < item < len(text)}), len(text)]
+    return [text[start:end] for start, end in zip(boundaries, boundaries[1:]) if end > start]
+
+
+def fixed_chunks(text: str, target_tokens: int) -> list[str]:
+    if not text:
+        return []
+    chunks: list[str] = []
+    start = 0
+    while start < len(text):
+        remaining = text[start:]
+        remaining_tokens = estimated_tokens(remaining)
+        if remaining_tokens <= target_tokens:
+            chunks.append(remaining)
+            break
+        estimate = max(1, int(round(len(remaining) * target_tokens / remaining_tokens)))
+        end = min(len(text), start + estimate)
+        while end > start + 1 and estimated_tokens(text[start:end]) > target_tokens:
+            end -= 1
+        while end < len(text) and estimated_tokens(text[start : end + 1]) <= target_tokens:
+            end += 1
+        chunks.append(text[start:end])
+        start = end
+    return chunks
+
+
+def natural_boundaries(text: str, segments: list[dict[str, Any]]) -> set[int]:
+    boundaries: set[int] = set()
+    offset = 0
+    for segment in segments:
+        offset += len(str(segment.get("text", "")))
+        if 0 < offset <= len(text):
+            boundaries.add(offset)
+    for match in re.finditer(r"(?:[.!?。！？][\"')\]】]*\s*|\n+)", text):
+        boundaries.add(match.end())
+    boundaries.add(len(text))
+    return boundaries
+
+
+def pack_units(units: list[str], target_tokens: int = 128) -> list[str]:
+    packed: list[str] = []
+    current = ""
+    for unit in units:
+        if not unit:
+            continue
+        if estimated_tokens(unit) > int(target_tokens * 1.5):
+            if current:
+                packed.append(current)
+                current = ""
+            packed.extend(fixed_chunks(unit, target_tokens))
+            continue
+        candidate = current + unit
+        if current and estimated_tokens(candidate) > target_tokens:
+            packed.append(current)
+            current = unit
+        else:
+            current = candidate
+    if current:
+        packed.append(current)
+    return packed
+
+
+def split_prefix(
+    row: dict[str, Any],
+    method_id: str,
+    reuse_points: set[int],
+) -> list[str]:
+    text = str(row.get("common_prefix_text", ""))
+    segments = list(row.get("prefix_segments") or [])
+    if method_id in {"fixed_64_128", "fixed_192_384"}:
+        system_target, context_target = (
+            (64, 128) if method_id == "fixed_64_128" else (192, 384)
+        )
+        chunks: list[str] = []
+        if not segments:
+            return fixed_chunks(text, context_target)
+        for segment in segments:
+            segment_text = str(segment.get("text", ""))
+            segment_type = str(segment.get("type", ""))
+            target = system_target if segment_type == "shared_system" else context_target
+            chunks.extend(fixed_chunks(segment_text, target))
+        return chunks
+
+    boundaries = natural_boundaries(text, segments)
+    if method_id == "sentence":
+        return pack_units(split_at_positions(text, list(boundaries)), 128)
+
+    if method_id == "keyword":
+        units = split_at_positions(text, list(boundaries))
+        keyword_pattern = re.compile(
+            r"(?i)(?:^|\n)\s*(?:user|assistant|system|task|context|article|question|answer|"
+            r"session|profile|instruction|dialogue|summary|headline|translate|source|target)\b|"
+            r"\b(?:however|meanwhile|therefore|because|finally|next|then)\b"
+        )
+        chunks: list[str] = []
+        current = ""
+        for unit in units:
+            if estimated_tokens(unit) > 288:
+                if current:
+                    chunks.append(current)
+                    current = ""
+                chunks.extend(fixed_chunks(unit, 192))
+                continue
+            keyword_start = bool(keyword_pattern.search(unit))
+            candidate = current + unit
+            if current and (keyword_start or estimated_tokens(candidate) > 192):
+                chunks.append(current)
+                current = unit
+            else:
+                current = candidate
+        if current:
+            chunks.append(current)
+        return chunks
+
+    if method_id != "reuse_aware":
+        raise ValueError(f"unknown prefix method: {method_id}")
+
+    candidates = sorted(boundaries | reuse_points)
+    chunks: list[str] = []
+    start = 0
+    while start < len(text):
+        remaining = text[start:]
+        if estimated_tokens(remaining) <= 128:
+            chunks.append(remaining)
+            break
+        viable: list[tuple[float, int]] = []
+        for end in candidates:
+            if end <= start or end >= len(text):
+                continue
+            size = estimated_tokens(text[start:end])
+            if 64 <= size <= 192:
+                reuse_bonus = 72.0 if end in reuse_points else 0.0
+                viable.append((abs(size - 128) - reuse_bonus, end))
+        if viable:
+            end = min(viable)[1]
+        else:
+            fallback = fixed_chunks(remaining, 128)[0]
+            end = start + len(fallback)
+        chunks.append(text[start:end])
+        start = end
+    return chunks
+
+
+def analyze_prefix_structure(snapshot: dict[str, Any]) -> pd.DataFrame:
+    workloads_root = Path(snapshot["workloads_root"])
+    rows_out: list[dict[str, Any]] = []
+    request_limit = int(snapshot.get("request_limit", 30))
+    for dataset in snapshot["selected_datasets"]:
+        path = workloads_root / dataset / "grouped" / "grouped_requests.jsonl"
+        if not path.is_file():
+            continue
+        requests = read_jsonl(path)[:request_limit]
+        prefixes_by_context: dict[str, list[str]] = {}
+        for request in requests:
+            context_id = str(request.get("context_id", ""))
+            prefixes_by_context.setdefault(context_id, []).append(
+                str(request.get("common_prefix_text", ""))
+            )
+
+        for method_id, method_label in PREFIX_METHODS:
+            seen_nodes: set[str] = set()
+            seen_prefixes: set[str] = set()
+            total_chunks = 0
+            total_chunk_tokens = 0
+            total_prefix_tokens = 0
+            reused_tokens = 0
+            requests_with_reuse = 0
+            complete_prefix_hits = 0
+            natural_ends = 0
+            internal_ends = 0
+            for request in requests:
+                text = str(request.get("common_prefix_text", ""))
+                context_id = str(request.get("context_id", ""))
+                reuse_points = {
+                    len(prefix)
+                    for prefix in prefixes_by_context.get(context_id, [])
+                    if len(prefix) < len(text) and text.startswith(prefix)
+                }
+                chunks = split_prefix(request, method_id, reuse_points)
+                chunk_tokens = [estimated_tokens(chunk) for chunk in chunks]
+                total_chunks += len(chunks)
+                total_chunk_tokens += sum(chunk_tokens)
+                total_prefix_tokens += estimated_tokens(text)
+
+                boundaries = natural_boundaries(
+                    text,
+                    list(request.get("prefix_segments") or []),
+                )
+                offset = 0
+                for chunk in chunks[:-1]:
+                    offset += len(chunk)
+                    internal_ends += 1
+                    natural_ends += int(offset in boundaries)
+
+                parent = "root"
+                node_ids: list[str] = []
+                for chunk in chunks:
+                    node_id = hashlib.sha256(
+                        (parent + "\0" + chunk).encode("utf-8")
+                    ).hexdigest()[:24]
+                    node_ids.append(node_id)
+                    parent = node_id
+                request_reused = sum(
+                    tokens for node_id, tokens in zip(node_ids, chunk_tokens) if node_id in seen_nodes
+                )
+                reused_tokens += request_reused
+                requests_with_reuse += int(request_reused > 0)
+                prefix_hash = str(request.get("common_prefix_hash", ""))
+                complete_prefix_hits += int(prefix_hash in seen_prefixes)
+                seen_nodes.update(node_ids)
+                seen_prefixes.add(prefix_hash)
+
+            rows_out.append(
+                {
+                    "dataset": dataset,
+                    "dataset_label": DATASET_LABELS.get(dataset, dataset),
+                    "method_id": method_id,
+                    "method_label": method_label,
+                    "requests": len(requests),
+                    "mean_prefix_tokens": total_prefix_tokens / max(1, len(requests)),
+                    "mean_chunks_per_prefix": total_chunks / max(1, len(requests)),
+                    "mean_tokens_per_chunk": total_chunk_tokens / max(1, total_chunks),
+                    "structural_request_hit_rate": requests_with_reuse / max(1, len(requests)),
+                    "structural_token_coverage": reused_tokens / max(1, total_chunk_tokens),
+                    "complete_prefix_repeat_rate": complete_prefix_hits / max(1, len(requests)),
+                    "natural_boundary_coverage": natural_ends / max(1, internal_ends),
+                    "unique_nodes": len(seen_nodes),
+                }
+            )
+    return pd.DataFrame(rows_out)
+
+
 def configure_plots() -> None:
     plt.rcParams.update(
         {
@@ -396,16 +677,7 @@ def save_chunk_ablation(summary: pd.DataFrame, figures_dir: Path) -> None:
 
 
 def save_storage_ablation(summary: pd.DataFrame, figures_dir: Path) -> None:
-    storage_ids = [
-        "full_prefill",
-        "legacy_exact",
-        "gpu_only_128",
-        "gpu_host_full_128",
-        "tiered_no_prefetch_128",
-        "tiered_oracle_128",
-        "tiered_disk_build_128",
-        "tiered_disk_warm_128",
-    ]
+    storage_ids = STORAGE_STRATEGY_IDS
     storage = summary[summary["strategy_id"].isin(storage_ids)].copy()
     if storage.empty:
         return
@@ -501,6 +773,239 @@ def save_delta_quality(delta: pd.DataFrame, figures_dir: Path) -> None:
     plt.close(fig)
 
 
+def save_dataset_final_effect(dataset_summary: pd.DataFrame, output_path: Path) -> None:
+    preferred_order = [
+        "full_prefill",
+        "legacy_exact",
+        "gpu_only_128",
+        "gpu_host_full_128",
+        "tiered_no_prefetch_128",
+        "tiered_oracle_32",
+        "tiered_oracle_64",
+        "tiered_oracle_128",
+        "tiered_oracle_256",
+        "tiered_oracle_full",
+        "tiered_disk_build_128",
+        "tiered_disk_warm_128",
+    ]
+    order_map = {item: index for index, item in enumerate(preferred_order)}
+    frame = dataset_summary.copy()
+    frame["plot_order"] = frame["strategy_id"].map(order_map).fillna(len(order_map))
+    frame = frame.sort_values("plot_order")
+    short_labels = {
+        "full_prefill": "Full prefill",
+        "legacy_exact": "Legacy exact",
+        "gpu_only_128": "GPU only",
+        "gpu_host_full_128": "GPU + host full",
+        "tiered_no_prefetch_128": "Tiered no-prefetch",
+        "tiered_oracle_32": "Oracle 32 / 2 chunks",
+        "tiered_oracle_64": "Oracle 64 / 2 chunks",
+        "tiered_oracle_128": "Oracle 128 / 2 chunks",
+        "tiered_oracle_256": "Oracle 256 / 2 chunks",
+        "tiered_oracle_full": "Oracle 128 / full coverage",
+        "tiered_disk_build_128": "Disk cold-build",
+        "tiered_disk_warm_128": "Disk warm-load",
+    }
+
+    fig, axes = plt.subplots(2, 2, figsize=(16, 11), constrained_layout=True)
+    label = str(frame["dataset_label"].iloc[0])
+    fig.suptitle(f"{label}: prefix reuse and three-level storage", fontsize=14)
+
+    speed = frame["ttft_speedup_percent"].to_numpy(dtype=float)
+    colors = ["#3f8f62" if value > 0 else "#b95c5c" if value < 0 else "#858585" for value in speed]
+    y = np.arange(len(frame))
+    axes[0, 0].barh(y, speed, color=colors)
+    axes[0, 0].set_yticks(y, [short_labels.get(item, item) for item in frame["strategy_id"]])
+    axes[0, 0].invert_yaxis()
+    axes[0, 0].axvline(0, color="0.35", linewidth=0.8)
+    axes[0, 0].set_xlabel("TTFT speedup vs matched full prefill (%)")
+    axes[0, 0].set_title("End-to-end latency")
+    axes[0, 0].grid(axis="x", alpha=0.25)
+    for index, value in enumerate(speed):
+        axes[0, 0].text(value, index, f" {value:.1f}%", va="center", fontsize=8)
+
+    oracle_ids = [
+        "tiered_oracle_32",
+        "tiered_oracle_64",
+        "tiered_oracle_128",
+        "tiered_oracle_256",
+        "tiered_oracle_full",
+    ]
+    oracle = frame[frame["strategy_id"].isin(oracle_ids)].set_index("strategy_id").reindex(oracle_ids)
+    oracle = oracle.dropna(subset=["ttft_mean_ms"])
+    oracle_labels = ["32\n2 chunks", "64\n2 chunks", "128\n2 chunks", "256\n2 chunks", "128\nfull"]
+    oracle_labels = [oracle_labels[oracle_ids.index(item)] for item in oracle.index]
+    oracle_x = np.arange(len(oracle))
+    axes[0, 1].bar(oracle_x, oracle["ttft_mean_ms"], color=plt.get_cmap("Set2").colors[: len(oracle)])
+    baseline = frame[frame["strategy_id"] == "full_prefill"]
+    if not baseline.empty:
+        axes[0, 1].axhline(
+            float(baseline.iloc[0]["ttft_mean_ms"]),
+            color="0.25",
+            linestyle="--",
+            linewidth=1.1,
+            label="Full prefill",
+        )
+        axes[0, 1].legend(frameon=False)
+    axes[0, 1].set_xticks(oracle_x, oracle_labels)
+    axes[0, 1].set_ylabel("Mean TTFT (ms)")
+    axes[0, 1].set_title("Oracle chunk coverage")
+    axes[0, 1].grid(axis="y", alpha=0.25)
+    for index, value in enumerate(oracle["ttft_mean_ms"]):
+        axes[0, 1].text(index, value, f"{value:.1f}", ha="center", va="bottom", fontsize=8)
+
+    reuse = frame[frame["strategy_id"] != "full_prefill"].copy()
+    reuse_x = np.arange(len(reuse))
+    width = 0.38
+    axes[1, 0].bar(
+        reuse_x - width / 2,
+        100.0 * reuse["prefix_token_hit_rate"],
+        width,
+        label="Token hit",
+        color="#4c78a8",
+    )
+    axes[1, 0].bar(
+        reuse_x + width / 2,
+        100.0 * reuse["request_hit_rate"],
+        width,
+        label="Request hit",
+        color="#f2a65a",
+    )
+    axes[1, 0].set_xticks(
+        reuse_x,
+        [short_labels.get(item, item) for item in reuse["strategy_id"]],
+        rotation=28,
+        ha="right",
+    )
+    axes[1, 0].set_ylabel("Hit rate (%)")
+    axes[1, 0].set_ylim(0, 105)
+    axes[1, 0].set_title("Observed prefix reuse")
+    axes[1, 0].legend(frameon=False)
+    axes[1, 0].grid(axis="y", alpha=0.25)
+
+    resources = frame[frame["strategy_id"].isin(STORAGE_STRATEGY_IDS[1:])].copy()
+    resource_x = np.arange(len(resources))
+    axes[1, 1].bar(
+        resource_x,
+        resources["max_physical_cache_tokens"],
+        color="#5b8e7d",
+        label="GPU cache tokens",
+    )
+    host_axis = axes[1, 1].twinx()
+    host_mb = (
+        resources["max_host_delta_bytes"] + resources["max_host_full_bytes"]
+    ) / (1024.0 * 1024.0)
+    host_axis.plot(resource_x, host_mb, color="#c45d39", marker="o", label="Host cache MiB")
+    axes[1, 1].set_xticks(
+        resource_x,
+        [short_labels.get(item, item) for item in resources["strategy_id"]],
+        rotation=28,
+        ha="right",
+    )
+    axes[1, 1].set_ylabel("Peak physical GPU cache tokens")
+    host_axis.set_ylabel("Peak host cache (MiB)")
+    axes[1, 1].set_title("Storage pressure; annotations = wall time / evictions")
+    axes[1, 1].grid(axis="y", alpha=0.25)
+    for index, (_, row) in enumerate(resources.iterrows()):
+        axes[1, 1].text(
+            index,
+            0.97 * float(row["max_physical_cache_tokens"]),
+            f"{row['run_elapsed_seconds']:.0f}s / {int(row['family_evictions'])}",
+            ha="center",
+            va="top",
+            fontsize=7,
+            rotation=45,
+        )
+    handles1, labels1 = axes[1, 1].get_legend_handles_labels()
+    handles2, labels2 = host_axis.get_legend_handles_labels()
+    axes[1, 1].legend(handles1 + handles2, labels1 + labels2, frameon=False, loc="upper left")
+
+    fig.savefig(output_path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_prefix_structure_plot(prefix: pd.DataFrame, output_path: Path) -> None:
+    if prefix.empty:
+        return
+    order = [item[0] for item in PREFIX_METHODS]
+    frame = prefix.set_index("method_id").reindex(order).dropna(subset=["method_label"])
+    x = np.arange(len(frame))
+    labels = frame["method_label"].tolist()
+    colors = plt.get_cmap("Set2").colors[: len(frame)]
+    fig, axes = plt.subplots(2, 2, figsize=(11, 7), constrained_layout=True)
+    metrics = [
+        ("mean_chunks_per_prefix", "Mean chunks per prefix", "Chunks"),
+        ("mean_tokens_per_chunk", "Mean estimated tokens per chunk", "Tokens"),
+        ("natural_boundary_coverage", "Natural-boundary coverage", "Rate (%)"),
+        ("structural_token_coverage", "Structural reusable-token coverage", "Rate (%)"),
+    ]
+    for ax, (column, title, ylabel) in zip(axes.flat, metrics):
+        values = frame[column].to_numpy(dtype=float)
+        if "coverage" in column:
+            values *= 100.0
+        ax.bar(x, values, color=colors)
+        ax.set_xticks(x, labels, rotation=22, ha="right")
+        ax.set_title(title)
+        ax.set_ylabel(ylabel)
+        ax.grid(axis="y", alpha=0.25)
+        for index, value in enumerate(values):
+            suffix = "%" if "coverage" in column else ""
+            ax.text(index, value, f"{value:.1f}{suffix}", ha="center", va="bottom", fontsize=8)
+    fig.suptitle(f"{prefix['dataset_label'].iloc[0]}: offline prefix-splitting structure", fontsize=13)
+    fig.savefig(output_path, bbox_inches="tight")
+    plt.close(fig)
+
+
+def save_prefix_method_online_plot(prefix: pd.DataFrame, output_path: Path) -> None:
+    required = {
+        "runtime_request_hit_rate",
+        "runtime_token_hit_rate",
+        "runtime_ttft_speedup_percent",
+        "runtime_host_peak_mb",
+        "runtime_family_evictions",
+        "runtime_reusable_prefix_tokens",
+    }
+    if prefix.empty or not required.issubset(prefix.columns):
+        return
+    if prefix["runtime_ttft_speedup_percent"].isna().all():
+        return
+    order = [item[0] for item in PREFIX_METHODS]
+    frame = prefix.set_index("method_id").reindex(order).dropna(subset=["method_label"])
+    x = np.arange(len(frame))
+    labels = frame["method_label"].tolist()
+    colors = plt.get_cmap("tab10").colors[: len(frame)]
+    fig, axes = plt.subplots(2, 3, figsize=(15, 7.5), constrained_layout=True)
+    metrics = [
+        ("runtime_request_hit_rate", "Return request hit rate", "%", 100.0),
+        ("runtime_token_hit_rate", "Return prefix token coverage", "%", 100.0),
+        ("runtime_ttft_speedup_percent", "Online TTFT vs paired baseline", "%", 1.0),
+        ("runtime_host_peak_mb", "Host KV peak", "MiB", 1.0),
+        ("runtime_family_evictions", "Anchor-family evictions", "Count", 1.0),
+        ("runtime_reusable_prefix_tokens", "Total reusable prefix tokens", "Tokens", 1.0),
+    ]
+    for ax, (column, title, ylabel, scale) in zip(axes.flat, metrics):
+        values = pd.to_numeric(frame[column], errors="coerce").to_numpy(dtype=float) * scale
+        colors_for_values = colors[: len(values)]
+        ax.bar(x, values, color=colors_for_values)
+        ax.set_xticks(x, labels, rotation=22, ha="right")
+        ax.set_title(title)
+        ax.set_ylabel(ylabel)
+        ax.grid(axis="y", alpha=0.25)
+        if column == "runtime_ttft_speedup_percent":
+            ax.axhline(0.0, color="0.35", linewidth=0.8)
+        for index, value in enumerate(values):
+            if not np.isfinite(value):
+                continue
+            va = "bottom" if value >= 0 else "top"
+            ax.text(index, value, f"{value:.1f}", ha="center", va=va, fontsize=8)
+    fig.suptitle(
+        f"{prefix['dataset_label'].iloc[0]}: online prefix-method effects",
+        fontsize=13,
+    )
+    fig.savefig(output_path, bbox_inches="tight")
+    plt.close(fig)
+
+
 def markdown_table(frame: pd.DataFrame, columns: list[tuple[str, str, str]]) -> list[str]:
     headers = [label for _, label, _ in columns]
     lines = [
@@ -513,10 +1018,10 @@ def markdown_table(frame: pd.DataFrame, columns: list[tuple[str, str, str]]) -> 
             value = row.get(key, "")
             if fmt == "text":
                 values.append(str(value).replace("|", "\\|"))
+            elif fmt != "text" and (value is None or not math.isfinite(float(value))):
+                values.append("n/a")
             elif fmt == "int":
                 values.append(str(int(round(float(value)))))
-            elif fmt == "float" and not math.isfinite(float(value)):
-                values.append("n/a")
             elif fmt == "pct":
                 values.append(f"{100.0 * float(value):.1f}%")
             elif fmt == "pct_value":
@@ -529,11 +1034,233 @@ def markdown_table(frame: pd.DataFrame, columns: list[tuple[str, str, str]]) -> 
     return lines
 
 
+def write_dataset_outputs(
+    output_dir: Path,
+    snapshot: dict[str, Any],
+    summary: pd.DataFrame,
+    prefix_structure: pd.DataFrame,
+) -> None:
+    datasets_dir = output_dir / "datasets"
+    datasets_dir.mkdir(parents=True, exist_ok=True)
+    workloads_root = Path(snapshot["workloads_root"])
+    for dataset in snapshot["selected_datasets"]:
+        runtime = summary[summary["dataset"] == dataset].copy()
+        if runtime.empty:
+            continue
+        dataset_dir = datasets_dir / dataset
+        dataset_dir.mkdir(parents=True, exist_ok=True)
+        prefix = prefix_structure[prefix_structure["dataset"] == dataset].copy()
+        save_dataset_final_effect(runtime, dataset_dir / "final_effect.png")
+        save_prefix_structure_plot(prefix, dataset_dir / "prefix_split_structure.png")
+        save_prefix_method_online_plot(prefix, dataset_dir / "prefix_method_online_effect.png")
+
+        workload_summary_path = workloads_root / dataset / "summary.json"
+        workload = read_json(workload_summary_path) if workload_summary_path.is_file() else {}
+        runtime["host_peak_bytes"] = runtime["max_host_delta_bytes"] + runtime["max_host_full_bytes"]
+        preferred_order = {
+            "full_prefill": 0,
+            **{
+                item: index + 1
+                for index, item in enumerate(
+                    [
+                        "legacy_exact",
+                        "gpu_only_128",
+                        "gpu_host_full_128",
+                        "tiered_no_prefetch_128",
+                        "tiered_oracle_32",
+                        "tiered_oracle_64",
+                        "tiered_oracle_128",
+                        "tiered_oracle_256",
+                        "tiered_oracle_full",
+                        "tiered_disk_build_128",
+                        "tiered_disk_warm_128",
+                    ]
+                )
+            },
+        }
+        runtime["report_order"] = runtime["strategy_id"].map(preferred_order).fillna(99)
+        runtime = runtime.sort_values("report_order")
+        online = runtime[runtime["strategy_id"] != "full_prefill"]
+        best = online.loc[online["ttft_mean_ms"].idxmin()]
+        oracle = runtime[runtime["strategy_id"].isin(
+            [
+                "tiered_oracle_32",
+                "tiered_oracle_64",
+                "tiered_oracle_128",
+                "tiered_oracle_256",
+                "tiered_oracle_full",
+            ]
+        )].copy()
+        oracle["coverage"] = oracle["strategy_id"].map(
+            {
+                "tiered_oracle_32": "32 / 2 chunks",
+                "tiered_oracle_64": "64 / 2 chunks",
+                "tiered_oracle_128": "128 / 2 chunks",
+                "tiered_oracle_256": "256 / 2 chunks",
+                "tiered_oracle_full": "128 / full coverage",
+            }
+        )
+
+        findings = [
+            f"- 最低平均 TTFT 的非 full-prefill 策略是 **{best['strategy_label']}**："
+            f"{best['ttft_mean_ms']:.2f} ms，相对 matched full-prefill "
+            f"{best['ttft_speedup_percent']:+.1f}%。"
+        ]
+        full_rows = runtime[runtime["strategy_id"] == "tiered_oracle_full"]
+        limited_rows = runtime[runtime["strategy_id"] == "tiered_oracle_128"]
+        if not full_rows.empty and not limited_rows.empty:
+            full = full_rows.iloc[0]
+            limited = limited_rows.iloc[0]
+            delta_ms = float(full["ttft_mean_ms"] - limited["ttft_mean_ms"])
+            relation = "降低" if delta_ms < 0 else "增加"
+            findings.append(
+                f"- 完整覆盖 oracle 相对 128-token、最多两个 chunk 的 oracle "
+                f"{relation} {abs(delta_ms):.2f} ms；其 token 命中率为 "
+                f"{100.0 * full['prefix_token_hit_rate']:.1f}%。"
+            )
+        if not oracle.empty:
+            best_oracle = oracle.loc[oracle["ttft_mean_ms"].idxmin()]
+            findings.append(
+                f"- Oracle 系列中最低平均 TTFT 为 **{best_oracle['coverage']}** "
+                f"({best_oracle['ttft_mean_ms']:.2f} ms)。"
+            )
+
+        lines = [
+            f"# {DATASET_LABELS.get(dataset, dataset)} 实验结果",
+            "",
+            f"生成时间：{datetime.now(timezone.utc).isoformat()}",
+            "",
+            "## Workload",
+            "",
+            f"- 形式：`{workload.get('form', 'unknown')}`",
+            f"- 侧重点：{workload.get('focus', 'n/a')}",
+            f"- 请求数：{int(workload.get('requests', len(runtime)))}",
+            f"- 上下文数：{int(workload.get('contexts', 0))}",
+        ]
+        if workload.get("form") == "continuous":
+            lines.extend(
+                [
+                    f"- LoRA transition：{int(workload.get('lora_transitions', 0))}",
+                    f"- 同 LoRA transition rate：{100.0 * float(workload.get('same_lora_transition_rate', 0.0)):.1f}%",
+                    f"- gap 后返回 rate：{100.0 * float(workload.get('return_after_gap_rate', 0.0)):.1f}%",
+                ]
+            )
+        else:
+            lines.extend(
+                [
+                    f"- 并列复用次数：{int(workload.get('context_reuses', 0))}",
+                    f"- 请求级上下文复用率：{100.0 * float(workload.get('request_level_context_reuse_rate', 0.0)):.1f}%",
+                ]
+            )
+
+        lines.extend(["", "## 最终效果", "", "![Final effect](final_effect.png)", "", *findings])
+        lines.extend(["", "### Runtime 策略明细", ""])
+        lines.extend(
+            markdown_table(
+                runtime,
+                [
+                    ("strategy_label", "策略", "text"),
+                    ("ttft_mean_ms", "平均 TTFT (ms)", "float"),
+                    ("ttft_p95_ms", "p95 (ms)", "float"),
+                    ("ttft_speedup_percent", "相对 full-prefill", "pct_value"),
+                    ("prefix_token_hit_rate", "token 命中率", "pct"),
+                    ("request_hit_rate", "请求命中率", "pct"),
+                    ("max_physical_cache_tokens", "GPU token 峰值", "int"),
+                    ("host_peak_bytes", "Host 峰值 (MiB)", "mb"),
+                    ("family_evictions", "淘汰", "int"),
+                    ("run_elapsed_seconds", "cell wall time (s)", "float"),
+                ],
+            )
+        )
+        lines.extend(["", "### Oracle 覆盖与 chunk 对比", ""])
+        if not oracle.empty:
+            lines.extend(
+                markdown_table(
+                    oracle,
+                    [
+                        ("coverage", "切分 / 预取覆盖", "text"),
+                        ("ttft_mean_ms", "平均 TTFT (ms)", "float"),
+                        ("ttft_p95_ms", "p95 (ms)", "float"),
+                        ("ttft_speedup_percent", "speedup", "pct_value"),
+                        ("prefix_token_hit_rate", "token 命中率", "pct"),
+                        ("max_physical_cache_tokens", "GPU token 峰值", "int"),
+                        ("family_evictions", "淘汰", "int"),
+                    ],
+                )
+            )
+
+        lines.extend(
+            [
+                "",
+                "## 前缀切分方法：结构与在线效果",
+                "",
+                "![Prefix split structure](prefix_split_structure.png)",
+                "",
+                "> 结构指标来自真实请求文本的离线分析；下面的 Runtime 列来自同一 workload 的派生边界在线实验。"
+                "Fixed 64/128 表示 system/context 两类节点上限；Fixed 192/384 同理。"
+                "Sentence 以自然句边界按约 128 token 合并，Keyword 在标题/话语关键词处切分且上限约 192 token，"
+                "Reuse-aware 优先对齐历史 prefix 终点；运行时通过 prefix_segments 保留这些边界。",
+                "",
+            ]
+        )
+        if not prefix.empty and prefix["runtime_ttft_speedup_percent"].notna().any():
+            lines.extend(
+                [
+                    "![Prefix method online effect](prefix_method_online_effect.png)",
+                    "",
+                    "> TTFT 变化是相对同一派生 workload cell 内 full-prefill 的配对均值；`+/-` 为请求级 bootstrap 95% CI 半宽。",
+                    "",
+                ]
+            )
+        if not prefix.empty:
+            lines.extend(
+                markdown_table(
+                    prefix,
+                    [
+                        ("method_label", "方法", "text"),
+                        ("runtime_request_hit_rate", "Runtime 返回命中", "pct"),
+                        ("runtime_token_hit_rate", "Runtime token 覆盖", "pct"),
+                        ("ttft_change_display", "TTFT 变化", "text"),
+                        ("runtime_host_peak_mb", "Host KV 峰值 (MiB)", "float"),
+                        ("runtime_peak_nodes", "Runtime 节点峰值", "int"),
+                        ("runtime_family_evictions", "Anchor-family 淘汰", "int"),
+                        ("runtime_reusable_prefix_tokens", "可复用 prefix token", "int"),
+                        ("mean_chunks_per_prefix", "平均 chunk 数", "float"),
+                        ("mean_tokens_per_chunk", "平均 token/chunk", "float"),
+                        ("structural_token_coverage", "结构 token 覆盖", "pct"),
+                        ("complete_prefix_repeat_rate", "完整 prefix 重复", "pct"),
+                        ("natural_boundary_coverage", "自然边界覆盖", "pct"),
+                        ("unique_nodes", "唯一节点", "int"),
+                    ],
+                )
+            )
+        lines.extend(
+            [
+                "",
+                "## 解释边界",
+                "",
+                "- `oracle` 读取下一请求的真实 LoRA，只用于给预取上界定界。",
+                "- `oracle_full` 的 0 表示不限制每个 LoRA 的预取 chunk 数，不表示零预取。",
+                "- 物理 GGUF LoRA 与逻辑任务不匹配，本结果只衡量缓存、切换和 KV 路径。",
+                "- 30 条请求且每个 cell 一次运行，结论需要更多请求和重复运行验证。",
+                "",
+                "## 文件",
+                "",
+                f"- Runtime 原始结果：`../../runs/{dataset}/<strategy>/`",
+                "- 全局汇总：`../../aggregate_results.csv`",
+                "- 离线切分汇总：`../../prefix_structure_analysis.csv`",
+                "- 在线切分汇总：`../../prefix_method_results.csv`",
+            ]
+        )
+        (dataset_dir / "RESULTS.md").write_text("\n".join(lines) + "\n", encoding="utf-8")
+
+
 def write_report(
     output_dir: Path,
     snapshot: dict[str, Any],
     summary: pd.DataFrame,
     delta: pd.DataFrame,
+    prefix_structure: pd.DataFrame,
     failures: list[dict[str, Any]],
 ) -> None:
     strategy_meta = {item["id"]: item for item in snapshot["strategies"]}
@@ -561,16 +1288,7 @@ def write_report(
             axis=1,
         )
 
-    storage_ids = [
-        "full_prefill",
-        "legacy_exact",
-        "gpu_only_128",
-        "gpu_host_full_128",
-        "tiered_no_prefetch_128",
-        "tiered_oracle_128",
-        "tiered_disk_build_128",
-        "tiered_disk_warm_128",
-    ]
+    storage_ids = STORAGE_STRATEGY_IDS
     storage = summary[summary["strategy_id"].isin(storage_ids)].copy()
     storage_mean = (
         storage.groupby(["strategy_id", "strategy_label"], as_index=False)
@@ -596,6 +1314,42 @@ def write_report(
     chunk = summary[summary["category"] == "chunk"].copy()
     chunk = chunk.sort_values(["dataset", "chunk_tokens"])
     disk = summary[summary["category"] == "disk"].copy()
+    prefix_mean = pd.DataFrame()
+    if not prefix_structure.empty:
+        prefix_mean = (
+            prefix_structure.groupby(["method_id", "method_label"], as_index=False)
+            .agg(
+                mean_chunks_per_prefix=("mean_chunks_per_prefix", "mean"),
+                mean_tokens_per_chunk=("mean_tokens_per_chunk", "mean"),
+                structural_request_hit_rate=("structural_request_hit_rate", "mean"),
+                structural_token_coverage=("structural_token_coverage", "mean"),
+                complete_prefix_repeat_rate=("complete_prefix_repeat_rate", "mean"),
+                natural_boundary_coverage=("natural_boundary_coverage", "mean"),
+                unique_nodes=("unique_nodes", "mean"),
+                runtime_request_hit_rate=("runtime_request_hit_rate", "mean"),
+                runtime_token_hit_rate=("runtime_token_hit_rate", "mean"),
+                runtime_ttft_speedup_percent=("runtime_ttft_speedup_percent", "mean"),
+                runtime_ttft_ci95_half_percent=("runtime_ttft_ci95_half_percent", "mean"),
+                runtime_host_peak_mb=("runtime_host_peak_mb", "mean"),
+                runtime_peak_nodes=("runtime_peak_nodes", "mean"),
+                runtime_family_evictions=("runtime_family_evictions", "sum"),
+                runtime_reusable_prefix_tokens=("runtime_reusable_prefix_tokens", "mean"),
+            )
+        )
+        prefix_mean["order"] = prefix_mean["method_id"].map(
+            {item[0]: index for index, item in enumerate(PREFIX_METHODS)}
+        )
+        prefix_mean = prefix_mean.sort_values("order")
+        prefix_mean["ttft_change_display"] = prefix_mean.apply(
+            lambda row: (
+                f"{float(row['runtime_ttft_speedup_percent']):+.2f}% +/- "
+                f"{float(row['runtime_ttft_ci95_half_percent']):.2f}"
+                if math.isfinite(float(row["runtime_ttft_speedup_percent"]))
+                and math.isfinite(float(row["runtime_ttft_ci95_half_percent"]))
+                else "n/a"
+            ),
+            axis=1,
+        )
 
     def one_row(dataset: str, strategy_id: str) -> pd.Series | None:
         rows = summary[
@@ -679,6 +1433,21 @@ def write_report(
             "可压缩性或重建精度不能替代端到端延迟测量。"
         )
 
+    oracle_full = summary[summary["strategy_id"] == "tiered_oracle_full"]
+    oracle_limited = summary[summary["strategy_id"] == "tiered_oracle_128"]
+    if not oracle_full.empty and not oracle_limited.empty:
+        merged = oracle_full[["dataset", "ttft_mean_ms"]].merge(
+            oracle_limited[["dataset", "ttft_mean_ms"]],
+            on="dataset",
+            suffixes=("_full", "_limited"),
+        )
+        improved = int((merged["ttft_mean_ms_full"] < merged["ttft_mean_ms_limited"]).sum())
+        interpretation.append(
+            f"- `oracle_full` 在 {improved}/{len(merged)} 个数据集上低于 128-token、"
+            "最多两个 chunk 的 oracle。它把“预取覆盖不足”和“完整 KV 构建/迁移成本”分开，"
+            "但仍是使用真实下一 LoRA 的理论上界。"
+        )
+
     lines = [
         "# Test6 真实数据集三级缓存与前缀切分实验",
         "",
@@ -689,6 +1458,7 @@ def write_report(
         "本实验在同一套真实请求上比较无缓存 full-prefill、旧版 exact-prefix、GPU-only、GPU + host full，以及包含 GPU full KV、host full/Q8 delta 和磁盘 delta store 的分层策略。连续数据用于观察逐轮增长和 LoRA 返回，并列数据用于观察同一 prefix 下的跨 LoRA 复用。",
         "",
         "> `oracle` 策略使用下一请求的真实 LoRA 作为预取上界，不代表线上可达到的预测精度。物理 GGUF LoRA 仅用于系统切换实验，并未针对这些逻辑任务训练。",
+        "> `oracle_full` 使用 128-token 节点并将 `max-prefetch-chunks-per-lora=0`，其中 0 表示不限制预取节点数；普通 oracle 策略最多预取两个节点。",
         "",
         "## 实验配置",
         "",
@@ -714,6 +1484,7 @@ def write_report(
         description = (
             f"system-v2={options.get('system-v2')}, chunk={options.get('prefix-chunk-tokens')}, "
             f"cross-LoRA={options.get('cross-lora-policy')}, prefetch={options.get('prefetch-policy')}, "
+            f"max-prefetch={options.get('max-prefetch-chunks-per-lora', snapshot['common_options'].get('max-prefetch-chunks-per-lora'))}, "
             f"disk={options.get('delta-store-policy')}"
         )
         lines.append(
@@ -847,6 +1618,43 @@ def write_report(
     lines.extend(
         [
             "",
+            "### 前缀切分方法：结构与在线效果",
+            "",
+            "> 结构列来自真实文本离线分析；Runtime 列来自将同一边界写入 `prefix_segments` 后的 llama.cpp 在线实验，五种方法使用相同 oracle 预取和三级存储配置。",
+            "> Fixed A/B 分别限制 system/context 节点；Sentence 约 128 token 并对齐句界，Keyword 约 192 token 并在标题/话语关键词处切分，Reuse-aware 优先对齐历史 prefix 终点。",
+            "",
+        ]
+    )
+    if not prefix_mean.empty:
+        lines.extend(
+            markdown_table(
+                prefix_mean,
+                [
+                    ("method_label", "方法", "text"),
+                    ("runtime_request_hit_rate", "Runtime 返回命中", "pct"),
+                    ("runtime_token_hit_rate", "Runtime token 覆盖", "pct"),
+                    ("ttft_change_display", "平均 TTFT 变化", "text"),
+                    ("runtime_host_peak_mb", "平均 Host KV 峰值 (MiB)", "float"),
+                    ("runtime_peak_nodes", "平均节点峰值", "float"),
+                    ("runtime_family_evictions", "总淘汰", "int"),
+                    ("mean_chunks_per_prefix", "平均 chunk 数", "float"),
+                    ("mean_tokens_per_chunk", "平均 token/chunk", "float"),
+                    ("structural_token_coverage", "结构 token 覆盖", "pct"),
+                    ("complete_prefix_repeat_rate", "完整 prefix 重复", "pct"),
+                    ("natural_boundary_coverage", "自然边界覆盖", "pct"),
+                    ("unique_nodes", "平均唯一节点", "float"),
+                ],
+            )
+        )
+
+    lines.extend(["", "### 各数据集独立报告", ""])
+    for dataset in snapshot["selected_datasets"]:
+        label = DATASET_LABELS.get(dataset, dataset)
+        lines.append(f"- [{label}](datasets/{dataset}/RESULTS.md)")
+
+    lines.extend(
+        [
+            "",
             "## 如何解释这些结果",
             "",
             *interpretation,
@@ -865,6 +1673,9 @@ def write_report(
             "- `aggregate_results.csv`：每个 dataset/strategy 的汇总指标。",
             "- `request_results.csv`：请求级 online 与配对 full-prefill 指标。",
             "- `delta_quality.csv`：OPUS-100/XSum exact-prefix pair 的离线 delta 质量。",
+            "- `prefix_structure_analysis.csv`：五种切分方法的离线结构指标。",
+            "- `prefix_method_results.csv`：五种切分方法的在线 TTFT、返回命中、Host KV 和淘汰指标。",
+            "- `datasets/<dataset>/`：每个数据集的独立 Markdown 和两张效果图。",
             "- `runs/<dataset>/<strategy>/`：运行日志、完整 CSV、缓存树和参数快照。",
         ]
     )
@@ -896,6 +1707,9 @@ def main() -> int:
     failures: list[dict[str, Any]] = []
     for path in sorted((args.output_dir / "runs").glob("*/*/run_manifest.json")):
         manifest = read_json(path)
+        # Prefix-method cells are auxiliary runs merged from prefix_method_results.csv.
+        if manifest.get("strategy_id") not in strategy_by_id:
+            continue
         if manifest.get("status") == "ok":
             manifests.append(manifest)
         else:
@@ -934,6 +1748,40 @@ def main() -> int:
     requests.to_csv(args.output_dir / "request_results.csv", index=False)
     delta = collect_delta_quality(manifests)
     delta.to_csv(args.output_dir / "delta_quality.csv", index=False)
+    prefix_structure = analyze_prefix_structure(snapshot)
+    for column in PREFIX_RUNTIME_COLUMNS:
+        if column not in prefix_structure:
+            prefix_structure[column] = np.nan
+    prefix_method_results_path = args.output_dir / "prefix_method_results.csv"
+    if prefix_method_results_path.is_file() and prefix_method_results_path.stat().st_size:
+        method_results = pd.read_csv(prefix_method_results_path)
+        merge_columns = [
+            "dataset",
+            "method_id",
+            *[column for column in PREFIX_RUNTIME_COLUMNS if column != "ttft_change_display"],
+        ]
+        available = [column for column in merge_columns if column in method_results.columns]
+        prefix_structure = prefix_structure.drop(
+            columns=[column for column in available if column not in {"dataset", "method_id"}],
+            errors="ignore",
+        ).merge(method_results[available], on=["dataset", "method_id"], how="left")
+        for column in PREFIX_RUNTIME_COLUMNS:
+            if column not in prefix_structure:
+                prefix_structure[column] = np.nan
+    prefix_structure["ttft_change_display"] = prefix_structure.apply(
+        lambda row: (
+            f"{float(row['runtime_ttft_speedup_percent']):+.2f}% +/- "
+            f"{float(row['runtime_ttft_ci95_half_percent']):.2f}"
+            if math.isfinite(float(row["runtime_ttft_speedup_percent"]))
+            and math.isfinite(float(row["runtime_ttft_ci95_half_percent"]))
+            else "n/a"
+        ),
+        axis=1,
+    )
+    prefix_structure.to_csv(
+        args.output_dir / "prefix_structure_analysis.csv",
+        index=False,
+    )
 
     figures_dir = args.output_dir / "figures"
     figures_dir.mkdir(parents=True, exist_ok=True)
@@ -943,11 +1791,25 @@ def main() -> int:
     save_storage_ablation(summary_frame, figures_dir)
     save_resource_tradeoff(summary_frame, figures_dir)
     save_delta_quality(delta, figures_dir)
-    write_report(args.output_dir, snapshot, summary_frame, delta, failures)
+    write_dataset_outputs(
+        args.output_dir,
+        snapshot,
+        summary_frame,
+        prefix_structure,
+    )
+    write_report(
+        args.output_dir,
+        snapshot,
+        summary_frame,
+        delta,
+        prefix_structure,
+        failures,
+    )
 
     print(
         f"test6 analysis complete: runs={len(manifests)} "
-        f"aggregate_rows={len(summary_frame)} output={args.output_dir}"
+        f"aggregate_rows={len(summary_frame)} prefix_rows={len(prefix_structure)} "
+        f"output={args.output_dir}"
     )
     return 0
 

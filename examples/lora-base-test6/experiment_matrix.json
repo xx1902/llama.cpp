@@ -170,6 +170,25 @@
       }
     },
     {
+      "id": "tiered_oracle_full",
+      "label": "Tiered oracle / full coverage",
+      "category": "oracle_full",
+      "options": {
+        "system-v2": 1,
+        "prefix-chunk-tokens": 128,
+        "system-chunk-tokens": 128,
+        "context-chunk-tokens": 128,
+        "cross-lora-policy": "deferred",
+        "max-host-delta-mb": 256,
+        "max-host-full-mb": 512,
+        "prefetch-policy": "oracle",
+        "prefetch-storage": "auto",
+        "max-prefetch-chunks-per-lora": 0,
+        "delta-store-policy": "none",
+        "background-policy": "unlimited"
+      }
+    },
+    {
       "id": "tiered_disk_build_128",
       "label": "Tiered disk cold-build / 128",
       "category": "disk",
