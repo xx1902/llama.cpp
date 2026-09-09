@@ -6,9 +6,9 @@ report. Reusing the runtime keeps the GPU full-KV, host full/Q8-delta, disk
 delta-store, prefix-tree, and CUDA overlap paths identical to the implementation
 already exercised by test4 and test5.
 
-The default matrix covers the five real 30-request workloads:
+The default matrix covers six real 100-request workloads:
 
-- MSC, Taskmaster, and LMSYS continuous growing-prefix traces;
+- MSC, Taskmaster, LMSYS, and ShareGPT52K continuous growing-prefix traces;
 - OPUS-100 and XSum exact shared-prefix parallel traces.
 
 It compares full-prefill and legacy exact-prefix baselines with GPU-only,
@@ -18,11 +18,10 @@ GPU-plus-host-full, tiered no-prefetch, oracle-prefetched fixed chunks of
 prefetch is an upper bound, not a deployable predictor result; `0` means
 unlimited chunk coverage, not zero prefetch.
 
-The default matrix uses `n_ctx=65536` and a 61440-token cache budget. The MSC
-30-request trace reaches about 42K physical cached tokens because growing
-prefix nodes can hold several LoRA variants. Smaller budgets produced
-`foreground_capacity_failed` rows. The runner treats any failed mode or
-non-positive online TTFT as a failed cell instead of aggregating it.
+The default matrix uses `n_ctx=65536` and a 61440-token cache budget. Growing
+prefix nodes can hold several LoRA variants, so the 100-request traces may
+trigger capacity eviction. The runner treats any failed mode or non-positive
+online TTFT as a failed cell instead of aggregating it.
 
 ## Build
 
@@ -39,7 +38,7 @@ D:\anaconda\envs\qwen2.5_vl\python.exe `
 
 Use `--quick` for a five-request smoke run, `--force` to rerun completed cells,
 and comma-separated `--datasets` or `--strategies` filters for a subset. The
-runner stores complete commands and logs under `output/real_30_matrix/runs` and
+runner stores complete commands and logs under `output/real_100_matrix/runs` and
 then invokes `analyze_results.py`.
 
 The analyzer writes:

@@ -65,11 +65,11 @@ Useful overrides include `--request-count`, `--time-step-min`, `--user-id`,
 `--session-id`, and `--output-dir`. `--request-count` must be even because the
 parallel construction emits two requests per context.
 
-## Real-content 30-request workloads
+## Real-content workloads
 
-`build_real_workloads.py` constructs one initial workload from each downloaded
-dataset. The assignment follows the structure naturally available in each
-source:
+`build_real_workloads.py` constructs one workload from each downloaded dataset.
+The request count is configurable; the default remains 30 for compatibility.
+The assignment follows the structure naturally available in each source:
 
 | Dataset | Construction | Experimental focus |
 |---|---|---|
@@ -78,15 +78,16 @@ source:
 | LMSYS-33K | continuous | ordinary multi-turn chat baseline |
 | OPUS-100 | parallel | one short English source sent to two language roles |
 | XSum | parallel | one full article sent to summary, QA, and headline roles |
+| ShareGPT52K | continuous | real multi-turn chat with append-only history |
 
-Every workload contains 30 requests. Dataset utterances, translations,
+Every workload contains the requested number of requests. Dataset utterances, translations,
 articles, and `reference_response` values are real downloaded records; only
 the experiment task instructions are constructed. The `logical_lora_role`
 field describes the intended experimental role. The physical GGUF in
 `adapter_path` comes from the LSApp routing setup and is used only to exercise
 LoRA switching. It is not claimed to be trained for the logical role.
 
-Generate all five workloads from the repository root with the Python
+Generate the default 30-request workloads from the repository root with the Python
 environment that provides `datasets` and `pyarrow`:
 
 ```powershell
@@ -130,3 +131,33 @@ build/bin/Release/llama-lora-base-test5.exe `
 Start inspection with `output/real_30/preview.md`; each workload's
 `summary.json` records selected source IDs, context reuse, LoRA transitions,
 and validation status.
+
+### Generate the 100-request set
+
+First create a 100-step LSApp-derived route using the same five-minute duration
+slicing rule:
+
+```powershell
+D:\anaconda\envs\qwen2.5_vl\python.exe `
+  examples/lora-base-datasets/build_lsapp_requests.py `
+  --request-count 100 `
+  --output-dir examples/lora-base-datasets/output/lsapp_100
+```
+
+Then construct the six real-data workloads, including ShareGPT52K:
+
+```powershell
+D:\anaconda\envs\qwen2.5_vl\python.exe `
+  examples/lora-base-datasets/build_real_workloads.py `
+  --request-count 100 `
+  --route-jsonl examples/lora-base-datasets/output/lsapp_100/source_trace_100.jsonl `
+  --lora-groups-json D:\ecnu_experiment\datasets\mobilora_workloads_87_original\lora_groups.json `
+  --output-dir examples/lora-base-datasets/output/real_100
+```
+
+`output/real_100/DATASET_CONSTRUCTION.md` documents the source filters,
+continuous/parallel construction algorithms, and request-level reuse rates.
+The generated `summary.json` files also record context reaccess, exact-prefix
+repeat, same-LoRA reread, switched-LoRA reread, return-after-gap, and
+append-only growth rates. These are workload opportunities, not runtime KV-hit
+rates.

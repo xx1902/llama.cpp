@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run online TTFT experiments for the five prefix-boundary methods."""
+"""Run test7 online TTFT experiments for the five prefix-boundary methods."""
 
 from __future__ import annotations
 
@@ -14,10 +14,12 @@ import pandas as pd
 
 from analyze_results import (
     DATASET_LABELS,
+    PREFIX_METHOD_CATALOG,
     PREFIX_METHODS,
+    build_causal_lora_focus_profiles,
     bootstrap_mean_ci,
     read_jsonl,
-    split_prefix,
+    split_prefix_experiment_method,
 )
 from run_experiments import DEFAULT_BINARY, run_cell
 
@@ -42,6 +44,8 @@ def build_method_workload(
     destination_dir: Path,
     method_id: str,
     request_limit: int,
+    context_reaccess_rate: float = 0.0,
+    exact_prefix_rate: float = 0.0,
 ) -> None:
     if destination_dir.exists():
         shutil.rmtree(destination_dir)
@@ -50,6 +54,7 @@ def build_method_workload(
     destination_path = destination_dir / "grouped" / "grouped_requests.jsonl"
     rows = read_jsonl(source_path)
     rows = rows[:request_limit]
+    lora_focus_profiles = build_causal_lora_focus_profiles(rows)
     prefixes_by_context: dict[str, list[str]] = {}
     for row in rows:
         context_id = str(row.get("context_id", ""))
@@ -58,7 +63,7 @@ def build_method_workload(
         )
 
     output_rows: list[dict[str, Any]] = []
-    for row in rows:
+    for row_index, row in enumerate(rows):
         context_id = str(row.get("context_id", ""))
         text = str(row.get("common_prefix_text", ""))
         reuse_points = {
@@ -66,7 +71,14 @@ def build_method_workload(
             for prefix in prefixes_by_context.get(context_id, [])
             if len(prefix) < len(text) and text.startswith(prefix)
         }
-        chunks = split_prefix(row, method_id, reuse_points)
+        chunks, chunk_roles = split_prefix_experiment_method(
+            row,
+            method_id,
+            reuse_points,
+            context_reaccess_rate=context_reaccess_rate,
+            exact_prefix_rate=exact_prefix_rate,
+            lora_focus_profile=lora_focus_profiles[row_index],
+        )
         updated = dict(row)
         # A large runtime step makes each precomputed boundary one node.
         updated["prefix_segments"] = [
@@ -75,6 +87,7 @@ def build_method_workload(
         updated["prefix_segment_types"] = ["prefix_method"] * len(chunks)
         updated["prefix_method"] = method_id
         updated["prefix_method_chunk_count"] = len(chunks)
+        updated["prefix_method_chunk_roles"] = chunk_roles
         output_rows.append(updated)
 
     destination_path.parent.mkdir(parents=True, exist_ok=True)
@@ -91,6 +104,29 @@ def numeric(frame: pd.DataFrame, column: str) -> pd.Series:
 
 def summarize_method_run(manifest: dict[str, Any], method_id: str, method_label: str) -> dict[str, Any]:
     run_dir = Path(manifest["run_dir"])
+    if manifest.get("status") != "ok":
+        return {
+            "dataset": manifest.get("dataset", ""),
+            "dataset_label": DATASET_LABELS.get(
+                str(manifest.get("dataset", "")), str(manifest.get("dataset", ""))
+            ),
+            "method_id": method_id,
+            "method_label": method_label,
+            "runtime_requests": 0,
+            "runtime_request_hit_rate": np.nan,
+            "runtime_token_hit_rate": np.nan,
+            "runtime_ttft_speedup_percent": np.nan,
+            "runtime_ttft_ci95_low_percent": np.nan,
+            "runtime_ttft_ci95_high_percent": np.nan,
+            "runtime_ttft_ci95_half_percent": np.nan,
+            "runtime_host_peak_mb": np.nan,
+            "runtime_peak_nodes": np.nan,
+            "runtime_family_evictions": np.nan,
+            "runtime_reusable_prefix_tokens": np.nan,
+            "run_elapsed_seconds": float(manifest.get("elapsed_seconds", 0.0)),
+            "status": manifest.get("status", "failed"),
+            "error": manifest.get("error", "unknown failure"),
+        }
     frame = pd.read_csv(run_dir / "online_request_results.csv")
     baseline = frame[frame["benchmark"] == "baseline"].copy()
     online = frame[frame["benchmark"] == "online"].copy()
@@ -125,10 +161,10 @@ def summarize_method_run(manifest: dict[str, Any], method_id: str, method_label:
         "runtime_requests": int(len(online)),
         "runtime_request_hit_rate": float(np.mean(reused_tokens > 0)) if len(online) else 0.0,
         "runtime_token_hit_rate": float(reused_tokens.sum() / max(1.0, prefix_tokens.sum())),
-        "runtime_ttft_speedup_percent": float(
-            100.0 * (numeric(baseline, "ttft_ms").mean() - numeric(online, "ttft_ms").mean())
-            / max(1e-9, numeric(baseline, "ttft_ms").mean())
-        ),
+        # Keep the point estimate consistent with the request-paired bootstrap
+        # interval above. A ratio of aggregate means can otherwise fall
+        # outside its paired-request confidence interval.
+        "runtime_ttft_speedup_percent": float(np.mean(relative_speedup)),
         "runtime_ttft_ci95_low_percent": ci_low,
         "runtime_ttft_ci95_high_percent": ci_high,
         "runtime_ttft_ci95_half_percent": 0.5 * (ci_high - ci_low),
@@ -150,16 +186,40 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--matrix", type=Path, default=DEFAULT_MATRIX)
     parser.add_argument("--workloads-root", type=Path, default=DEFAULT_WORKLOADS_ROOT)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument(
+        "--datasets",
+        type=lambda value: [item.strip() for item in value.split(",") if item.strip()],
+        help="Comma-separated workload directory names (default: all datasets)",
+    )
     parser.add_argument("--request-limit", type=int, default=100)
     parser.add_argument("--timeout-seconds", type=int, default=1800)
     parser.add_argument("--force", action="store_true")
+    parser.add_argument(
+        "--methods",
+        type=lambda value: [item.strip() for item in value.split(",") if item.strip()],
+        help="Comma-separated method IDs (default: all v1 methods)",
+    )
+    parser.add_argument(
+        "--continue-on-failure",
+        action="store_true",
+        help="Record failed cells and continue with the remaining dataset/method pairs",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
     matrix = read_json(args.matrix)
-    datasets = list(matrix["datasets"])
+    datasets = args.datasets or list(matrix["datasets"])
+    unknown = sorted(set(datasets) - set(matrix["datasets"]))
+    if unknown:
+        raise ValueError(f"unknown datasets: {unknown}")
+    method_catalog = PREFIX_METHOD_CATALOG
+    method_labels = dict(method_catalog)
+    methods = args.methods or [item[0] for item in PREFIX_METHODS]
+    unknown_methods = sorted(set(methods) - set(method_labels))
+    if unknown_methods:
+        raise ValueError(f"unknown methods: {unknown_methods}")
     derived_root = args.output_dir / "prefix_method_workloads"
     run_root = args.output_dir
     rows: list[dict[str, Any]] = []
@@ -178,11 +238,26 @@ def main() -> int:
         "background-policy": "unlimited",
     }
 
-    for method_id, method_label in PREFIX_METHODS:
+    for method_id in methods:
+        method_label = method_labels[method_id]
         for dataset in datasets:
             source_dir = args.workloads_root / dataset
             destination_dir = derived_root / method_id / dataset
-            build_method_workload(source_dir, destination_dir, method_id, args.request_limit)
+            summary_path = source_dir / "summary.json"
+            summary = read_json(summary_path) if summary_path.is_file() else {}
+            build_method_workload(
+                source_dir,
+                destination_dir,
+                method_id,
+                args.request_limit,
+                context_reaccess_rate=float(
+                    summary.get(
+                        "request_level_context_reuse_rate",
+                        summary.get("request_level_context_reaccess_rate", 0.0),
+                    )
+                ),
+                exact_prefix_rate=float(summary.get("request_level_exact_prefix_reuse_rate", 0.0)),
+            )
             strategy = {
                 "id": f"prefix_method_{method_id}",
                 "label": f"Prefix method / {method_label}",
@@ -200,7 +275,7 @@ def main() -> int:
                 timeout_seconds=args.timeout_seconds,
                 force=args.force,
             )
-            if manifest.get("status") != "ok":
+            if manifest.get("status") != "ok" and not args.continue_on_failure:
                 raise RuntimeError(
                     f"prefix method cell failed: {method_id}/{dataset}: {manifest.get('error', '')}"
                 )

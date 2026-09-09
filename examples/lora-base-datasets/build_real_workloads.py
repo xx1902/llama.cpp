@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build five 30-request workloads from locally downloaded real datasets.
+"""Build configurable request workloads from locally downloaded real datasets.
 
 The logical task or language attached to a request is deliberately separate
 from the physical GGUF adapter used to exercise the LoRA runtime. The adapters
@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import copy
 import hashlib
+import html
 import json
 import math
 import re
@@ -64,6 +65,11 @@ WORKLOADS = {
         "dataset": "XSum",
         "form": "parallel",
         "focus": "same article dispatched to summary, QA, and rewrite LoRAs",
+    },
+    "sharegpt_continuous": {
+        "dataset": "ShareGPT52K",
+        "form": "continuous",
+        "focus": "general multi-turn chat with append-only conversation history",
     },
 }
 
@@ -129,11 +135,11 @@ def route_arrival_ms(route: list[dict[str, Any]], index: int) -> int:
 
 
 def load_adapter_inputs(
-    route_path: Path, groups_path: Path
+    route_path: Path, groups_path: Path, request_count: int
 ) -> tuple[list[dict[str, Any]], dict[int, dict[str, Any]]]:
     route = read_jsonl(route_path)
-    if len(route) < REQUEST_COUNT:
-        raise ValueError(f"LSApp route has {len(route)} rows; {REQUEST_COUNT} are required")
+    if len(route) < request_count:
+        raise ValueError(f"LSApp route has {len(route)} rows; {request_count} are required")
 
     groups = read_json(groups_path)
     catalog = {
@@ -141,10 +147,10 @@ def load_adapter_inputs(
         for entries in groups.values()
         for entry in entries
     }
-    missing = sorted({int(row["lora_id"]) for row in route[:REQUEST_COUNT]} - set(catalog))
+    missing = sorted({int(row["lora_id"]) for row in route[:request_count]} - set(catalog))
     if missing:
         raise ValueError(f"LoRAs missing from source lora_groups.json: {missing}")
-    return route[:REQUEST_COUNT], catalog
+    return route[:request_count], catalog
 
 
 def build_lora_groups(
@@ -253,13 +259,78 @@ def add_continuous_reuse_metadata(requests: list[dict[str, Any]]) -> dict[str, A
         previous_hash_by_context[context_id] = request["common_prefix_hash"]
         seen.add(lora_id)
 
-    return {
+    summary = {
         "contexts": len({request["context_id"] for request in requests}),
         "lora_transitions": transitions,
         "same_lora_transitions": same_lora,
         "same_lora_transition_rate": same_lora / transitions if transitions else 0.0,
         "return_after_gap_transitions": returns,
         "return_after_gap_rate": returns / transitions if transitions else 0.0,
+    }
+    summary.update(add_reuse_statistics(requests))
+    return summary
+
+
+def add_reuse_statistics(requests: list[dict[str, Any]]) -> dict[str, Any]:
+    """Annotate and summarize reuse opportunities in arrival order."""
+    previous_by_context: dict[str, dict[str, Any]] = {}
+    seen_loras_by_context: dict[str, set[int]] = {}
+    seen_prefixes_by_context: dict[str, set[str]] = {}
+    context_reaccesses = 0
+    exact_prefix_reuses = 0
+    same_lora_rereads = 0
+    switched_lora_rereads = 0
+    any_prior_same_lora = 0
+    append_only_extensions = 0
+
+    for request in requests:
+        context_id = str(request["context_id"])
+        lora_id = int(request["lora_id"])
+        prefix_hash = str(request["common_prefix_hash"])
+        previous = previous_by_context.get(context_id)
+        seen_loras = seen_loras_by_context.setdefault(context_id, set())
+        seen_prefixes = seen_prefixes_by_context.setdefault(context_id, set())
+        reaccess = previous is not None
+        exact_repeat = prefix_hash in seen_prefixes
+        same_previous = reaccess and int(previous["lora_id"]) == lora_id
+        switched_previous = reaccess and not same_previous
+        prior_same = lora_id in seen_loras
+        append_only = bool(
+            reaccess
+            and str(request["common_prefix_text"]).startswith(str(previous["prompt"]))
+        )
+
+        request["context_seen_before"] = reaccess
+        request["exact_prefix_seen_before_in_context"] = exact_repeat
+        request["same_lora_as_previous_in_context"] = same_previous
+        request["switched_lora_on_context_reread"] = switched_previous
+        request["same_lora_seen_before_in_context"] = prior_same
+        request["append_only_from_previous_context_request"] = append_only
+
+        context_reaccesses += int(reaccess)
+        exact_prefix_reuses += int(exact_repeat)
+        same_lora_rereads += int(same_previous)
+        switched_lora_rereads += int(switched_previous)
+        any_prior_same_lora += int(reaccess and prior_same)
+        append_only_extensions += int(append_only)
+        previous_by_context[context_id] = request
+        seen_loras.add(lora_id)
+        seen_prefixes.add(prefix_hash)
+
+    request_count = len(requests)
+    return {
+        "context_reaccesses": context_reaccesses,
+        "request_level_context_reaccess_rate": context_reaccesses / max(1, request_count),
+        "exact_prefix_reuses_in_context": exact_prefix_reuses,
+        "request_level_exact_prefix_reuse_rate": exact_prefix_reuses / max(1, request_count),
+        "same_lora_context_rereads": same_lora_rereads,
+        "same_lora_context_reread_rate": same_lora_rereads / max(1, context_reaccesses),
+        "switched_lora_context_rereads": switched_lora_rereads,
+        "switched_lora_context_reread_rate": switched_lora_rereads / max(1, context_reaccesses),
+        "prior_same_lora_context_rereads": any_prior_same_lora,
+        "prior_same_lora_context_reread_rate": any_prior_same_lora / max(1, context_reaccesses),
+        "append_only_extensions": append_only_extensions,
+        "append_only_extension_rate": append_only_extensions / max(1, context_reaccesses),
     }
 
 
@@ -277,9 +348,12 @@ def build_msc(
     datasets_dir: Path,
     route: list[dict[str, Any]],
     catalog: dict[int, dict[str, Any]],
+    request_count: int = REQUEST_COUNT,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any], dict[str, list[dict[str, Any]]]]:
     source = datasets_dir / "msc" / "msc" / "msc" / "msc_dialogue" / "session_5" / "valid.txt"
-    selected: dict[str, Any] | None = None
+    selected: list[dict[str, Any]] = []
+    available_pairs = 0
+    target_pairs_per_record = min(30, request_count)
     with source.open(encoding="utf-8") as file:
         for line in file:
             record = json.loads(line)
@@ -287,71 +361,79 @@ def build_msc(
                 {"dialog": record.get("dialog", []), "time_back": "current session"}
             ]
             pair_count = sum(len(alternating_pairs(session["dialog"])) for session in sessions)
-            if pair_count >= REQUEST_COUNT:
-                selected = record
+            if pair_count < target_pairs_per_record:
+                continue
+            selected.append(record)
+            available_pairs += pair_count
+            if available_pairs >= request_count:
                 break
-    if selected is None:
-        raise ValueError("MSC validation split contains no five-session record with 30 pairs")
+    if available_pairs < request_count:
+        raise ValueError(f"MSC validation split produced only {available_pairs} pairs")
 
-    source_id = str(selected["metadata"]["initial_data_id"])
-    sessions = list(selected["previous_dialogs"]) + [
-        {"dialog": selected["dialog"], "time_back": "current session", "time_num": 0, "time_unit": ""}
-    ]
-    persona_groups = selected.get("init_personas") or selected.get("personas") or []
-    persona_text = "Participant profiles:\n" + "\n".join(
-        f"Participant {group_index + 1}: " + " ".join(clean_text(item) for item in group)
-        for group_index, group in enumerate(persona_groups)
-    ) + "\n"
     system = (
         "Continue this long-term conversation naturally. Use the participant profiles "
         "and all available earlier sessions when answering the current user.\n"
     )
-    history = ""
     requests: list[dict[str, Any]] = []
-    selected_session_counts: Counter[int] = Counter()
+    selected_session_counts: Counter[str] = Counter()
+    selected_source_ids: list[str] = []
 
-    for session_index, session in enumerate(sessions, start=1):
-        time_back = clean_text(session.get("time_back")) or "unspecified gap"
-        history += f"[Session {session_index} begins; source time gap: {time_back}]\n"
-        for turn_index, user_text, assistant_text in alternating_pairs(session["dialog"]):
-            if len(requests) == REQUEST_COUNT:
-                break
-            request_id = len(requests)
-            route_meta = route_metadata(route, catalog, request_id)
-            segments = [
-                {"type": "shared_system", "text": system},
-                {"type": "persona_context", "text": persona_text},
-            ]
-            if history:
-                segments.append({"type": "conversation_history", "text": history})
-            task = f"User: {user_text}\nAssistant:"
-            requests.append(
-                make_request(
-                    request_id=request_id,
-                    experiment="msc_multi_session_continuous",
-                    group_name="msc_lsapp_route",
-                    context_id=f"msc_{source_id}",
-                    source_dataset="MSC session_5 valid",
-                    segments=segments,
-                    task=task,
-                    reference_response=assistant_text,
-                    lora_id=route_meta["lora_id"],
-                    lora_name=route_meta["lora_name"],
-                    adapter_path=route_meta["adapter_path"],
-                    arrival_ms=route_meta["arrival_ms"],
-                    logical_role="long_term_persona_chat",
-                    extra={
-                        **route_meta,
-                        "source_record_id": source_id,
-                        "source_session_index": session_index,
-                        "source_session_time_back": time_back,
-                        "source_turn_index": turn_index,
-                    },
+    for record in selected:
+        source_id = str(record["metadata"]["initial_data_id"])
+        selected_source_ids.append(source_id)
+        sessions = list(record["previous_dialogs"]) + [
+            {"dialog": record["dialog"], "time_back": "current session", "time_num": 0, "time_unit": ""}
+        ]
+        persona_groups = record.get("init_personas") or record.get("personas") or []
+        persona_text = "Participant profiles:\n" + "\n".join(
+            f"Participant {group_index + 1}: " + " ".join(clean_text(item) for item in group)
+            for group_index, group in enumerate(persona_groups)
+        ) + "\n"
+        history = ""
+        for session_index, session in enumerate(sessions, start=1):
+            time_back = clean_text(session.get("time_back")) or "unspecified gap"
+            history += f"[Session {session_index} begins; source time gap: {time_back}]\n"
+            for turn_index, user_text, assistant_text in alternating_pairs(session["dialog"]):
+                if len(requests) == request_count:
+                    break
+                request_id = len(requests)
+                route_meta = route_metadata(route, catalog, request_id)
+                segments = [
+                    {"type": "shared_system", "text": system},
+                    {"type": "persona_context", "text": persona_text},
+                ]
+                if history:
+                    segments.append({"type": "conversation_history", "text": history})
+                task = f"User: {user_text}\nAssistant:"
+                requests.append(
+                    make_request(
+                        request_id=request_id,
+                        experiment="msc_multi_session_continuous",
+                        group_name="msc_lsapp_route",
+                        context_id=f"msc_{source_id}",
+                        source_dataset="MSC session_5 valid",
+                        segments=segments,
+                        task=task,
+                        reference_response=assistant_text,
+                        lora_id=route_meta["lora_id"],
+                        lora_name=route_meta["lora_name"],
+                        adapter_path=route_meta["adapter_path"],
+                        arrival_ms=route_meta["arrival_ms"],
+                        logical_role="long_term_persona_chat",
+                        extra={
+                            **route_meta,
+                            "source_record_id": source_id,
+                            "source_session_index": session_index,
+                            "source_session_time_back": time_back,
+                            "source_turn_index": turn_index,
+                        },
+                    )
                 )
-            )
-            selected_session_counts[session_index] += 1
-            history += f"User: {user_text}\nAssistant: {assistant_text}\n"
-        if len(requests) == REQUEST_COUNT:
+                selected_session_counts[f"{source_id}:session_{session_index}"] += 1
+                history += f"User: {user_text}\nAssistant: {assistant_text}\n"
+            if len(requests) == request_count:
+                break
+        if len(requests) == request_count:
             break
 
     reuse = add_continuous_reuse_metadata(requests)
@@ -366,9 +448,9 @@ def build_msc(
         **WORKLOADS["msc_continuous"],
         "requests": len(requests),
         "source_file": str(source),
-        "selected_source_ids": [source_id],
+        "selected_source_ids": selected_source_ids,
         "requests_by_session": dict(sorted(selected_session_counts.items())),
-        "construction": "five-session growing conversation prefix",
+        "construction": "one or more independent five-session growing conversation prefixes",
         "direct_lora_base_test5_compatible": False,
         **reuse,
     }
@@ -402,16 +484,23 @@ def build_taskmaster(
     datasets_dir: Path,
     route: list[dict[str, Any]],
     catalog: dict[int, dict[str, Any]],
+    request_count: int = REQUEST_COUNT,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any], dict[str, list[dict[str, Any]]]]:
     source = datasets_dir / "taskmaster" / "TM-1-2019" / "self-dialogs.json"
     conversations = read_json(source)
-    selected = [
-        conversation
-        for conversation in conversations
-        if len(taskmaster_pairs(conversation.get("utterances", []))) >= 15
-    ][:2]
-    if len(selected) != 2:
-        raise ValueError("Taskmaster self-dialogs needs two conversations with 15 pairs")
+    selected: list[dict[str, Any]] = []
+    available_pairs = 0
+    target_pairs_per_conversation = min(15, request_count)
+    for conversation in conversations:
+        pair_count = len(taskmaster_pairs(conversation.get("utterances", [])))
+        if pair_count < target_pairs_per_conversation:
+            continue
+        selected.append(conversation)
+        available_pairs += pair_count
+        if available_pairs >= request_count:
+            break
+    if available_pairs < request_count:
+        raise ValueError(f"Taskmaster self-dialogs produced only {available_pairs} pairs")
 
     system = (
         "You are a personal task assistant. Continue the task using the conversation "
@@ -423,7 +512,9 @@ def build_taskmaster(
         instruction_id = str(conversation.get("instruction_id", "unknown"))
         history = ""
         state: dict[str, str] = {}
-        for turn_index, user, assistant in taskmaster_pairs(conversation["utterances"])[:15]:
+        for turn_index, user, assistant in taskmaster_pairs(conversation["utterances"]):
+            if len(requests) == request_count:
+                break
             request_id = len(requests)
             route_meta = route_metadata(route, catalog, request_id)
             segments = [
@@ -470,6 +561,8 @@ def build_taskmaster(
                 f"User: {user_text}\nAssistant: {assistant_text}\n"
                 f"[Task state after turn {turn_index}: {state_text}]\n"
             )
+        if len(requests) == request_count:
+            break
 
     reuse = add_continuous_reuse_metadata(requests)
     requested_loras = [int(request["lora_id"]) for request in requests]
@@ -485,7 +578,7 @@ def build_taskmaster(
         "source_file": str(source),
         "selected_source_ids": [conversation["conversation_id"] for conversation in selected],
         "selected_instruction_ids": [conversation["instruction_id"] for conversation in selected],
-        "construction": "two 15-turn growing task-state conversations",
+        "construction": "multiple independent growing task-state conversations",
         "direct_lora_base_test5_compatible": False,
         **reuse,
     }
@@ -518,6 +611,126 @@ def role_pairs(conversation: list[dict[str, Any]]) -> list[tuple[int, str, str]]
     return pairs
 
 
+def sharegpt_text(message: dict[str, Any]) -> str:
+    text = clean_text(message.get("value") or message.get("text"))
+    if not text:
+        return ""
+    text = re.sub(r"(?i)<br\s*/?>", "\n", text)
+    text = re.sub(r"<[^>]+>", "", text)
+    return clean_text(html.unescape(text))
+
+
+def sharegpt_pairs(conversation: list[dict[str, Any]]) -> list[tuple[int, str, str]]:
+    user_roles = {"human", "user"}
+    assistant_roles = {"gpt", "chatgpt", "assistant", "bing"}
+    pairs: list[tuple[int, str, str]] = []
+    for index in range(len(conversation) - 1):
+        user = conversation[index]
+        assistant = conversation[index + 1]
+        if str(user.get("from", "")).lower() not in user_roles:
+            continue
+        if str(assistant.get("from", "")).lower() not in assistant_roles:
+            continue
+        user_text = sharegpt_text(user)
+        assistant_text = sharegpt_text(assistant)
+        if user_text and assistant_text:
+            pairs.append((len(pairs), user_text, assistant_text))
+    return pairs
+
+
+def build_sharegpt(
+    datasets_dir: Path,
+    route: list[dict[str, Any]],
+    catalog: dict[int, dict[str, Any]],
+    request_count: int = REQUEST_COUNT,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any], dict[str, list[dict[str, Any]]]]:
+    source = datasets_dir / "sharegpt52k_dataset"
+    dataset = load_from_disk(str(source))
+    system = "Continue the multi-turn conversation and answer the latest user message.\n"
+    requests: list[dict[str, Any]] = []
+    selected_ids: list[str] = []
+    selected_pair_counts: dict[str, int] = {}
+
+    for record in dataset:
+        pairs = sharegpt_pairs(list(record.get("conversations") or []))
+        if len(pairs) < 2:
+            continue
+        # Avoid one pathological transcript dominating the workload or exceeding
+        # the context window while retaining genuine multi-turn conversations.
+        usable = [
+            pair for pair in pairs
+            if len(pair[1]) <= 4000 and len(pair[2]) <= 6000
+        ][:12]
+        if len(usable) < 2:
+            continue
+        conversation_id = str(record.get("id") or stable_hash(str(record)))
+        selected_ids.append(conversation_id)
+        history = ""
+        used_in_context = 0
+        for turn_index, user_text, assistant_text in usable:
+            if len(requests) == request_count:
+                break
+            request_id = len(requests)
+            route_meta = route_metadata(route, catalog, request_id)
+            segments = [{"type": "shared_system", "text": system}]
+            if history:
+                segments.append({"type": "conversation_history", "text": history})
+            task = f"User: {user_text}\nAssistant:"
+            requests.append(
+                make_request(
+                    request_id=request_id,
+                    experiment="sharegpt_general_chat_continuous",
+                    group_name="sharegpt_lsapp_route",
+                    context_id=f"sharegpt_{conversation_id}",
+                    source_dataset="RyokoAI ShareGPT52K local train split",
+                    segments=segments,
+                    task=task,
+                    reference_response=assistant_text,
+                    lora_id=route_meta["lora_id"],
+                    lora_name=route_meta["lora_name"],
+                    adapter_path=route_meta["adapter_path"],
+                    arrival_ms=route_meta["arrival_ms"],
+                    logical_role="general_sharegpt_chat",
+                    extra={
+                        **route_meta,
+                        "source_conversation_id": conversation_id,
+                        "source_turn_index": turn_index,
+                        "source_content_cleaning": "HTML tags removed; entities unescaped",
+                    },
+                )
+            )
+            used_in_context += 1
+            history += f"User: {user_text}\nAssistant: {assistant_text}\n"
+        selected_pair_counts[conversation_id] = used_in_context
+        if len(requests) == request_count:
+            break
+    if len(requests) != request_count:
+        raise ValueError(f"ShareGPT selection produced only {len(requests)} requests")
+
+    reuse = add_continuous_reuse_metadata(requests)
+    requested_loras = [int(request["lora_id"]) for request in requests]
+    groups = build_lora_groups(
+        "sharegpt_lsapp_route",
+        {lora_id: "general_sharegpt_chat" for lora_id in set(requested_loras)},
+        catalog,
+        requested_loras,
+    )
+    summary = {
+        **WORKLOADS["sharegpt_continuous"],
+        "requests": len(requests),
+        "source_file": str(source),
+        "source_dataset_rows": len(dataset),
+        "selected_source_ids": selected_ids,
+        "requests_by_conversation": selected_pair_counts,
+        "selection": "at least two real adjacent user-assistant pairs; at most 12 pairs per conversation",
+        "construction": "multiple independent append-only ShareGPT conversation prefixes",
+        "content_cleaning": "remove HTML tags and unescape HTML entities without rewriting text",
+        "direct_lora_base_test5_compatible": False,
+        **reuse,
+    }
+    return requests, [], summary, groups
+
+
 def conversation_is_mostly_ascii(conversation: list[dict[str, Any]]) -> bool:
     text = "".join(clean_text(message.get("content")) for message in conversation)
     if not text:
@@ -538,6 +751,7 @@ def build_lmsys(
     datasets_dir: Path,
     route: list[dict[str, Any]],
     catalog: dict[int, dict[str, Any]],
+    request_count: int = REQUEST_COUNT,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any], dict[str, list[dict[str, Any]]]]:
     source = next((datasets_dir / "lmsys_33k" / "data").glob("*.parquet"))
     records = pq.read_table(source).to_pylist()
@@ -561,7 +775,7 @@ def build_lmsys(
         selected_ids.append(question_id)
         history = ""
         for turn_index, user_text, assistant_text in pairs:
-            if len(requests) == REQUEST_COUNT:
+            if len(requests) == request_count:
                 break
             request_id = len(requests)
             route_meta = route_metadata(route, catalog, request_id)
@@ -596,9 +810,9 @@ def build_lmsys(
                 )
             )
             history += f"User: {user_text}\nAssistant: {assistant_text}\n"
-        if len(requests) == REQUEST_COUNT:
+        if len(requests) == request_count:
             break
-    if len(requests) != REQUEST_COUNT:
+    if len(requests) != request_count:
         raise ValueError(f"LMSYS selection produced only {len(requests)} requests")
 
     reuse = add_continuous_reuse_metadata(requests)
@@ -640,7 +854,9 @@ def quality_english_source(text: str) -> bool:
     return letters / max(1, len(text)) >= 0.55
 
 
-def select_opus_intersections(datasets_dir: Path) -> list[dict[str, Any]]:
+def select_opus_intersections(
+    datasets_dir: Path, source_count: int
+) -> list[dict[str, Any]]:
     root = datasets_dir / "opus100"
     ja_path = root / "en-ja" / "train-00000-of-00001.parquet"
     japanese_by_english: dict[str, tuple[str, int]] = {}
@@ -654,7 +870,9 @@ def select_opus_intersections(datasets_dir: Path) -> list[dict[str, Any]]:
 
     selected: list[dict[str, Any]] = []
     used_sources: set[str] = set()
-    for language, config in (("de", "de-en"), ("es", "en-es"), ("fr", "en-fr"), ("ru", "en-ru"), ("zh", "en-zh")):
+    language_configs = (("de", "de-en"), ("es", "en-es"), ("fr", "en-fr"), ("ru", "en-ru"), ("zh", "en-zh"))
+    per_language = math.ceil(source_count / len(language_configs))
+    for language, config in language_configs:
         path = root / config / "train-00000-of-00001.parquet"
         found = 0
         for row_index, translation in iter_translations(path):
@@ -678,11 +896,13 @@ def select_opus_intersections(datasets_dir: Path) -> list[dict[str, Any]]:
             )
             used_sources.add(english)
             found += 1
-            if found == 3:
+            if found == per_language:
                 break
-        if found != 3:
-            raise ValueError(f"OPUS-100 found only {found}/3 en-ja/en-{language} intersections")
-    return selected
+        if found != per_language:
+            raise ValueError(
+                f"OPUS-100 found only {found}/{per_language} en-ja/en-{language} intersections"
+            )
+    return selected[:source_count]
 
 
 def make_pair(
@@ -708,6 +928,7 @@ def make_pair(
 def build_opus100(
     datasets_dir: Path,
     catalog: dict[int, dict[str, Any]],
+    request_count: int = REQUEST_COUNT,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any], dict[str, list[dict[str, Any]]]]:
     language_loras = {"ja": 31, "de": 60, "es": 21, "fr": 18, "ru": 54, "zh": 24}
     language_names = {
@@ -718,7 +939,7 @@ def build_opus100(
         "ru": "Russian",
         "zh": "Chinese",
     }
-    selected = select_opus_intersections(datasets_dir)
+    selected = select_opus_intersections(datasets_dir, math.ceil(request_count / 2))
     system = (
         "You are a multilingual translation assistant. Translate the supplied English "
         "source faithfully while preserving its meaning and tone.\n"
@@ -734,6 +955,8 @@ def build_opus100(
         ]
         local: list[dict[str, Any]] = []
         for pair_role, language in (("anchor", "ja"), ("child", other_language)):
+            if len(requests) == request_count:
+                break
             request_id = len(requests)
             lora_id = language_loras[language]
             entry = catalog[lora_id]
@@ -764,15 +987,16 @@ def build_opus100(
             )
             requests.append(request)
             local.append(request)
-        pairs.append(
-            make_pair(
-                context_id,
-                "opus100_language_loras",
-                local[0],
-                local[1],
-                "opus100_same_english_different_target_language",
+        if len(local) == 2:
+            pairs.append(
+                make_pair(
+                    context_id,
+                    "opus100_language_loras",
+                    local[0],
+                    local[1],
+                    "opus100_same_english_different_target_language",
+                )
             )
-        )
 
     requested_loras = [int(request["lora_id"]) for request in requests]
     groups = build_lora_groups(
@@ -791,8 +1015,10 @@ def build_opus100(
         "different_lora_pairs": len(pairs),
         "target_language_counts": dict(Counter(request["target_language"] for request in requests)),
         "selected_source_ids": [stable_hash(record["english"]) for record in selected],
-        "construction": "15 exact English intersections, each translated by Japanese and one other language role",
+        "construction": "exact English intersections, each dispatched to Japanese and one other language role",
+        "partial_final_context": request_count % 2 != 0,
         "direct_lora_base_test5_compatible": True,
+        **add_reuse_statistics(requests),
     }
     return requests, pairs, summary, groups
 
@@ -800,6 +1026,7 @@ def build_opus100(
 def build_xsum(
     datasets_dir: Path,
     catalog: dict[int, dict[str, Any]],
+    request_count: int = REQUEST_COUNT,
 ) -> tuple[list[dict[str, Any]], list[dict[str, Any]], dict[str, Any], dict[str, list[dict[str, Any]]]]:
     source = datasets_dir / "xsum_dataset"
     dataset = load_from_disk(str(source))
@@ -809,9 +1036,9 @@ def build_xsum(
         summary = clean_text(record["summary"])
         if 1600 <= len(document) <= 4000 and 40 <= len(summary) <= 500:
             selected.append({"document": document, "summary": summary, "id": str(record["id"])})
-        if len(selected) == 10:
+        if len(selected) == math.ceil(request_count / 3):
             break
-    if len(selected) != 10:
+    if len(selected) != math.ceil(request_count / 3):
         raise ValueError(f"XSum selection produced only {len(selected)} documents")
 
     task_roles = [
@@ -830,6 +1057,8 @@ def build_xsum(
         ]
         local: list[dict[str, Any]] = []
         for role_index, (logical_role, lora_id, task) in enumerate(task_roles):
+            if len(requests) == request_count:
+                break
             entry = catalog[lora_id]
             request = make_request(
                 request_id=len(requests),
@@ -884,9 +1113,11 @@ def build_xsum(
         "different_lora_pairs": len(pairs),
         "logical_task_counts": dict(Counter(request["logical_lora_role"] for request in requests)),
         "selected_source_ids": [record["id"] for record in selected],
-        "construction": "10 articles, each dispatched to three logical task LoRAs",
+        "construction": "articles dispatched to summarization, QA, and headline LoRAs",
+        "partial_final_context_requests": request_count % len(task_roles),
         "reference_note": "QA and headline requests use the real XSum summary as a proxy reference, not a task-specific gold label.",
         "direct_lora_base_test5_compatible": True,
+        **add_reuse_statistics(requests),
     }
     return requests, pairs, summary, groups
 
@@ -896,11 +1127,12 @@ def validate_workload(
     requests: list[dict[str, Any]],
     pairs: list[dict[str, Any]],
     groups: dict[str, list[dict[str, Any]]],
+    request_count: int = REQUEST_COUNT,
 ) -> dict[str, Any]:
     errors: list[str] = []
-    if len(requests) != REQUEST_COUNT:
+    if len(requests) != request_count:
         errors.append(f"request count is {len(requests)}")
-    if [request["request_id"] for request in requests] != list(range(REQUEST_COUNT)):
+    if [request["request_id"] for request in requests] != list(range(request_count)):
         errors.append("request IDs are not contiguous")
     for request in requests:
         prefix = request["common_prefix_text"]
@@ -972,8 +1204,9 @@ def write_workload(
     pairs: list[dict[str, Any]],
     summary: dict[str, Any],
     groups: dict[str, list[dict[str, Any]]],
+    request_count: int = REQUEST_COUNT,
 ) -> dict[str, Any]:
-    validation = validate_workload(name, requests, pairs, groups)
+    validation = validate_workload(name, requests, pairs, groups, request_count)
     workload_dir = output_dir / name
     write_json(workload_dir / "lora_groups.json", groups)
     write_jsonl(workload_dir / "grouped" / "grouped_requests.jsonl", requests)
@@ -1001,9 +1234,10 @@ def write_preview(
     output_dir: Path,
     summaries: dict[str, dict[str, Any]],
     samples: dict[str, list[dict[str, Any]]],
+    request_count: int,
 ) -> None:
     lines = [
-        "# Real 30-request workload preview",
+        f"# Real {request_count}-request workload preview",
         "",
         "All source prompts and reference responses come from the local dataset copies. ",
         "Task instructions are constructed for the experiment. Physical LoRAs are routing artifacts, ",
@@ -1034,24 +1268,197 @@ def write_preview(
     (output_dir / "preview.md").write_text("\n".join(lines), encoding="utf-8")
 
 
+def pct(value: Any) -> str:
+    return f"{100.0 * float(value):.1f}%"
+
+
+def write_construction_report(
+    output_dir: Path,
+    summaries: dict[str, dict[str, Any]],
+    request_count: int,
+) -> None:
+    """Write the reproducible dataset construction and reuse-probability report."""
+    lines = [
+        f"# {request_count}-request workload construction and reuse analysis",
+        "",
+        "This report describes how each local workload is constructed. It separates",
+        "source-data repetition from runtime KV-cache hits: a repeated context can",
+        "still miss at runtime when its LoRA variant was evicted or only a suffix is",
+        "available.",
+        "",
+        "## Definitions",
+        "",
+        "For requests ordered by `arrival_ms` within each `context_id`:",
+        "",
+        "- **Context reaccess rate** = requests whose context appeared earlier / all requests.",
+        "- **Exact prefix repeat rate** = requests whose `common_prefix_hash` appeared earlier in the same context / all requests.",
+        "- **Immediate same-LoRA reread rate** = rereads whose LoRA equals the immediately previous request in that context / context rereads.",
+        "- **Switched-LoRA reread rate** = rereads whose LoRA differs from the immediately previous request / context rereads.",
+        "- **Prior same-LoRA rate** = context rereads whose LoRA appeared earlier anywhere in that context / context rereads.",
+        "- **Return-after-gap rate** = a continuous request changes away from a LoRA and later returns to a LoRA already seen in that context / LoRA transitions.",
+        "- **Append-only rate** = rereads where the new `common_prefix_text` starts with the previous request's full prompt / context rereads.",
+        "",
+        "The first request of every context has no previous request and is therefore",
+        "not counted as a reread. These are workload-level opportunity rates, not",
+        "measured runtime hit rates.",
+        "",
+        f"## {request_count}-request summary",
+        "",
+        "| Workload | Form | Requests | Contexts | Pairs | Context reaccess | Exact prefix repeat | Immediate same-LoRA | Switched-LoRA | Prior same-LoRA | Return after gap | Append-only |",
+        "|---|---|---:|---:|---:|---:|---:|---:|---:|---:|---:|---:|",
+    ]
+    for name, summary in summaries.items():
+        lines.append(
+            f"| `{name}` | {summary['form']} | {summary['requests']} | "
+            f"{summary.get('contexts', 0)} | {summary.get('pairs', 0)} | "
+            f"{pct(summary.get('request_level_context_reaccess_rate', 0.0))} | "
+            f"{pct(summary.get('request_level_exact_prefix_reuse_rate', 0.0))} | "
+            f"{pct(summary.get('same_lora_context_reread_rate', 0.0))} | "
+            f"{pct(summary.get('switched_lora_context_reread_rate', 0.0))} | "
+            f"{pct(summary.get('prior_same_lora_context_reread_rate', 0.0))} | "
+            f"{pct(summary.get('return_after_gap_rate', 0.0))} | "
+            f"{pct(summary.get('append_only_extension_rate', 0.0))} |"
+        )
+
+    lines.extend(
+        [
+            "",
+            "## Dataset construction",
+            "",
+            "### MSC: continuous multi-session dialogue",
+            "",
+            "The builder reads `session_5/valid.txt`, keeps records with at least",
+            "the required number of real user/assistant pairs, and consumes records",
+            "in source order until the request limit is reached. Each selected record",
+            "contains up to five sessions. A context begins with the real participant",
+            "profiles and session boundary, then appends every real user turn and its",
+            "assistant response to `conversation_history`. The next request uses the",
+            "entire previous prompt as a prefix, so growth is append-only inside a",
+            "context; a new source record starts a new context and is never concatenated",
+            "with another person's dialogue.",
+            "",
+            f"The experiment route assigns the {request_count} real LSApp time-sliced LoRA calls",
+            "in order. Thus a same-LoRA adjacent transition represents direct reuse",
+            "opportunity, while a later return after another LoRA represents a",
+            "non-contiguous reuse opportunity.",
+            "",
+            "### Taskmaster-1: continuous task-state dialogue",
+            "",
+            "The builder reads `self-dialogs.json`, selects source conversations with",
+            "enough real USER→ASSISTANT pairs, and consumes complete conversations",
+            "in source order until the limit. Each context contains the real task",
+            "instruction, prior dialogue, and a serialized task state assembled from",
+            "the source annotations after each completed turn. A request asks the next",
+            "real user turn; the assistant turn is retained as `reference_response` and",
+            "then appended to the next context prefix. This models a stateful personal",
+            "agent without splicing unrelated tasks together.",
+            "",
+            "### LMSYS-33K: ordinary continuous chat",
+            "",
+            "The builder scans the local parquet file, keeps English, unflagged records",
+            "with a valid winning model branch, and requires at least two real",
+            "user→assistant pairs. Each selected conversation is its own context. The",
+            "winning branch is converted into successive prompts whose history grows",
+            "by appending the previous user and assistant turns. This dataset has many",
+            "short independent contexts, so context reaccess is lower than in MSC and",
+            "Taskmaster even when the total request count is the same.",
+            "",
+            "### ShareGPT52K: added continuous chat workload",
+            "",
+            "The local Hugging Face Arrow dataset contains 52,180 conversations. The",
+            "builder accepts adjacent `human/user`→`gpt/chatgpt/assistant/bing` pairs,",
+            "reads `value` (falling back to `text`), removes HTML tags, and unescapes",
+            "HTML entities without rewriting the content. It takes at most 12 pairs",
+            "from one conversation to prevent a single long transcript dominating the",
+            f"{request_count}-request trace. Every source conversation becomes an independent",
+            "append-only context. The first request contains only the shared system",
+            "prefix; later requests contain the complete prior dialogue history.",
+            "",
+            "This is a continuous-context workload, not a parallel same-prefix",
+            "workload: different conversations do not share `common_prefix_text`.",
+            "",
+            "### OPUS-100: parallel same-source translation",
+            "",
+            "The builder intersects the English side of `en-ja` with one of",
+            "`de/es/fr/ru/zh`, filters short or malformed sentences, and creates one",
+            "pair per exact English source. The Japanese request is the anchor and the",
+            "second language is the child; both requests have byte-identical prefix text",
+            f"but different physical LoRAs. For {request_count} requests this produces",
+            f"{summaries['opus100_parallel'].get('contexts', 0)} contexts and",
+            f"{summaries['opus100_parallel'].get('pairs', 0)} complete cross-LoRA pairs.",
+            "There is no prefix growth inside a pair.",
+            "",
+            "### XSum: parallel same-article multi-task requests",
+            "",
+            "The builder selects real articles satisfying the local length and summary",
+            "filters. Each article is used for up to three task roles: summarization,",
+            "main-event QA, and headline rewrite. All roles receive the exact same",
+            f"article prefix but different LoRAs. For {request_count} requests,",
+            f"{request_count // 3} complete three-role contexts plus",
+            f"{request_count % 3} request(s) in a final partial context are emitted",
+            f"({summaries['xsum_parallel'].get('contexts', 0)} contexts total); the partial final context is recorded explicitly in",
+            "`summary.json` and is not treated as a complete three-way pair.",
+            "",
+            "## Why a negative TTFT result is not automatically a bad dataset",
+            "",
+            "A negative runtime speedup means the tested cache policy was slower than",
+            "matched full-prefill for that workload. It can be caused by low context",
+            "reaccess, LoRA switching, partial prefix coverage, variant construction,",
+            "KV copying, eviction, or delta maintenance. The rates above only describe",
+            "available reuse opportunities; they do not claim that the runtime can",
+            "realize every opportunity cheaply.",
+            "",
+            "In particular, continuous workloads have high append-only rates but zero",
+            "exact-prefix repeats by construction: each new turn extends the history.",
+            "Parallel workloads have high exact-prefix repeats but zero append-only",
+            "growth: the same source is sent to a different LoRA. These are different",
+            "experimental phenomena and should not be combined into one probability.",
+            "",
+            "## Reproduce",
+            "",
+            "```powershell",
+            "D:\\anaconda\\envs\\qwen2.5_vl\\python.exe -B examples/lora-base-datasets/build_lsapp_requests.py `",
+            f"  --request-count {request_count} --output-dir examples/lora-base-datasets/output/lsapp_{request_count}",
+            "",
+            "D:\\anaconda\\envs\\qwen2.5_vl\\python.exe -B examples/lora-base-datasets/build_real_workloads.py `",
+            f"  --request-count {request_count} `",
+            f"  --route-jsonl examples/lora-base-datasets/output/lsapp_{request_count}/source_trace_{request_count}.jsonl `",
+            "  --lora-groups-json D:\\ecnu_experiment\\datasets\\mobilora_workloads_87_original\\lora_groups.json `",
+            f"  --output-dir examples/lora-base-datasets/output/real_{request_count}",
+            "```",
+            "",
+            "All generated data and previews remain under the ignored `output/` directory.",
+        ]
+    )
+    (output_dir / "DATASET_CONSTRUCTION.md").write_text(
+        "\n".join(lines) + "\n", encoding="utf-8"
+    )
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--datasets-dir", type=Path, default=DEFAULT_DATASETS_DIR)
     parser.add_argument("--route-jsonl", type=Path, default=DEFAULT_ROUTE_JSONL)
     parser.add_argument("--lora-groups-json", type=Path, default=DEFAULT_LORA_GROUPS_JSON)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_OUTPUT_DIR)
+    parser.add_argument("--request-count", type=int, default=REQUEST_COUNT)
     return parser.parse_args()
 
 
 def main() -> None:
     args = parse_args()
-    route, catalog = load_adapter_inputs(args.route_jsonl, args.lora_groups_json)
+    if args.request_count <= 0:
+        raise ValueError("--request-count must be positive")
+    route, catalog = load_adapter_inputs(
+        args.route_jsonl, args.lora_groups_json, args.request_count
+    )
     builders = [
-        ("msc_continuous", lambda: build_msc(args.datasets_dir, route, catalog)),
-        ("taskmaster_continuous", lambda: build_taskmaster(args.datasets_dir, route, catalog)),
-        ("lmsys_continuous", lambda: build_lmsys(args.datasets_dir, route, catalog)),
-        ("opus100_parallel", lambda: build_opus100(args.datasets_dir, catalog)),
-        ("xsum_parallel", lambda: build_xsum(args.datasets_dir, catalog)),
+        ("msc_continuous", lambda: build_msc(args.datasets_dir, route, catalog, args.request_count)),
+        ("taskmaster_continuous", lambda: build_taskmaster(args.datasets_dir, route, catalog, args.request_count)),
+        ("lmsys_continuous", lambda: build_lmsys(args.datasets_dir, route, catalog, args.request_count)),
+        ("sharegpt_continuous", lambda: build_sharegpt(args.datasets_dir, route, catalog, args.request_count)),
+        ("opus100_parallel", lambda: build_opus100(args.datasets_dir, catalog, args.request_count)),
+        ("xsum_parallel", lambda: build_xsum(args.datasets_dir, catalog, args.request_count)),
     ]
     summaries: dict[str, dict[str, Any]] = {}
     samples: dict[str, list[dict[str, Any]]] = {}
@@ -1059,18 +1466,19 @@ def main() -> None:
         print(f"Building {name}...", flush=True)
         requests, pairs, summary, groups = builder()
         summaries[name] = write_workload(
-            args.output_dir, name, requests, pairs, summary, groups
+            args.output_dir, name, requests, pairs, summary, groups, args.request_count
         )
         samples[name] = requests
 
     root_summary = {
-        "request_count_per_workload": REQUEST_COUNT,
+        "request_count_per_workload": args.request_count,
         "workloads": summaries,
         "all_valid": all(summary["validation"]["status"] == "ok" for summary in summaries.values()),
         "physical_adapter_notice": PHYSICAL_ADAPTER_NOTICE,
     }
     write_json(args.output_dir / "summary.json", root_summary)
-    write_preview(args.output_dir, summaries, samples)
+    write_preview(args.output_dir, summaries, samples, args.request_count)
+    write_construction_report(args.output_dir, summaries, args.request_count)
     print(json.dumps(root_summary, ensure_ascii=False, indent=2))
 
 

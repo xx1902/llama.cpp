@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Aggregate test6 runs and generate reproducible plots and a Markdown report."""
+"""Aggregate test7 runs and generate reproducible plots and a Markdown report."""
 
 from __future__ import annotations
 
@@ -39,6 +39,42 @@ PREFIX_METHODS = [
     ("sentence", "Sentence"),
     ("keyword", "Keyword"),
     ("reuse_aware", "Reuse-aware"),
+]
+
+# v2 is intentionally kept separate from the original five methods so old
+# reports remain reproducible and the optimized experiment can be compared
+# against the exact same workload order.
+PREFIX_METHODS_V2 = [("adaptive_reuse_v2", "Adaptive reuse v2")]
+
+PREFIX_METHODS_V1_ABLATION = [
+    ("reuse_v1_full_signals", "v1 full signals"),
+    ("reuse_v1_no_sentence", "v1 no Sentence"),
+    ("reuse_v1_no_keyword", "v1 no Keyword (original)"),
+    ("reuse_v1_only", "v1 Reuse only"),
+]
+
+PREFIX_METHODS_V2_ABLATION = [
+    ("adaptive_v2_reference", "v2 reference"),
+    ("adaptive_v2_no_sentence", "v2 no Sentence"),
+    ("adaptive_v2_no_reuse", "v2 no Reuse"),
+    ("adaptive_v2_no_future_cost", "v2 no future-node cost"),
+    ("adaptive_v2_no_prefetch_cost", "v2 no prefetch cost"),
+    ("adaptive_v2_length_only", "v2 length only"),
+]
+
+PREFIX_METHODS_V3 = [
+    ("lora_focus_v3", "LoRA-focus filter v3"),
+    ("lora_focus_v3_no_private", "v3 no LoRA-private"),
+    ("lora_focus_v3_no_focus", "v3 no user-focus"),
+    ("lora_focus_v3_cost_only", "v3 cost only"),
+]
+
+PREFIX_METHOD_CATALOG = [
+    *PREFIX_METHODS,
+    *PREFIX_METHODS_V2,
+    *PREFIX_METHODS_V1_ABLATION,
+    *PREFIX_METHODS_V2_ABLATION,
+    *PREFIX_METHODS_V3,
 ]
 
 STORAGE_STRATEGY_IDS = [
@@ -380,17 +416,38 @@ def fixed_chunks(text: str, target_tokens: int) -> list[str]:
     return chunks
 
 
-def natural_boundaries(text: str, segments: list[dict[str, Any]]) -> set[int]:
+def segment_boundaries(text: str, segments: list[dict[str, Any]]) -> set[int]:
     boundaries: set[int] = set()
     offset = 0
     for segment in segments:
         offset += len(str(segment.get("text", "")))
         if 0 < offset <= len(text):
             boundaries.add(offset)
+    boundaries.add(len(text))
+    return boundaries
+
+
+def sentence_boundaries(text: str) -> set[int]:
+    boundaries: set[int] = set()
     for match in re.finditer(r"(?:[.!?。！？][\"')\]】]*\s*|\n+)", text):
         boundaries.add(match.end())
     boundaries.add(len(text))
     return boundaries
+
+
+def keyword_boundaries(text: str) -> set[int]:
+    pattern = re.compile(
+        r"(?im)(?:^|\n)\s*(?:user|assistant|system|task|context|article|question|answer|"
+        r"session|profile|instruction|dialogue|summary|headline|translate|source|target)\b|"
+        r"\b(?:however|meanwhile|therefore|because|finally|next|then)\b"
+    )
+    boundaries = {match.start() for match in pattern.finditer(text) if match.start() > 0}
+    boundaries.add(len(text))
+    return boundaries
+
+
+def natural_boundaries(text: str, segments: list[dict[str, Any]]) -> set[int]:
+    return segment_boundaries(text, segments) | sentence_boundaries(text)
 
 
 def pack_units(units: list[str], target_tokens: int = 128) -> list[str]:
@@ -495,6 +552,396 @@ def split_prefix(
         chunks.append(text[start:end])
         start = end
     return chunks
+
+
+def split_prefix_adaptive_v2(
+    row: dict[str, Any],
+    reuse_points: set[int],
+    context_reaccess_rate: float = 0.0,
+    exact_prefix_rate: float = 0.0,
+    max_prefetch_chunks: int = 2,
+    use_sentence_boundaries: bool = True,
+    use_reuse_reward: bool = True,
+    use_future_cost: bool = True,
+    use_prefetch_cost: bool = True,
+    use_natural_reward: bool = True,
+) -> list[str]:
+    """Adaptive v2 splitter with explicit reuse/cost scoring.
+
+    The target is selected from workload shape: exact-prefix parallel pairs
+    keep the reusable source inside the prefetch budget, while continuous
+    traces use larger chunks when reaccess is sparse and align append-only
+    history to known reuse points when they exist.
+    """
+    text = str(row.get("common_prefix_text", ""))
+    segments = list(row.get("prefix_segments") or [])
+    total_tokens = estimated_tokens(text)
+    parallel = exact_prefix_rate >= 0.25 or bool(row.get("exact_shared_english_intersection"))
+    if parallel:
+        target = max(96, min(512, math.ceil(total_tokens / max(1, max_prefetch_chunks))))
+        min_tokens = max(48, int(target * 0.55))
+        max_tokens = max(target, int(target * 1.35))
+    else:
+        # Sparse reaccess benefits from fewer, larger nodes. Frequent return
+        # visits can afford smaller nodes to maximize partial-prefix reuse.
+        target = 192 if context_reaccess_rate < 0.70 else 128
+        if total_tokens > 768:
+            target = 256
+        elif total_tokens > 512:
+            target = max(target, 192)
+        min_tokens = 96 if target == 192 else 64
+        if target == 256:
+            min_tokens, max_tokens = 128, 384
+        else:
+            max_tokens = 288 if target == 192 else 192
+
+    boundaries = segment_boundaries(text, segments)
+    if use_sentence_boundaries:
+        boundaries |= sentence_boundaries(text)
+    active_reuse_points = reuse_points if use_reuse_reward else set()
+    candidates = sorted(boundaries | active_reuse_points)
+    chunks: list[str] = []
+    start = 0
+    while start < len(text):
+        remaining = text[start:]
+        if estimated_tokens(remaining) <= max_tokens:
+            chunks.append(remaining)
+            break
+        viable: list[tuple[float, int]] = []
+        for end in candidates:
+            if end <= start or end >= len(text):
+                continue
+            size = estimated_tokens(text[start:end])
+            if not min_tokens <= size <= max_tokens:
+                continue
+            is_reuse = end in active_reuse_points
+            is_natural = end in boundaries
+            remaining_after = estimated_tokens(text[end:]) if end < len(text) else 0
+            future_nodes = math.ceil(remaining_after / max(1, target))
+            reuse_weight = 48.0 + 64.0 * context_reaccess_rate + 64.0 * exact_prefix_rate
+            prefetch_overflow = 0
+            if parallel:
+                slots_left = max(0, max_prefetch_chunks - (len(chunks) + 1))
+                prefetch_overflow = max(0, future_nodes - slots_left)
+            # Lower is better. All terms use token-equivalent weights so they
+            # can be inspected and ablated directly.
+            score = abs(size - target)
+            score += 10.0 * future_nodes if use_future_cost else 0.0
+            score += 80.0 * prefetch_overflow if use_prefetch_cost else 0.0
+            score -= (reuse_weight if is_reuse else 0.0)
+            score -= (18.0 if is_natural and use_natural_reward else 0.0)
+            viable.append((score, end))
+        if viable:
+            end = min(viable)[1]
+        else:
+            fallback = fixed_chunks(remaining, target)[0]
+            end = start + len(fallback)
+        chunks.append(text[start:end])
+        start = end
+    return chunks
+
+
+_FOCUS_STOPWORDS = {
+    "about", "after", "again", "also", "answer", "assistant", "before", "being",
+    "continue", "could", "from", "have", "into", "latest", "message", "more",
+    "please", "should", "task", "that", "their", "there", "these", "they", "this",
+    "using", "what", "when", "where", "which", "while", "with", "would", "your",
+}
+
+
+def focus_terms(text: str) -> set[str]:
+    terms = {
+        token.lower()
+        for token in re.findall(r"[A-Za-z][A-Za-z0-9_-]{2,}|[\u4e00-\u9fff]{2,}", text)
+    }
+    return {term for term in terms if term not in _FOCUS_STOPWORDS}
+
+
+def build_lora_focus_profile(requests: list[dict[str, Any]]) -> dict[str, Any]:
+    """Build deterministic filter statistics from workload prompts only."""
+    term_total: dict[str, int] = {}
+    term_loras: dict[str, set[int]] = {}
+    term_contexts: dict[str, set[str]] = {}
+    term_by_lora: dict[str, dict[int, int]] = {}
+    term_by_context: dict[str, dict[str, int]] = {}
+    requests_by_context: dict[str, int] = {}
+    loras: set[int] = set()
+    for request in requests:
+        lora_id = int(request.get("lora_id", -1))
+        context_id = str(request.get("context_id", ""))
+        loras.add(lora_id)
+        requests_by_context[context_id] = requests_by_context.get(context_id, 0) + 1
+        for term in focus_terms(str(request.get("common_prefix_text", ""))):
+            term_total[term] = term_total.get(term, 0) + 1
+            term_loras.setdefault(term, set()).add(lora_id)
+            term_contexts.setdefault(term, set()).add(context_id)
+            by_lora = term_by_lora.setdefault(term, {})
+            by_lora[lora_id] = by_lora.get(lora_id, 0) + 1
+            by_context = term_by_context.setdefault(term, {})
+            by_context[context_id] = by_context.get(context_id, 0) + 1
+    return {
+        "request_count": len(requests),
+        "lora_count": len(loras),
+        "term_total": term_total,
+        "term_loras": term_loras,
+        "term_contexts": term_contexts,
+        "term_by_lora": term_by_lora,
+        "term_by_context": term_by_context,
+        "requests_by_context": requests_by_context,
+    }
+
+
+def build_causal_lora_focus_profiles(
+    requests: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Return one profile per request without observing future requests."""
+    return [build_lora_focus_profile(requests[: index + 1]) for index in range(len(requests))]
+
+
+def lora_focus_signals(
+    text: str,
+    row: dict[str, Any],
+    profile: dict[str, Any],
+    end_ratio: float,
+) -> tuple[float, float, float]:
+    terms = focus_terms(text)
+    if not terms:
+        return 0.0, 0.0, min(1.0, 0.30 * end_ratio)
+    lora_id = int(row.get("lora_id", -1))
+    context_id = str(row.get("context_id", ""))
+    total_loras = max(1, int(profile.get("lora_count", 1)))
+    context_requests = max(1, int(profile.get("requests_by_context", {}).get(context_id, 1)))
+    shared_values: list[float] = []
+    private_values: list[float] = []
+    context_values: list[float] = []
+    for term in terms:
+        total = int(profile.get("term_total", {}).get(term, 0))
+        support = min(1.0, max(0, total - 1) / 3.0)
+        lora_count = len(profile.get("term_loras", {}).get(term, set()))
+        cross_lora = (lora_count - 1) / max(1, total_loras - 1)
+        current_lora_count = int(profile.get("term_by_lora", {}).get(term, {}).get(lora_id, 0))
+        concentration = current_lora_count / max(1, total)
+        shared_values.append(support * cross_lora)
+        private_values.append(support * concentration * (1.0 - cross_lora))
+        context_count = int(
+            profile.get("term_by_context", {}).get(term, {}).get(context_id, 0)
+        )
+        context_values.append(min(1.0, max(0, context_count - 1) / max(1, context_requests - 1)))
+    shared = float(sum(shared_values) / len(shared_values))
+    private = float(sum(private_values) / len(private_values))
+    context_reuse = float(sum(context_values) / len(context_values))
+    task_terms = focus_terms(str(row.get("task", "")))
+    task_overlap = len(terms & task_terms) / max(1, len(task_terms))
+    role_marker = float(bool(re.search(r"(?im)(?:^|\n)\s*(?:user|question|profile|state)\s*:", text)))
+    focus = min(1.0, 0.50 * task_overlap + 0.30 * end_ratio + 0.20 * role_marker)
+    reuse = min(1.0, 0.55 * shared + 0.45 * context_reuse)
+    return reuse, private, focus
+
+
+def split_prefix_lora_focus_v3(
+    row: dict[str, Any],
+    reuse_points: set[int],
+    profile: dict[str, Any],
+    context_reaccess_rate: float = 0.0,
+    exact_prefix_rate: float = 0.0,
+    max_prefetch_chunks: int = 2,
+    use_private_signal: bool = True,
+    use_focus_signal: bool = True,
+    use_reuse_signal: bool = True,
+) -> tuple[list[str], list[str]]:
+    """Filter-style LoRA affinity and user-focus aware splitter.
+
+    The returned roles are descriptive admission hints. The current runtime
+    still receives ordinary prefix_method segments and does not pin them.
+    """
+    text = str(row.get("common_prefix_text", ""))
+    segments = list(row.get("prefix_segments") or [])
+    total_tokens = estimated_tokens(text)
+    parallel = exact_prefix_rate >= 0.25 or bool(row.get("exact_shared_english_intersection"))
+    base_target = (
+        max(96, min(512, math.ceil(total_tokens / max(1, max_prefetch_chunks))))
+        if parallel
+        else (128 if context_reaccess_rate >= 0.70 else 192)
+    )
+    if not parallel and total_tokens > 512:
+        base_target = max(base_target, 192)
+    if not parallel and total_tokens > 768:
+        base_target = 256
+    boundaries = natural_boundaries(text, segments) | keyword_boundaries(text)
+    candidates = sorted(boundaries | reuse_points)
+    chunks: list[str] = []
+    roles: list[str] = []
+    start = 0
+    while start < len(text):
+        remaining_tokens = estimated_tokens(text[start:])
+        if remaining_tokens <= base_target:
+            chunk = text[start:]
+            reuse, private, focus = lora_focus_signals(chunk, row, profile, 1.0)
+            if not use_reuse_signal:
+                reuse = 0.0
+            if not use_private_signal:
+                private = 0.0
+            if not use_focus_signal:
+                focus = 0.0
+            role = "shared_reuse" if reuse >= max(private, focus, 0.35) else (
+                "lora_private_resident" if private >= max(focus, 0.35) else (
+                    "user_focus" if focus >= 0.35 else "cold_bulk"
+                )
+            )
+            chunks.append(chunk)
+            roles.append(role)
+            break
+        viable: list[tuple[float, int, str]] = []
+        for end in candidates:
+            if end <= start or end >= len(text):
+                continue
+            size = estimated_tokens(text[start:end])
+            end_ratio = end / max(1, len(text))
+            reuse, private, focus = lora_focus_signals(
+                text[start:end], row, profile, end_ratio
+            )
+            if not use_reuse_signal:
+                reuse = 0.0
+            if not use_private_signal:
+                private = 0.0
+            if not use_focus_signal:
+                focus = 0.0
+            signal_discount = min(160.0, 96.0 * reuse + 80.0 * focus + 64.0 * private)
+            signal_target = int(round(256.0 - signal_discount))
+            # Salience should select a boundary, not force long contexts into
+            # many small nodes. Parallel prefixes are bounded by prefetch slots;
+            # long continuous prefixes retain the cost-derived base target.
+            if parallel or total_tokens > 512:
+                target = base_target
+            else:
+                target = signal_target
+            target = max(96, min(512, target))
+            if not max(48, int(target * 0.50)) <= size <= max(target, int(target * 1.50)):
+                continue
+            remaining_after = estimated_tokens(text[end:])
+            # Do not create a boundary that strands a tiny, high-overhead tail.
+            if 0 < remaining_after < 48:
+                continue
+            future_nodes = math.ceil(remaining_after / max(1, target))
+            slots_left = max(0, max_prefetch_chunks - (len(chunks) + 1))
+            prefetch_overflow = max(0, future_nodes - slots_left) if parallel else 0
+            mixing = min(private, max(reuse, focus))
+            score = abs(size - target)
+            score += 10.0 * future_nodes + 80.0 * prefetch_overflow
+            score += 32.0 * mixing
+            score -= 64.0 * reuse + 48.0 * private + 56.0 * focus
+            score -= 48.0 if end in reuse_points else 0.0
+            score -= 18.0 if end in boundaries else 0.0
+            role = "shared_reuse" if reuse >= max(private, focus, 0.35) else (
+                "lora_private_resident" if private >= max(focus, 0.35) else (
+                    "user_focus" if focus >= 0.35 else "cold_bulk"
+                )
+            )
+            viable.append((score, end, role))
+        if viable:
+            _, end, role = min(viable)
+        else:
+            fallback = fixed_chunks(text[start:], base_target)[0]
+            end = start + len(fallback)
+            if 0 < estimated_tokens(text[end:]) < 48:
+                end = len(text)
+            role = "cold_bulk"
+        chunks.append(text[start:end])
+        roles.append(role)
+        start = end
+    return chunks, roles
+
+
+def split_prefix_experiment_method(
+    row: dict[str, Any],
+    method_id: str,
+    reuse_points: set[int],
+    context_reaccess_rate: float = 0.0,
+    exact_prefix_rate: float = 0.0,
+    lora_focus_profile: dict[str, Any] | None = None,
+) -> tuple[list[str], list[str]]:
+    if method_id in dict(PREFIX_METHODS):
+        chunks = split_prefix(row, method_id, reuse_points)
+        return chunks, ["legacy"] * len(chunks)
+    if method_id == "adaptive_reuse_v2":
+        chunks = split_prefix_adaptive_v2(
+            row, reuse_points, context_reaccess_rate, exact_prefix_rate
+        )
+        return chunks, ["adaptive"] * len(chunks)
+    if method_id in dict(PREFIX_METHODS_V1_ABLATION):
+        text = str(row.get("common_prefix_text", ""))
+        segments = list(row.get("prefix_segments") or [])
+        candidates = set(reuse_points) | {len(text)}
+        if method_id in {"reuse_v1_full_signals", "reuse_v1_no_keyword"}:
+            candidates |= natural_boundaries(text, segments)
+        if method_id in {"reuse_v1_full_signals", "reuse_v1_no_sentence"}:
+            candidates |= segment_boundaries(text, segments) | keyword_boundaries(text)
+        chunks: list[str] = []
+        start = 0
+        while start < len(text):
+            remaining = text[start:]
+            if estimated_tokens(remaining) <= 128:
+                chunks.append(remaining)
+                break
+            viable = []
+            for end in sorted(candidates):
+                if end <= start or end >= len(text):
+                    continue
+                size = estimated_tokens(text[start:end])
+                if 64 <= size <= 192:
+                    viable.append((abs(size - 128) - (72.0 if end in reuse_points else 0.0), end))
+            if viable:
+                end = min(viable)[1]
+            else:
+                fallback = fixed_chunks(remaining, 128)[0]
+                end = start + len(fallback)
+            chunks.append(text[start:end])
+            start = end
+        return chunks, ["v1_ablation"] * len(chunks)
+    if method_id in dict(PREFIX_METHODS_V2_ABLATION):
+        options = {
+            "adaptive_v2_reference": {},
+            "adaptive_v2_no_sentence": {"use_sentence_boundaries": False},
+            "adaptive_v2_no_reuse": {"use_reuse_reward": False},
+            "adaptive_v2_no_future_cost": {"use_future_cost": False},
+            "adaptive_v2_no_prefetch_cost": {"use_prefetch_cost": False},
+            "adaptive_v2_length_only": {
+                "use_reuse_reward": False,
+                "use_future_cost": False,
+                "use_prefetch_cost": False,
+                "use_natural_reward": False,
+            },
+        }[method_id]
+        chunks = split_prefix_adaptive_v2(
+            row,
+            reuse_points,
+            context_reaccess_rate,
+            exact_prefix_rate,
+            **options,
+        )
+        return chunks, ["v2_ablation"] * len(chunks)
+    if method_id in dict(PREFIX_METHODS_V3):
+        if lora_focus_profile is None:
+            raise ValueError("LoRA-focus v3 requires a workload profile")
+        options = {
+            "lora_focus_v3": {},
+            "lora_focus_v3_no_private": {"use_private_signal": False},
+            "lora_focus_v3_no_focus": {"use_focus_signal": False},
+            "lora_focus_v3_cost_only": {
+                "use_private_signal": False,
+                "use_focus_signal": False,
+                "use_reuse_signal": False,
+            },
+        }[method_id]
+        return split_prefix_lora_focus_v3(
+            row,
+            reuse_points,
+            lora_focus_profile,
+            context_reaccess_rate=context_reaccess_rate,
+            exact_prefix_rate=exact_prefix_rate,
+            **options,
+        )
+    raise ValueError(f"unknown prefix experiment method: {method_id}")
 
 
 def analyze_prefix_structure(snapshot: dict[str, Any]) -> pd.DataFrame:
@@ -1450,7 +1897,7 @@ def write_report(
         )
 
     lines = [
-        "# Test6 真实数据集三级缓存与前缀切分实验",
+        "# Test7 真实数据集三级缓存与前缀切分实验",
         "",
         f"生成时间：{datetime.now(timezone.utc).isoformat()}",
         "",
@@ -1471,7 +1918,7 @@ def write_report(
         f"- 生成 token：{snapshot['common_options']['n-predict']}；delta 执行：`{snapshot['common_options']['delta-execution']}`",
         "- 正数 TTFT speedup 表示优于同一次运行内、同请求的 full-prefill；95% 区间由请求级配对 bootstrap 得到。",
         "- 存储汇总中的 Full-prefill 是 legacy cell 内的逐请求参考测量，不是额外运行的 cell；因此其 wall time 标为 n/a。",
-        f"- 有效性校验：{len(summary[summary['strategy_id'] != 'full_prefill'])} 个策略 cell 均完成；"
+        f"- 有效性校验：{len(summary[summary['strategy_id'] != 'full_prefill'])} 个策略 cell 完成，另有 {len(failures)} 个失败；"
         "任何 `failed` 模式或 TTFT <= 0 的在线行都会使 cell 失败。",
         "",
         "## 策略",
@@ -1520,7 +1967,7 @@ def write_report(
         )
 
     lines.extend(["", "![TTFT speedup](figures/ttft_speedup_heatmap.png)", ""])
-    lines.extend(["### 存储策略汇总（五个数据集等权平均）", ""])
+    lines.extend([f"### 存储策略汇总（{summary['dataset'].nunique()} 个数据集等权平均）", ""])
     if not storage_mean.empty:
         lines.extend(
             markdown_table(
@@ -1658,6 +2105,7 @@ def write_report(
             "",
             "## 如何解释这些结果",
             "",
+            "- 逐 cell 的命中、缓存峰值、模式和失败行见 [`DIAGNOSIS.md`](DIAGNOSIS.md)。",
             *interpretation,
             "",
             "## 局限性",
@@ -1667,7 +2115,7 @@ def write_report(
             "3. Full-prefill 在每个进程中先执行，首请求可能包含额外 warm-up；比较使用同进程配对 baseline，但仍建议后续增加重复次数和随机化顺序。",
             "4. 当前 GGUF LoRA 与逻辑任务不匹配，因此只能验证缓存、切换和 KV 重建行为，不能据此比较生成质量。",
             "5. XSum 的 QA 和 headline 使用摘要作为代理 reference；本实验未计算 ROUGE、BLEU 或人工质量指标。",
-            "6. test6 复用 test4 system-v2 运行时；它的固定切分是在节点建立后再按容量淘汰，尚不是基于边际收益的动态 admission。",
+            "6. test7 复用 test4 system-v2 运行时；它的固定切分是在节点建立后再按容量淘汰，尚不是基于边际收益的动态 admission。",
             "",
             "## 原始结果",
             "",
@@ -1716,7 +2164,7 @@ def main() -> int:
         else:
             failures.append(manifest)
     if not manifests:
-        raise ValueError(f"no successful test6 runs found under {args.output_dir / 'runs'}")
+        raise ValueError(f"no successful test7 runs found under {args.output_dir / 'runs'}")
 
     summaries: list[dict[str, Any]] = []
     request_frames: list[pd.DataFrame] = []
@@ -1808,7 +2256,7 @@ def main() -> int:
     )
 
     print(
-        f"test6 analysis complete: runs={len(manifests)} "
+        f"test7 analysis complete: runs={len(manifests)} "
         f"aggregate_rows={len(summary_frame)} prefix_rows={len(prefix_structure)} "
         f"output={args.output_dir}"
     )

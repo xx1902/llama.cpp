@@ -1,0 +1,4 @@
+workload,text_tokens,chunks,split_ms,inference_ms,serial_ttft_ms,parallel_ttft_ms,overlap_saved_ms,split_hint_hit
+workbuddy_sentence,52,2,2.2,15.36,17.56,15.36,2.1999999999999993,1
+long_document_sentence,360,18,17.1,70.8,87.9,70.8,17.10000000000001,1
+long_sentence_fallback,457,15,18.175,88.25999999999999,106.43499999999999,88.25999999999999,18.174999999999997,1

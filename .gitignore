@@ -115,6 +115,7 @@ poetry.toml
 /examples/lora-base-datasets/datasets/
 /examples/lora-base-datasets/output/
 /examples/lora-base-test6/output/
+/examples/lora-base-test7/output/
 /examples/lora-base-test5/output/
 /examples/lora-base-test4/output/
 

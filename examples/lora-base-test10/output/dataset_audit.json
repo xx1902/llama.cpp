@@ -1,0 +1,22 @@
+{
+  "dataset": "D:\\ecnu_experiment\\datasets\\mobilora_workloads_87_group_hybrid\\delta\\delta_requests.jsonl",
+  "available_requests": 696,
+  "sampled_requests": 87,
+  "sampling": "deterministic_lora_stratified_round_robin",
+  "available_loras": 87,
+  "available_apps": 87,
+  "available_contexts": 80,
+  "sampled_unique_prefixes": 10,
+  "sampled_loras": 87,
+  "sampled_apps": 87,
+  "sampled_repeated_prefix_rate": 0.8850574712643678,
+  "prefix_tokens_min": 139,
+  "prefix_tokens_p50": 531.0,
+  "prefix_tokens_p95": 1347.0,
+  "prefix_tokens_max": 2003,
+  "source_components": [
+    "XSum",
+    "ShareGPT52K",
+    "LSApp 87-App trace"
+  ]
+}

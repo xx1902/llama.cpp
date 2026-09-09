@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Run the test6 real-dataset prefix-cache experiment matrix."""
+"""Run the test7 real-dataset prefix-cache experiment matrix."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ from typing import Any
 
 SCRIPT_DIR = Path(__file__).resolve().parent
 REPO_ROOT = SCRIPT_DIR.parents[1]
-DEFAULT_BINARY = REPO_ROOT / "build" / "bin" / "Release" / "llama-lora-base-test6.exe"
+DEFAULT_BINARY = REPO_ROOT / "build" / "bin" / "Release" / "llama-lora-base-test7.exe"
 DEFAULT_WORKLOADS_ROOT = (
     REPO_ROOT / "examples" / "lora-base-datasets" / "output" / "real_100"
 )
@@ -102,7 +102,7 @@ def validate_inputs(
 ) -> None:
     if not binary.is_file():
         raise FileNotFoundError(
-            f"test6 binary not found: {binary}. Build llama-lora-base-test6 first."
+            f"test7 binary not found: {binary}. Build llama-lora-base-test7 first."
         )
     for dataset in datasets:
         workload_dir = workloads_root / dataset
@@ -291,7 +291,7 @@ def main() -> int:
         validate_inputs(args.binary, args.workloads_root, datasets)
         total = len(datasets) * len(strategies)
         print(
-            f"test6 matrix: {len(datasets)} datasets x {len(strategies)} strategies "
+            f"test7 matrix: {len(datasets)} datasets x {len(strategies)} strategies "
             f"= {total} runs",
             flush=True,
         )
